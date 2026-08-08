@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+
+# Claude local settings
+.claude/settings.local.json
+
+# Xcode / Swift
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.swiftpm/
+Package.resolved
+
+# Gradle (legacy Backend scaffold)
+.gradle/
+Backend/.gradle/
+Backend/build/
+Backend/bin/
+
+# Supabase local
+supabase/.branches
+supabase/.temp
+
+# Env / secrets
+.env
+.env.*
+!.env.example
