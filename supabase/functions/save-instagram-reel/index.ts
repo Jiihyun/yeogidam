@@ -33,6 +33,27 @@ const IG_RE =
 
 type FailureReason = "IG_FETCH_FAILED" | "PLACE_NOT_FOUND" | "UNKNOWN";
 
+// 로컬 검증 전용 스텁 (STUB_PROVIDERS=1 일 때만 사용). Gemini/네이버 키 없이
+// 파이프라인 전체(추출→매칭→저장→썸네일)를 결정적으로 검증하기 위한 것.
+// 프로덕션에서는 이 플래그를 켜지 않는다.
+const STUB_META = {
+  title: "성수 카페 추천",
+  description: "서울 성동구 연무장길 12 에 있는 여기담 스텁 카페 ☕️ 분위기 좋아요",
+  thumbnailUrl: "https://picsum.photos/seed/yeogidam/600/600",
+  canonicalUrl: null as string | null,
+};
+const STUB_PLACE = {
+  naverPlaceId: "stub-1001",
+  name: "여기담 스텁 카페",
+  category: "카페",
+  roadAddress: "서울 성동구 연무장길 12",
+  address: "서울 성동구 성수동2가 273-14",
+  latitude: 37.5445,
+  longitude: 127.0557,
+  link: null as string | null,
+  telephone: null as string | null,
+};
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
@@ -98,11 +119,12 @@ async function processReel(
   userId: string,
   instagramUrl: string,
 ): Promise<ProcessResult> {
+  const stub = Deno.env.get("STUB_PROVIDERS") === "1";
   try {
     // 1. Instagram HTML → og:*
     let meta;
     try {
-      meta = await fetchInstagramMeta(instagramUrl);
+      meta = stub ? STUB_META : await fetchInstagramMeta(instagramUrl);
     } catch {
       return await fail(admin, reelId, "IG_FETCH_FAILED");
     }
@@ -120,13 +142,15 @@ async function processReel(
     // 2. 주소 정규식(1순위)로 네이버 검색
     const naverId = Deno.env.get("NAVER_SEARCH_CLIENT_ID");
     const naverSecret = Deno.env.get("NAVER_SEARCH_CLIENT_SECRET");
-    if (!naverId || !naverSecret) return await fail(admin, reelId, "PLACE_NOT_FOUND");
+    if (!stub && (!naverId || !naverSecret)) return await fail(admin, reelId, "PLACE_NOT_FOUND");
 
     const address = extractKoreanAddress(caption);
-    let place = address ? await searchNaverPlace(address, naverId, naverSecret) : null;
+    let place = stub
+      ? (address ? STUB_PLACE : null)
+      : (address ? await searchNaverPlace(address, naverId!, naverSecret!) : null);
 
     // 3. 실패 시 Gemini 로 장소명 추출(2순위) 후 재검색
-    if (!place && caption) {
+    if (!place && !stub && caption) {
       const geminiKey = Deno.env.get("GEMINI_API_KEY");
       let placeName: string | null = null;
       let region: string | null = null;
