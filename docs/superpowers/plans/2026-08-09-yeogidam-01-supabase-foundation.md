@@ -6,7 +6,7 @@
 
 **Architecture:** Supabase CLI 로컬 스택(Docker) 위에서 SQL 마이그레이션으로 스키마를 정의하고, pgTAP로 테이블/제약/RLS/트리거를 TDD한다. 쓰기(`places`/`reels`/`saved_places`)는 추후 Edge Function이 `service_role`로 수행(RLS 우회)하고, 사용자는 자기 데이터 조회·삭제만 가능하도록 RLS를 건다. 인증은 MVP 단계에서 익명 로그인만 사용한다.
 
-**Tech Stack:** Supabase CLI, PostgreSQL 15, pgTAP, Docker.
+**Tech Stack:** Supabase CLI, PostgreSQL 17 (Supabase CLI default), pgTAP, Docker.
 
 ## Global Constraints
 
@@ -150,7 +150,7 @@ Expected: `supabase/migrations/<ts>_init_schema.sql` 빈 파일 생성.
 `supabase/tests/01_schema.sql`:
 ```sql
 begin;
-select plan(20);
+select plan(21);
 
 -- 테이블 존재
 select has_table('public', 'profiles',      'profiles 테이블 존재');
@@ -194,6 +194,12 @@ prepare bad_source as
   insert into public.reels (user_id, instagram_url, source)
   values ('00000000-0000-0000-0000-000000000000', 'https://x', 'twitter');
 select throws_ok('bad_source', '23514', null, 'source 잘못된 값은 check 위반');
+
+-- reels.failure_reason CHECK
+prepare bad_reason as
+  insert into public.reels (user_id, instagram_url, failure_reason)
+  values ('00000000-0000-0000-0000-000000000000', 'https://x', 'NOPE');
+select throws_ok('bad_reason', '23514', null, 'failure_reason 잘못된 값은 check 위반');
 
 -- saved_places.place_id NOT NULL 위반
 prepare null_place as
@@ -282,7 +288,7 @@ Run:
 ```bash
 supabase test db
 ```
-Expected: PASS — `01_schema.sql`의 20개 어서션 모두 통과, `# All tests passed`.
+Expected: PASS — `01_schema.sql`의 21개 어서션 모두 통과, `# All tests passed`.
 
 - [ ] **Step 6: 커밋**
 
@@ -561,6 +567,7 @@ create trigger on_auth_user_created
 create function public.set_updated_at()
 returns trigger
 language plpgsql
+set search_path = ''
 as $$
 begin
   new.updated_at = now();
