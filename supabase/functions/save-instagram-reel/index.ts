@@ -1,0 +1,217 @@
+// POST /functions/v1/save-instagram-reel
+// 1) JWT 인증 → 2) IG URL 검증 → 3) reels(PROCESSING) insert → 4) 202 즉시 반환
+// → 5) waitUntil 백그라운드 파이프라인(IG 추출 → 주소/장소 → 네이버 매칭 → 썸네일 → DB)
+//
+// 로컬 검증용: 환경변수 PIPELINE_SYNC=1 이면 백그라운드 대신 동기로 처리하고
+// 최종 상태를 응답에 담아 반환한다(테스트 편의). 프로덕션 기본은 비동기(202).
+
+import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
+import { fetchInstagramMeta } from "./instagram.ts";
+import { extractKoreanAddress } from "./address.ts";
+import { extractPlaceWithGemini } from "./gemini.ts";
+import { searchNaverPlace } from "./naver.ts";
+import { rehostThumbnail, scrapeNaverImage } from "./thumbnail.ts";
+
+// Supabase Edge Runtime 전역 (백그라운드 처리)
+declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void };
+
+const cors = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...cors, "Content-Type": "application/json" },
+  });
+}
+
+const IG_RE =
+  /^https?:\/\/(?:www\.)?instagram\.com\/(?:reel|reels|p|tv)\/[A-Za-z0-9_-]+/i;
+
+type FailureReason = "IG_FETCH_FAILED" | "PLACE_NOT_FOUND" | "UNKNOWN";
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+  if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+
+  const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+  const ANON = Deno.env.get("SUPABASE_ANON_KEY")!;
+  const SERVICE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+  // 1) JWT 인증
+  const token = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "");
+  if (!token) return json({ error: "unauthorized" }, 401);
+  const authClient = createClient(SUPABASE_URL, ANON, {
+    global: { headers: { Authorization: `Bearer ${token}` } },
+  });
+  const { data: userData, error: userErr } = await authClient.auth.getUser(token);
+  if (userErr || !userData.user) return json({ error: "unauthorized" }, 401);
+  const userId = userData.user.id;
+
+  // 2) 입력 검증
+  let payload: { instagramUrl?: string; source?: string };
+  try {
+    payload = await req.json();
+  } catch {
+    return json({ error: "invalid_body" }, 400);
+  }
+  const instagramUrl = (payload.instagramUrl ?? "").trim();
+  const source = payload.source === "url_input" ? "url_input" : "instagram_share";
+  if (!IG_RE.test(instagramUrl)) return json({ error: "invalid_instagram_url" }, 400);
+
+  // 3) reels(PROCESSING) insert (service_role → RLS 우회)
+  const admin = createClient(SUPABASE_URL, SERVICE);
+  const { data: reel, error: insErr } = await admin
+    .from("reels")
+    .insert({
+      user_id: userId,
+      instagram_url: instagramUrl,
+      source,
+      processing_status: "PROCESSING",
+    })
+    .select("id")
+    .single();
+  if (insErr || !reel) return json({ error: "db_error" }, 500);
+
+  // 4)/5) 동기(테스트) 또는 비동기(기본)
+  const work = processReel(admin, reel.id, userId, instagramUrl);
+  if (Deno.env.get("PIPELINE_SYNC") === "1") {
+    const result = await work;
+    return json({ reelId: reel.id, ...result }, 200);
+  }
+  EdgeRuntime.waitUntil(work);
+  return json({ reelId: reel.id, status: "PROCESSING" }, 202);
+});
+
+interface ProcessResult {
+  status: "COMPLETED" | "FAILED";
+  failureReason?: FailureReason;
+  placeId?: string;
+}
+
+async function processReel(
+  admin: SupabaseClient,
+  reelId: string,
+  userId: string,
+  instagramUrl: string,
+): Promise<ProcessResult> {
+  try {
+    // 1. Instagram HTML → og:*
+    let meta;
+    try {
+      meta = await fetchInstagramMeta(instagramUrl);
+    } catch {
+      return await fail(admin, reelId, "IG_FETCH_FAILED");
+    }
+    await admin
+      .from("reels")
+      .update({
+        instagram_title: meta.title,
+        instagram_description: meta.description,
+        instagram_thumbnail_url: meta.thumbnailUrl,
+      })
+      .eq("id", reelId);
+
+    const caption = [meta.title, meta.description].filter(Boolean).join("\n");
+
+    // 2. 주소 정규식(1순위)로 네이버 검색
+    const naverId = Deno.env.get("NAVER_SEARCH_CLIENT_ID");
+    const naverSecret = Deno.env.get("NAVER_SEARCH_CLIENT_SECRET");
+    if (!naverId || !naverSecret) return await fail(admin, reelId, "PLACE_NOT_FOUND");
+
+    const address = extractKoreanAddress(caption);
+    let place = address ? await searchNaverPlace(address, naverId, naverSecret) : null;
+
+    // 3. 실패 시 Gemini 로 장소명 추출(2순위) 후 재검색
+    if (!place && caption) {
+      const geminiKey = Deno.env.get("GEMINI_API_KEY");
+      let placeName: string | null = null;
+      let region: string | null = null;
+      if (geminiKey) {
+        const guess = await extractPlaceWithGemini(caption, geminiKey);
+        placeName = guess?.placeName ?? null;
+        region = guess?.region ?? null;
+      }
+      for (const q of buildQueries({ address, placeName, region })) {
+        place = await searchNaverPlace(q, naverId, naverSecret);
+        if (place) break;
+      }
+    }
+    if (!place) return await fail(admin, reelId, "PLACE_NOT_FOUND");
+
+    // 4. 썸네일: 네이버 대표 이미지(베스트에포트) → IG og:image → 없으면 null(로고는 앱에서)
+    const naverImage = await scrapeNaverImage(place.link);
+    const sourceImage = naverImage ?? meta.thumbnailUrl;
+    const thumbnailUrl = sourceImage ? await rehostThumbnail(admin, reelId, sourceImage) : null;
+
+    // 5. places upsert (naver_place_id 기준 중복 방지)
+    const { data: placeRow, error: placeErr } = await admin
+      .from("places")
+      .upsert(
+        {
+          naver_place_id: place.naverPlaceId,
+          name: place.name,
+          category: place.category,
+          road_address: place.roadAddress,
+          address: place.address,
+          latitude: place.latitude,
+          longitude: place.longitude,
+          naver_link: place.link,
+          naver_thumbnail_url: naverImage,
+          telephone: place.telephone,
+        },
+        { onConflict: "naver_place_id" },
+      )
+      .select("id")
+      .single();
+    if (placeErr || !placeRow) return await fail(admin, reelId, "UNKNOWN");
+
+    // 6. saved_places upsert (user_id, place_id) — 이미 있으면 무시(장소 중복 방지)
+    await admin
+      .from("saved_places")
+      .upsert(
+        { user_id: userId, place_id: placeRow.id, thumbnail_url: thumbnailUrl },
+        { onConflict: "user_id,place_id", ignoreDuplicates: true },
+      );
+
+    // 7. reels 완료
+    await admin
+      .from("reels")
+      .update({ place_id: placeRow.id, processing_status: "COMPLETED", failure_reason: null })
+      .eq("id", reelId);
+
+    return { status: "COMPLETED", placeId: placeRow.id };
+  } catch {
+    return await fail(admin, reelId, "UNKNOWN");
+  }
+}
+
+function buildQueries(
+  { address, placeName, region }: {
+    address: string | null;
+    placeName: string | null;
+    region: string | null;
+  },
+): string[] {
+  const q: string[] = [];
+  if (region && placeName) q.push(`${region} ${placeName}`);
+  if (placeName && address) q.push(`${placeName} ${address}`);
+  if (placeName) q.push(placeName);
+  if (address) q.push(address);
+  return [...new Set(q.map((s) => s.trim()).filter(Boolean))];
+}
+
+async function fail(
+  admin: SupabaseClient,
+  reelId: string,
+  reason: FailureReason,
+): Promise<ProcessResult> {
+  await admin
+    .from("reels")
+    .update({ processing_status: "FAILED", failure_reason: reason })
+    .eq("id", reelId);
+  return { status: "FAILED", failureReason: reason };
+}
