@@ -1,5 +1,5 @@
 begin;
-select plan(20);
+select plan(21);
 
 -- 테이블 존재
 select has_table('public', 'profiles',      'profiles 테이블 존재');
@@ -43,6 +43,12 @@ prepare bad_source as
   insert into public.reels (user_id, instagram_url, source)
   values ('00000000-0000-0000-0000-000000000000', 'https://x', 'twitter');
 select throws_ok('bad_source', '23514', null, 'source 잘못된 값은 check 위반');
+
+-- reels.failure_reason CHECK
+prepare bad_reason as
+  insert into public.reels (user_id, instagram_url, failure_reason)
+  values ('00000000-0000-0000-0000-000000000000', 'https://x', 'NOPE');
+select throws_ok('bad_reason', '23514', null, 'failure_reason 잘못된 값은 check 위반');
 
 -- saved_places.place_id NOT NULL 위반
 prepare null_place as
