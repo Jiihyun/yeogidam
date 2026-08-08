@@ -1,0 +1,41 @@
+name: Yeogidam
+options:
+  bundleIdPrefix: com.yeogidam
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+packages:
+  Supabase:
+    url: https://github.com/supabase/supabase-swift
+    from: "2.0.0"
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+targets:
+  Yeogidam:
+    type: application
+    platform: iOS
+    sources:
+      - Yeogidam
+    dependencies:
+      - package: Supabase
+        product: Supabase
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yeogidam.app
+        TARGETED_DEVICE_FAMILY: "1"
+    info:
+      path: Yeogidam/Info.plist
+      properties:
+        CFBundleDisplayName: 여기담
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSExceptionDomains:
+            127.0.0.1:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true

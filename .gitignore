@@ -29,3 +29,7 @@ supabase/.temp
 .env
 .env.*
 !.env.example
+
+# iOS (XcodeGen generates the .xcodeproj from project.yml)
+ios/Yeogidam.xcodeproj/
+ios/build/
