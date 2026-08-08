@@ -319,12 +319,18 @@ supabase migration new rls_policies
 `supabase/tests/02_rls.sql`:
 ```sql
 begin;
-select plan(6);
+select plan(8);
 
 -- 두 명의 유저를 auth.users에 직접 생성 (테스트 픽스처)
 insert into auth.users (id, aud, role, email)
 values ('11111111-1111-1111-1111-111111111111', 'authenticated', 'authenticated', 'a@test.dev'),
        ('22222222-2222-2222-2222-222222222222', 'authenticated', 'authenticated', 'b@test.dev');
+
+-- 프로필 시드 (Task 4 트리거가 있으면 이미 생성되므로 on conflict do nothing 으로 양립)
+insert into public.profiles (id, nickname)
+values ('11111111-1111-1111-1111-111111111111', 'U1'),
+       ('22222222-2222-2222-2222-222222222222', 'U2')
+on conflict (id) do nothing;
 
 -- 공용 place 1개, 각 유저의 reels/saved_places 데이터 시드 (service context = 현재 postgres 역할)
 insert into public.places (id, name) values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'PlaceA');
@@ -354,6 +360,11 @@ select is(
   (select count(*)::int from public.places),
   1, '유저1은 공용 places 조회 가능');
 
+-- 유저1은 자기 profiles 만 봄
+select is(
+  (select count(*)::int from public.profiles),
+  1, '유저1은 자신의 profiles 1건만 조회');
+
 -- 유저1은 reels에 직접 INSERT 불가 (정책 없음 → 거부)
 prepare ins_reel as
   insert into public.reels (user_id, instagram_url)
@@ -377,6 +388,14 @@ with del as (
 )
 select is( (select count(*)::int from del), 0, '유저2는 유저1의 reels 삭제 불가');
 
+-- 유저2는 유저1의 profiles 를 수정 불가 (본인 것만 → 0 rows affected)
+with upd as (
+  update public.profiles set description = 'hacked'
+  where id = '11111111-1111-1111-1111-111111111111'
+  returning 1
+)
+select is( (select count(*)::int from upd), 0, '유저2는 유저1의 profiles 수정 불가');
+
 select * from finish();
 rollback;
 ```
@@ -398,6 +417,14 @@ alter table public.profiles     enable row level security;
 alter table public.places       enable row level security;
 alter table public.reels        enable row level security;
 alter table public.saved_places enable row level security;
+
+-- 테이블 접근 권한: Supabase 로컬에서 anon/authenticated 는 기본 GRANT 가 없으므로 명시적으로 부여.
+-- GRANT 는 RLS 와 AND 로 동작한다. 쓰기(INSERT/UPDATE)는 부여하지 않으므로 service_role 만 쓰기 가능.
+grant select         on public.profiles     to authenticated;
+grant update         on public.profiles     to authenticated;
+grant select         on public.places       to authenticated;
+grant select, delete on public.reels        to authenticated;
+grant select, delete on public.saved_places to authenticated;
 
 -- profiles: 본인만 조회/수정
 create policy "profiles_select_own" on public.profiles
@@ -428,7 +455,7 @@ Run:
 ```bash
 supabase test db
 ```
-Expected: PASS — `02_rls.sql`의 6개 어서션 통과.
+Expected: PASS — `02_rls.sql`의 8개 어서션 통과.
 
 - [ ] **Step 6: 커밋**
 
