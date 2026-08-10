@@ -10,7 +10,7 @@ packages:
     from: "2.0.0"
 settings:
   base:
-    DEVELOPMENT_TEAM: N76TPYXBX5
+    DEVELOPMENT_TEAM: 3M2Y93XS7W
     CODE_SIGN_STYLE: Automatic
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
