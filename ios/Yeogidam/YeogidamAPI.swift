@@ -62,7 +62,7 @@ struct YeogidamAPI {
         components.queryItems = [
             URLQueryItem(
                 name: "select",
-                value: "id,thumbnail_url,created_at,place:places(id,name,category,road_address,address,latitude,longitude,naver_link,thumbnail_url,photo_attribution)"
+                value: "id,thumbnail_url,created_at,place:places(id,name,category,source_address,road_address,address,latitude,longitude,naver_link,thumbnail_url,photo_attribution)"
             ),
             URLQueryItem(name: "order", value: "created_at.desc"),
         ]

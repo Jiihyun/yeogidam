@@ -7,7 +7,7 @@
 
 import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 import { fetchInstagramMeta } from "./instagram.ts";
-import { extractKoreanAddress, extractPinnedPlaceName } from "./address.ts";
+import { extractKoreanAddress } from "./address.ts";
 import { extractPlaceWithGemini } from "./gemini.ts";
 import { searchNaverPlace } from "./naver.ts";
 import { findGooglePlacePhoto } from "./google.ts";
@@ -161,7 +161,7 @@ async function processReel(
 
     const caption = [meta.title, meta.description].filter(Boolean).join("\n");
 
-    // 2. 주소 정규식(1순위)로 네이버 검색
+    // 2. 상세주소 전체를 먼저 추출해 네이버 검색
     const naverId = Deno.env.get("NAVER_SEARCH_CLIENT_ID");
     const naverSecret = Deno.env.get("NAVER_SEARCH_CLIENT_SECRET");
     if (!stub && (!naverId || !naverSecret)) {
@@ -169,22 +169,20 @@ async function processReel(
     }
 
     const address = extractKoreanAddress(caption);
-    let placeName = extractPinnedPlaceName(caption);
-    let region: string | null = null;
     let place = stub
       ? (address ? STUB_PLACE : null)
       : (address
         ? await searchNaverPlace(address, naverId!, naverSecret!)
         : null);
 
-    // 3. 실패 시 Gemini 로 장소명 추출(2순위) 후 재검색
+    // 3. 주소 검색 실패 시에만 Gemini로 장소명·지역을 추출해 재검색
     if (!place && !stub && caption) {
       const geminiKey = Deno.env.get("GEMINI_API_KEY");
-      if (!placeName && geminiKey) {
-        const guess = await extractPlaceWithGemini(caption, geminiKey);
-        placeName = guess?.placeName ?? null;
-        region = guess?.region ?? null;
-      }
+      const guess = geminiKey
+        ? await extractPlaceWithGemini(caption, geminiKey)
+        : null;
+      const placeName = guess?.placeName ?? null;
+      const region = guess?.region ?? null;
       for (const q of buildQueries({ address, placeName, region })) {
         place = await searchNaverPlace(q, naverId!, naverSecret!);
         if (place) break;
@@ -202,6 +200,7 @@ async function processReel(
           category: place.category,
           road_address: place.roadAddress,
           address: place.address,
+          ...(address ? { source_address: address } : {}),
           latitude: place.latitude,
           longitude: place.longitude,
           naver_link: place.link,
@@ -365,7 +364,6 @@ function buildQueries(
   if (region && placeName) q.push(`${region} ${placeName}`);
   if (placeName && address) q.push(`${placeName} ${address}`);
   if (placeName) q.push(placeName);
-  if (address) q.push(address);
   return [...new Set(q.map((s) => s.trim()).filter(Boolean))];
 }
 

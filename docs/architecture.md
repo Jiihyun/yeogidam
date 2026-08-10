@@ -82,6 +82,7 @@ erDiagram
       text naver_place_id UK
       text google_place_id
       text name
+      text source_address
       text road_address
       float latitude
       float longitude
@@ -126,7 +127,7 @@ erDiagram
 | 제공자 | 역할 | 실패 시 동작 |
 |---|---|---|
 | Instagram | 캡션과 원본 썸네일 후보 | `IG_FETCH_FAILED` |
-| Gemini | 비정형 캡션에서 장소명·지역 추출 | 주소/핀 힌트와 Naver 검색 계속 |
+| Gemini | 상세주소 Naver 검색 실패 후 비정형 캡션에서 장소명·지역 추출 | `PLACE_NOT_FOUND` |
 | Naver API HUB | 장소명, 주소, 카테고리, 좌표 정규화 | `PLACE_NOT_FOUND` |
 | Google Places | 대표 사진과 Google Place ID | Instagram/Naver 이미지로 폴백 |
 | Supabase Storage | 선택된 썸네일 저장 | 이미지 없이 장소 저장 가능 |
@@ -144,7 +145,7 @@ Edge Function은 인증과 입력 검증 후 `reels(PROCESSING)`을 먼저 생�
 - 익명 인증과 RLS
 - URL 직접 입력과 Share Extension
 - Instagram 캡션 다단계 추출
-- 주소·핀 장소명·Gemini·Naver 매칭
+- 층·동·호 포함 상세주소 우선 검색과 Gemini·Naver 장소명 폴백
 - 장소와 사용자 저장 데이터 분리
 - Google Places 썸네일, 제공자 폴백, Storage 업로드
 - 월간 DB hard cap과 Google Cloud 일일 quota

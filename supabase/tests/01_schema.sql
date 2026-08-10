@@ -1,5 +1,5 @@
 begin;
-select plan(26);
+select plan(27);
 
 -- 테이블 존재
 select has_table('public', 'profiles',      'profiles 테이블 존재');
@@ -21,6 +21,7 @@ select has_column('public', 'places', 'google_place_id',  'places.google_place_i
 select has_column('public', 'places', 'thumbnail_url',    'places.thumbnail_url 존재');
 select has_column('public', 'places', 'thumbnail_source', 'places.thumbnail_source 존재');
 select has_column('public', 'places', 'photo_attribution','places.photo_attribution 존재');
+select has_column('public', 'places', 'source_address',   'places.source_address 존재');
 select has_column('public', 'saved_places', 'thumbnail_url', 'saved_places.thumbnail_url 존재');
 
 -- NOT NULL

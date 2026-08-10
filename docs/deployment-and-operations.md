@@ -198,7 +198,7 @@ Google Maps Platform 약관은 Google Maps Content의 저장·재호스팅과 �
 |---|---|
 | 요청 즉시 401 | 앱 JWT 만료, Share Extension App Group 세션 |
 | `IG_FETCH_FAILED` | oEmbed/HTML 응답 상태, Instagram 형식 변경 |
-| `PLACE_NOT_FOUND` | 추출 주소·핀 장소명, Naver API status·itemCount |
+| `PLACE_NOT_FOUND` | 추출 상세주소, Gemini 장소명·지역, Naver API status·itemCount |
 | `UNKNOWN` | places upsert와 DB 제약, Function exception log |
 | 사진만 없음 | 월 예약 한도, Google quota, Storage upload, 폴백 URL |
 

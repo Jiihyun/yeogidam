@@ -162,7 +162,7 @@ private struct SavedPlaceRowView: View {
                 Text(savedPlace.place.name)
                     .font(.headline)
                     .lineLimit(1)
-                Text(savedPlace.place.roadAddress ?? savedPlace.place.address ?? "주소 정보 없음")
+                Text(savedPlace.place.sourceAddress ?? savedPlace.place.roadAddress ?? savedPlace.place.address ?? "주소 정보 없음")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)

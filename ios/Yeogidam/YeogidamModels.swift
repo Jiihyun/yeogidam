@@ -42,6 +42,7 @@ struct PlaceRow: Identifiable, Decodable {
     let id: UUID
     let name: String
     let category: String?
+    let sourceAddress: String?
     let roadAddress: String?
     let address: String?
     let latitude: Double?
@@ -54,6 +55,7 @@ struct PlaceRow: Identifiable, Decodable {
         case id
         case name
         case category
+        case sourceAddress = "source_address"
         case roadAddress = "road_address"
         case address
         case latitude
