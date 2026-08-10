@@ -46,3 +46,13 @@ xcodebuild -project Yeogidam.xcodeproj \
 ```
 
 실제 API 키는 `supabase/functions/.env` 또는 Supabase Function Secrets에만 저장합니다. `SUPABASE_ANON_KEY`는 클라이언트 공개 키이며, `service_role` 키와 외부 API 키는 앱에 포함하지 않습니다.
+
+## 커밋 컨벤션
+
+커밋 메시지는 AngularJS 형식의 `<type>(<scope>): <한글 요약>`을 사용합니다. `scope`는 생략할 수 있으며 한글을 원칙으로 합니다. 주요 `type`은 `feat`, `fix`, `docs`, `refactor`, `test`, `chore`입니다.
+
+```text
+feat(장소): 카카오 장소 ID 기반 중복 방지 추가
+fix(인스타그램): HTML 메타데이터를 캡션 1순위로 변경
+docs: 장소 매칭 출시 보고서 갱신
+```

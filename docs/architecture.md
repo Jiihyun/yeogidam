@@ -31,7 +31,7 @@ flowchart LR
     SHARE -->|"URL + JWT"| FN
     APP -->|"RLS 적용 REST 조회/삭제"| DB[("Supabase Postgres")]
 
-    FN --> IG["Instagram oEmbed / HTML"]
+    FN --> IG["Instagram HTML head / fallback"]
     FN --> GEMINI["Gemini"]
     FN --> KAKAO["Kakao Local API"]
     FN --> GOOGLE["Google Places API (New)"]
@@ -174,7 +174,7 @@ Edge Function은 인증과 입력 검증 후 shortcode 캐시를 먼저 확인�
 
 ## 8. 주요 기술 부채
 
-1. Instagram의 내부 oEmbed 응답 형식은 변경될 수 있으므로 회귀 테스트와 실패 관측이 필요합니다.
+1. Instagram HTML head를 캡션 SSOT로 사용하지만 요청 환경에 따라 메타데이터가 누락될 수 있습니다. 내부 oEmbed는 HTML에 캡션이 없을 때만 사용하는 fallback이며 응답 형식 변경에 대한 회귀 테스트와 실패 관측이 필요합니다.
 2. Share Extension은 access token 만료 시 사용자에게 앱 실행을 요청하며 자체 refresh를 하지 않습니다.
 3. 외부 이미지 업로드 실패는 장소 저장을 막지 않지만, 일부 DB update 오류도 현재 best-effort로 처리됩니다.
 4. Google Places 사진 재호스팅은 현행 Google Maps Platform 저장 제한과 충돌할 수 있습니다. 프로덕션 출시 전에 [운영 가이드](deployment-and-operations.md)의 정책 항목을 해결해야 합니다.

@@ -45,8 +45,12 @@ sequenceDiagram
     else 신규 또는 재처리 필요
     F->>D: reels(PROCESSING) insert
     F-->>U: 202 + reelId
-    F->>I: oEmbed / HTML meta
+    F->>I: 릴스 HTML head meta
     I-->>F: caption + thumbnail
+    opt HTML에 caption 없음
+        F->>I: oEmbed / captioned embed fallback
+        I-->>F: caption + thumbnail
+    end
     F->>AI: 전체 caption, places[] schema
     AI-->>F: 0..N 장소명·주소·지역
     loop 원문에서 검증된 각 장소
@@ -64,11 +68,12 @@ sequenceDiagram
 
 ## 3. Instagram 추출
 
-1. oEmbed JSON의 `title`, `thumbnail_url`
-2. HTML `og:title`, `og:description`, `name="description"`, `og:image`
-3. `/embed/captioned/` HTML Caption
+1. HTML `og:description`, `name="description"`, `twitter:description`
+2. HTML `og:title`, `og:image`, `og:url` 등 보조 메타데이터
+3. 캡션이 없을 때만 oEmbed JSON의 `title`, `thumbnail_url`
+4. `/embed/captioned/` HTML Caption
 
-속성 순서와 큰따옴표·작은따옴표를 모두 처리하고 HTML entity를 디코딩한다. 캡션을 얻지 못하면 `IG_FETCH_FAILED`다.
+릴스 URL의 HTML head가 캡션 SSOT다. 속성 순서와 큰따옴표·작은따옴표를 모두 처리하고 HTML entity를 디코딩한다. HTML에 캡션이 있으면 추가 Instagram 요청은 하지 않으며, 끝까지 캡션을 얻지 못하면 `IG_FETCH_FAILED`다.
 
 ## 4. Gemini-first 다중 추출
 

@@ -1,12 +1,12 @@
 # 여기담 MVP 장소 매칭 및 출시 판단 보고서
 
-- 기준일: 2026-08-10
-- 기준 구현: Gemini-first 다중 추출 + Kakao Local API 검증
+- 기준일: 2026-08-11
+- 기준 구현: Instagram HTML-head-first + Gemini-first 다중 추출 + Kakao Local API 검증
 - 대상: `save-instagram-reel` Edge Function
 
 ## 1. 결론
 
-현재 MVP는 캡션 전체를 Gemini에 보내 장소명과 상세 주소를 다중 추출한 뒤, Kakao Local API 후보의 이름과 주소를 원문과 다시 대조한다. 유일하게 검증된 후보만 저장하고, 중복은 Kakao 장소 ID로 막는다.
+현재 MVP는 릴스 HTML head의 `description` 계열 메타데이터를 캡션 SSOT로 사용한다. 캡션 전체를 Gemini에 보내 장소명과 상세 주소를 다중 추출한 뒤, Kakao Local API 후보의 이름과 주소를 원문과 다시 대조한다. 유일하게 검증된 후보만 저장하고, 중복은 Kakao 장소 ID로 막는다.
 
 이 선택의 의미는 다음과 같다.
 
@@ -21,7 +21,7 @@ Kakao 장소 ID는 같은 건물의 층별 매장을 구분할 수 있지만, **
 
 다음 조건을 만족하면 자동 저장 대상이다.
 
-1. Instagram oEmbed 또는 HTML meta에서 캡션을 읽을 수 있다.
+1. Instagram HTML head의 `description`, `og:description`, `twitter:description` 중 하나에서 캡션을 읽을 수 있다.
 2. 캡션에 실제 장소명과 주소 또는 충분한 지역이 있다.
 3. Gemini가 그 문자열을 추론하지 않고 원문 그대로 반환한다.
 4. Kakao 키워드 검색에서 이름과 주소가 맞는 후보가 하나만 남는다.
@@ -30,6 +30,7 @@ Kakao 장소 ID는 같은 건물의 층별 매장을 구분할 수 있지만, **
 
 - 상호 또는 주소가 전혀 없는 릴스
 - OCR을 해야만 장소를 알 수 있는 릴스
+- 비공개·삭제·연령 제한으로 익명 HTML에 캡션 메타데이터가 없는 릴스
 - `용용선생` 같이 지점 근거 없이 브랜드명만 있는 캡션
 - 이름·주소 일치 후보가 두 개 이상인 모호한 캡션
 
@@ -38,18 +39,21 @@ Kakao 장소 ID는 같은 건물의 층별 매장을 구분할 수 있지만, **
 ```mermaid
 flowchart TD
     A["Instagram URL 접수"] --> B["reels: PROCESSING"]
-    B --> C["oEmbed / HTML meta에서 캡션 추출"]
-    C --> D{"cea1션 있음?"}
-    D -- "아니오" --> X["FAILED: IG_FETCH_FAILED"]
-    D -- "예" --> E["Gemini structured output: places[]"]
+    B --> C["릴스 HTML head 메타데이터 추출"]
+    C --> D{"description 캡션 있음?"}
+    D -- "아니오" --> C2["oEmbed / captioned embed fallback"]
+    C2 --> D2{"fallback 캡션 있음?"}
+    D2 -- "아니오" --> X["FAILED: IG_FETCH_FAILED"]
+    D2 -- "예" --> E["Gemini structured output: places[]"]
+    D -- "예" --> E
     E --> F["각 필드가 캡션 원문에 존재하는지 검증"]
     F --> G["각 장소별 범위 제한 Kakao 검색"]
     G --> H["후보 이름 + 지역 + 건물번호 대조"]
-    H --> I{"uc720일 후보인가?"}
+    H --> I{"유일한 후보인가?"}
     I -- "아니오" --> J["해당 추출 항목 스킵"]
     I -- "예" --> K["kakao_place_id로 places upsert"]
     K --> L["saved_places + reel_places upsert"]
-    J --> M{"uc800장된 장소가 1개 이상인가?"}
+    J --> M{"저장된 장소가 1개 이상인가?"}
     L --> M
     M -- "아니오" --> Y["FAILED: PLACE_NOT_FOUND"]
     M -- "예" --> N["reels.place_id = 첫 장소"]
@@ -70,8 +74,12 @@ sequenceDiagram
     App->>Fn: URL + JWT
     Fn->>DB: reels(PROCESSING)
     Fn-->>App: 202 + reelId
-    Fn->>IG: oEmbed / HTML
-    IG-->>Fn: caption + thumbnail
+    Fn->>IG: 릴스 HTML GET
+    IG-->>Fn: head description + thumbnail
+    opt HTML에 description 없음
+        Fn->>IG: oEmbed / captioned embed fallback
+        IG-->>Fn: caption + thumbnail
+    end
     Fn->>AI: 전체 caption + places[] schema
     AI-->>Fn: 0..N PlaceGuess
     loop 원문에 있는 각 PlaceGuess
@@ -91,7 +99,14 @@ sequenceDiagram
 ## 5. 의사코드
 
 ```text
-caption = fetchInstagramCaption(url)
+htmlMeta = fetchInstagramHtmlHead(url)
+caption = htmlMeta.description
+
+if caption is empty:
+    caption = fetchInstagramFallback(url)  // oEmbed, then captioned embed
+if caption is empty:
+    fail(IG_FETCH_FAILED)
+
 regexAddresses = extractAllRoadAddresses(caption)  // shadow log only
 
 rawPlaces = Gemini.extractPlaces(caption, maxItems=10)
@@ -180,6 +195,10 @@ Gemini는 상호와 `2층`까지 포함한 주소를 반환한다. Kakao 후보�
 
 Gemini가 두 개의 원소를 반환하고, Kakao에서 각각 유일하게 검증되면 `saved_places`에 두 행, `reel_places`에 순서 0과 1로 저장된다.
 
+### 연령 제한 계정
+
+`아리꿀꿀꽈배기` 릴스처럼 계정이 `15세 이상`으로 제한되면 로그인한 성인 사용자의 브라우저에는 릴스와 head 메타데이터가 보이지만, Instagram 계정 정보가 없는 Edge Function 요청에는 오류 페이지가 반환될 수 있다. 이때 HTML에는 캡션이 없고 fallback도 제한될 수 있으므로 Gemini와 Kakao 단계로 넘어가지 않고 `IG_FETCH_FAILED`가 된다. 이는 장소 파싱 실패가 아니라 Instagram 입력 수집 범위 밖의 실패다.
+
 ## 8. 정규식 조사
 
 ### 도로명 주소 후보
@@ -225,7 +244,9 @@ Gemini가 두 개의 원소를 반환하고, Kakao에서 각각 유일하게 검
 
 | 단계 | 예시 | 현재 결과 |
 |---|---|---|
-| Instagram | 비공개·삭제·로그인 차단 | `IG_FETCH_FAILED` |
+| Instagram HTML | `description` 메타데이터 제공 | 즉시 캡션으로 사용, 추가 Instagram 요청 없음 |
+| Instagram HTML | 비공개·삭제·연령 제한으로 오류 페이지 반환 | fallback 후에도 캡션이 없으면 `IG_FETCH_FAILED` |
+| Instagram fallback | HTML에 캡션이 없고 oEmbed/embed도 제한됨 | `IG_FETCH_FAILED` |
 | Gemini | 429, 모델 오류, 잘못된 JSON | 후보 0개, 최종 `PLACE_NOT_FOUND` |
 | 원문 검증 | Gemini가 캡션에 없는 지점명 추론 | 필드 제거 또는 항목 스킵 |
 | Kakao | REST API 키 누락·오류, 0건 | `PLACE_NOT_FOUND` |
@@ -238,11 +259,12 @@ Gemini가 두 개의 원소를 반환하고, Kakao에서 각각 유일하게 검
 
 MVP 출시 전 필수 통과 조건은 다음과 같다.
 
-1. 보연희 같은 도로명+상세주소 happy case가 정확한 Kakao ID로 저장됨
-2. 키리 지번 주소가 서울 키리엑스로 저장되지 않음
-3. 용용선생 브랜드명만 있는 캡션이 임의 지점으로 저장되지 않음
-4. 여러 장소 캡션에서 검증된 전체 장소가 `reel_places`에 순서대로 저장됨
-5. 같은 Kakao ID를 두 번 저장해도 `places`/`saved_places`가 중복되지 않음
-6. 신규 행의 카카오맵 버튼이 해당 장소 ID 페이지를 열고, 레거시 행은 이름+주소 검색을 염
+1. HTML head에 `description`이 있으면 추가 Instagram 요청 없이 그 캡션을 Gemini에 전달함
+2. 보연희 같은 도로명+상세주소 happy case가 정확한 Kakao ID로 저장됨
+3. 키리 지번 주소가 서울 키리엑스로 저장되지 않음
+4. 용용선생 브랜드명만 있는 캡션이 임의 지점으로 저장되지 않음
+5. 여러 장소 캡션에서 검증된 전체 장소가 `reel_places`에 순서대로 저장됨
+6. 같은 Kakao ID를 두 번 저장해도 `places`/`saved_places`가 중복되지 않음
+7. 신규 행의 카카오맵 버튼이 해당 장소 ID 페이지를 열고, 레거시 행은 이름+주소 검색을 염
 
 이 게이트를 통과하면 happy case MVP로 출시 가능하다. OCR, 사용자 후보 선택 UI, 공공주소 DB, 이전·폐업 동기화는 출시 후 확장 범위다.

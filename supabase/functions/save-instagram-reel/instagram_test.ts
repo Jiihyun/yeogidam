@@ -1,4 +1,5 @@
 import {
+  fetchInstagramMeta,
   parseInstagramEmbedCaption,
   parseInstagramMeta,
   parseInstagramOEmbed,
@@ -68,4 +69,50 @@ Deno.test("parses Instagram oEmbed JSON", () => {
     "📍보연희\n서울 서대문구 연희맛로 17-63 2층",
   );
   assertEquals(meta?.thumbnailUrl, "https://example.com/thumbnail.jpg");
+});
+
+Deno.test("uses reel HTML head metadata before any fallback", async () => {
+  const url = "https://www.instagram.com/reel/Db0azgWTF1h/";
+  const calls: string[] = [];
+  const request = (async (input: string | URL | Request) => {
+    calls.push(String(input));
+    return new Response(
+      `<head><meta name="description" content="보연희 서울 서대문구 연희맛로 17-63 2층"></head>`,
+      { status: 200, headers: { "content-type": "text/html" } },
+    );
+  }) as typeof fetch;
+
+  const meta = await fetchInstagramMeta(url, request);
+
+  assertEquals(meta.description, "보연희 서울 서대문구 연희맛로 17-63 2층");
+  assertEquals(calls.length, 1);
+  assertEquals(calls[0], url);
+});
+
+Deno.test("uses oEmbed only when reel HTML has no caption", async () => {
+  const url = "https://www.instagram.com/reel/Db0azgWTF1h/";
+  const calls: string[] = [];
+  const request = (async (input: string | URL | Request) => {
+    calls.push(String(input));
+    if (calls.length === 1) {
+      return new Response("<head><title>Instagram</title></head>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      });
+    }
+    return Response.json({
+      author_name: "opetion_h",
+      title: "보연희 서울 서대문구 연희맛로 17-63 2층",
+    });
+  }) as typeof fetch;
+
+  const meta = await fetchInstagramMeta(url, request);
+
+  assertEquals(meta.description, "보연희 서울 서대문구 연희맛로 17-63 2층");
+  assertEquals(calls.length, 2);
+  assertEquals(calls[0], url);
+  assertEquals(
+    calls[1].startsWith("https://www.instagram.com/api/v1/oembed/"),
+    true,
+  );
 });

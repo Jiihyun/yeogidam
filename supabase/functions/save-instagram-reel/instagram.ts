@@ -123,22 +123,18 @@ function embedCaptionUrl(url: string): string {
   return parsed.toString();
 }
 
-export async function fetchInstagramMeta(url: string): Promise<InstagramMeta> {
+export async function fetchInstagramMeta(
+  url: string,
+  request: typeof fetch = fetch,
+): Promise<InstagramMeta> {
   const headers = {
     "User-Agent":
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "ko,en;q=0.9",
   };
 
-  const oEmbedUrl = new URL("https://www.instagram.com/api/v1/oembed/");
-  oEmbedUrl.searchParams.set("url", url);
-  const oEmbedRes = await fetch(oEmbedUrl, { headers, redirect: "follow" });
-  if (oEmbedRes.ok) {
-    const oEmbed = parseInstagramOEmbed(await oEmbedRes.json(), url);
-    if (oEmbed) return oEmbed;
-  }
-
-  const res = await fetch(url, {
+  // The reel page head is the primary caption source.
+  const res = await request(url, {
     headers: {
       ...headers,
     },
@@ -147,9 +143,24 @@ export async function fetchInstagramMeta(url: string): Promise<InstagramMeta> {
   if (!res.ok) throw new Error(`instagram fetch failed: ${res.status}`);
   const html = await res.text();
   const meta = parseInstagramMeta(html);
-  if (meta.title || meta.description) return meta;
+  if (meta.description) return meta;
 
-  const embedRes = await fetch(embedCaptionUrl(url), {
+  const oEmbedUrl = new URL("https://www.instagram.com/api/v1/oembed/");
+  oEmbedUrl.searchParams.set("url", url);
+  const oEmbedRes = await request(oEmbedUrl, { headers, redirect: "follow" });
+  if (oEmbedRes.ok) {
+    const oEmbed = parseInstagramOEmbed(await oEmbedRes.json(), url);
+    if (oEmbed) {
+      return {
+        title: meta.title ?? oEmbed.title,
+        description: oEmbed.description,
+        thumbnailUrl: meta.thumbnailUrl ?? oEmbed.thumbnailUrl,
+        canonicalUrl: meta.canonicalUrl ?? oEmbed.canonicalUrl,
+      };
+    }
+  }
+
+  const embedRes = await request(embedCaptionUrl(url), {
     headers,
     redirect: "follow",
   });
