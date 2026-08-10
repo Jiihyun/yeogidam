@@ -122,7 +122,7 @@ sequenceDiagram
 
 `saved_places(user_id, place_id)`는 사용자별 중복을 막고, `reel_places(reel_id, place_id, position)`는 하나의 릴스와 여러 장소 관계를 보존한다. 기존 앱 호환을 위해 `reels.place_id`는 첫 장소를 계속 가리킨다.
 
-기존 `naver_place_id`, `naver_link`는 레거시 행 호환을 위해 유지하지만 신규 저장에서 사용하지 않는다.
+Naver 전용 `naver_place_id`, `naver_link`, `naver_thumbnail_url`은 Kakao 전환 마이그레이션에서 제거한다. 장소 식별자와 지도 링크의 SSOT는 각각 `kakao_place_id`, `kakao_place_url`이다.
 
 ## 7. 썸네일
 
