@@ -1,17 +1,26 @@
 // POST /functions/v1/save-instagram-reel
 // 1) JWT 인증 → 2) IG URL 검증 → 3) reels(PROCESSING) insert → 4) 202 즉시 반환
-// → 5) waitUntil 백그라운드 파이프라인(IG 추출 → 주소/장소 → 네이버 매칭 → 썸네일 → DB)
+// → 5) waitUntil 백그라운드 파이프라인(IG 추출 → Gemini 다중 장소 추출 → Kakao 검증 → 썸네일 → DB)
 //
 // 로컬 검증용: 환경변수 PIPELINE_SYNC=1 이면 백그라운드 대신 동기로 처리하고
 // 최종 상태를 응답에 담아 반환한다(테스트 편의). 프로덕션 기본은 비동기(202).
 
 import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 import { fetchInstagramMeta } from "./instagram.ts";
-import { extractKoreanAddress } from "./address.ts";
-import { extractPlaceWithGemini } from "./gemini.ts";
-import { searchNaverPlace } from "./naver.ts";
+import { extractKoreanAddresses } from "./address.ts";
+import { extractPlacesWithGemini, type PlaceGuess } from "./gemini.ts";
+import {
+  buildKakaoMapURL,
+  type KakaoPlace,
+  searchKakaoPlaces,
+} from "./kakao.ts";
+import {
+  buildKakaoQueries,
+  sanitizePlaceGuesses,
+  verifiedKakaoPlaces,
+} from "./matching.ts";
 import { findGooglePlacePhoto } from "./google.ts";
-import { rehostThumbnail, scrapeNaverImage } from "./thumbnail.ts";
+import { rehostThumbnail, scrapePageImage } from "./thumbnail.ts";
 
 // Supabase Edge Runtime 전역 (백그라운드 처리)
 declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void };
@@ -35,7 +44,7 @@ const IG_RE =
 
 type FailureReason = "IG_FETCH_FAILED" | "PLACE_NOT_FOUND" | "UNKNOWN";
 
-// 로컬 검증 전용 스텁 (STUB_PROVIDERS=1 일 때만 사용). Gemini/네이버 키 없이
+// 로컬 검증 전용 스텁 (STUB_PROVIDERS=1 일 때만 사용). Gemini/Kakao 키 없이
 // 파이프라인 전체(추출→매칭→저장→썸네일)를 결정적으로 검증하기 위한 것.
 // 프로덕션에서는 이 플래그를 켜지 않는다.
 const STUB_META = {
@@ -46,14 +55,14 @@ const STUB_META = {
   canonicalUrl: null as string | null,
 };
 const STUB_PLACE = {
-  naverPlaceId: "stub-1001",
+  kakaoPlaceId: "stub-1001",
   name: "여기담 스텁 카페",
   category: "카페",
   roadAddress: "서울 성동구 연무장길 12",
   address: "서울 성동구 성수동2가 273-14",
   latitude: 37.5445,
   longitude: 127.0557,
-  link: null as string | null,
+  placeUrl: null as string | null,
   telephone: null as string | null,
 };
 const STUB_THUMBNAIL = {
@@ -128,6 +137,12 @@ interface ProcessResult {
   status: "COMPLETED" | "FAILED";
   failureReason?: FailureReason;
   placeId?: string;
+  placeIds?: string[];
+}
+
+interface MatchedPlace {
+  guess: PlaceGuess;
+  place: KakaoPlace;
 }
 
 async function processReel(
@@ -161,110 +176,205 @@ async function processReel(
 
     const caption = [meta.title, meta.description].filter(Boolean).join("\n");
 
-    // 2. 상세주소 전체를 먼저 추출해 네이버 검색
-    const naverId = Deno.env.get("NAVER_SEARCH_CLIENT_ID");
-    const naverSecret = Deno.env.get("NAVER_SEARCH_CLIENT_SECRET");
-    if (!stub && (!naverId || !naverSecret)) {
+    // 2. 정규식 추출은 의사결정에 쓰지 않고 커버리지 관측용으로만 남겨둔다.
+    const regexAddresses = extractKoreanAddresses(caption);
+    console.info(JSON.stringify({
+      event: "regex_addresses_shadow",
+      reelId,
+      addresses: regexAddresses,
+    }));
+
+    // 3. Gemini가 전체 캡션에서 모든 장소를 구조화하고, 원문에 실제 있는 문자열만 남긴다.
+    const kakaoKey = Deno.env.get("KAKAO_REST_API_KEY");
+    const geminiKey = Deno.env.get("GEMINI_API_KEY");
+    if (!stub && (!kakaoKey || !geminiKey)) {
       return await fail(admin, reelId, "PLACE_NOT_FOUND");
     }
 
-    const address = extractKoreanAddress(caption);
-    let place = stub
-      ? (address ? STUB_PLACE : null)
-      : (address
-        ? await searchNaverPlace(address, naverId!, naverSecret!)
-        : null);
+    let matchedPlaces: MatchedPlace[] = [];
+    if (stub) {
+      matchedPlaces = [{
+        guess: {
+          placeName: STUB_PLACE.name,
+          address: regexAddresses[0] ?? null,
+          addressType: regexAddresses.length > 0 ? "ROAD" : "NONE",
+          region: "성동구",
+        },
+        place: STUB_PLACE,
+      }];
+    } else if (caption) {
+      const extracted = await extractPlacesWithGemini(caption, geminiKey!);
+      const guesses = sanitizePlaceGuesses(extracted, caption);
+      console.info(JSON.stringify({
+        event: "gemini_place_guesses_sanitized",
+        reelId,
+        extractedCount: extracted.length,
+        sanitizedCount: guesses.length,
+      }));
 
-    // 3. 주소 검색 실패 시에만 Gemini로 장소명·지역을 추출해 재검색
-    if (!place && !stub && caption) {
-      const geminiKey = Deno.env.get("GEMINI_API_KEY");
-      const guess = geminiKey
-        ? await extractPlaceWithGemini(caption, geminiKey)
-        : null;
-      const placeName = guess?.placeName ?? null;
-      const region = guess?.region ?? null;
-      for (const q of buildQueries({ address, placeName, region })) {
-        place = await searchNaverPlace(q, naverId!, naverSecret!);
-        if (place) break;
+      for (const guess of guesses) {
+        const candidates: KakaoPlace[] = [];
+        for (const query of buildKakaoQueries(guess)) {
+          candidates.push(
+            ...await searchKakaoPlaces(query, kakaoKey!),
+          );
+        }
+        const verified = verifiedKakaoPlaces(guess, candidates);
+        console.info(JSON.stringify({
+          event: "kakao_place_candidates_verified",
+          reelId,
+          guess,
+          candidateCount: candidates.length,
+          verifiedCount: verified.length,
+          verifiedPlaceIds: verified.map((place) => place.kakaoPlaceId),
+        }));
+
+        // 0개는 실패, 2개 이상은 모호함이다. 유일하게 검증된 장소만 저장한다.
+        if (verified.length === 1) {
+          matchedPlaces.push({ guess, place: verified[0] });
+        }
       }
     }
-    if (!place) return await fail(admin, reelId, "PLACE_NOT_FOUND");
-
-    // 4. places upsert (naver_place_id 기준 중복 방지)
-    const { data: placeRow, error: placeErr } = await admin
-      .from("places")
-      .upsert(
-        {
-          naver_place_id: place.naverPlaceId,
-          name: place.name,
-          category: place.category,
-          road_address: place.roadAddress,
-          address: place.address,
-          ...(address ? { source_address: address } : {}),
-          latitude: place.latitude,
-          longitude: place.longitude,
-          naver_link: place.link,
-          telephone: place.telephone,
-        },
-        { onConflict: "naver_place_id" },
-      )
-      .select("id, thumbnail_url, google_place_id")
-      .single();
-    if (placeErr || !placeRow) return await fail(admin, reelId, "UNKNOWN");
-
-    // 5. 썸네일: places 캐시 → Google Places → Instagram og:image → 네이버 스크래핑 → null(앱 로고)
-    const thumbnail = placeRow.thumbnail_url
-      ? {
-        url: placeRow.thumbnail_url as string,
-        source: null,
-        googlePlaceId: null,
-        attribution: null,
-      }
-      : await resolveThumbnail(admin, reelId, place, meta.thumbnailUrl, stub);
-
-    if (!placeRow.thumbnail_url && thumbnail.url) {
-      await admin
-        .from("places")
-        .update({
-          google_place_id: thumbnail.googlePlaceId,
-          thumbnail_url: thumbnail.url,
-          thumbnail_source: thumbnail.source,
-          photo_attribution: thumbnail.attribution,
-        })
-        .eq("id", placeRow.id);
+    matchedPlaces = deduplicateMatchedPlaces(matchedPlaces);
+    if (matchedPlaces.length === 0) {
+      return await fail(admin, reelId, "PLACE_NOT_FOUND");
     }
 
-    // 6. saved_places upsert (user_id, place_id) — 이미 있으면 무시(장소 중복 방지)
-    await admin
-      .from("saved_places")
-      .upsert(
-        {
-          user_id: userId,
-          place_id: placeRow.id,
-          thumbnail_url: thumbnail.url,
-        },
-        { onConflict: "user_id,place_id", ignoreDuplicates: true },
+    // 4. 검증된 모든 장소를 places/saved_places/reel_places에 순서대로 저장한다.
+    const placeIds: string[] = [];
+    for (const [position, match] of matchedPlaces.entries()) {
+      const placeId = await persistMatchedPlace(
+        admin,
+        reelId,
+        userId,
+        position,
+        match,
+        meta.thumbnailUrl,
+        stub,
       );
+      placeIds.push(placeId);
+    }
 
-    // 7. reels 완료
-    await admin
+    // 5. 기존 앱 호환을 위해 reels.place_id는 첫 번째 장소를 가리킨다.
+    const { error: reelUpdateError } = await admin
       .from("reels")
       .update({
-        place_id: placeRow.id,
+        place_id: placeIds[0],
         processing_status: "COMPLETED",
         failure_reason: null,
       })
       .eq("id", reelId);
+    if (reelUpdateError) throw reelUpdateError;
 
-    return { status: "COMPLETED", placeId: placeRow.id };
-  } catch {
+    return {
+      status: "COMPLETED",
+      placeId: placeIds[0],
+      placeIds,
+    };
+  } catch (error) {
+    console.error(JSON.stringify({
+      event: "reel_processing_failed",
+      reelId,
+      message: error instanceof Error ? error.message : String(error),
+    }));
     return await fail(admin, reelId, "UNKNOWN");
   }
 }
 
+function deduplicateMatchedPlaces(matches: MatchedPlace[]): MatchedPlace[] {
+  const unique = new Map<string, MatchedPlace>();
+  for (const match of matches) {
+    if (!unique.has(match.place.kakaoPlaceId)) {
+      unique.set(match.place.kakaoPlaceId, match);
+    }
+  }
+  return [...unique.values()];
+}
+
+async function persistMatchedPlace(
+  admin: SupabaseClient,
+  reelId: string,
+  userId: string,
+  position: number,
+  { guess, place }: MatchedPlace,
+  instagramThumbnailUrl: string | null,
+  stub: boolean,
+): Promise<string> {
+  const { data: placeRow, error: placeError } = await admin
+    .from("places")
+    .upsert(
+      {
+        kakao_place_id: place.kakaoPlaceId,
+        name: place.name,
+        category: place.category,
+        road_address: place.roadAddress,
+        address: place.address,
+        ...(guess.address ? { source_address: guess.address } : {}),
+        latitude: place.latitude,
+        longitude: place.longitude,
+        kakao_place_url: buildKakaoMapURL(place.kakaoPlaceId),
+        telephone: place.telephone,
+      },
+      { onConflict: "kakao_place_id" },
+    )
+    .select("id, thumbnail_url, google_place_id")
+    .single();
+  if (placeError || !placeRow) throw placeError ?? new Error("place_missing");
+
+  const thumbnail = placeRow.thumbnail_url
+    ? {
+      url: placeRow.thumbnail_url as string,
+      source: null,
+      googlePlaceId: null,
+      attribution: null,
+    }
+    : await resolveThumbnail(
+      admin,
+      `${reelId}-${position}`,
+      place,
+      instagramThumbnailUrl,
+      stub,
+    );
+
+  if (!placeRow.thumbnail_url && thumbnail.url) {
+    const { error } = await admin
+      .from("places")
+      .update({
+        google_place_id: thumbnail.googlePlaceId,
+        thumbnail_url: thumbnail.url,
+        thumbnail_source: thumbnail.source,
+        photo_attribution: thumbnail.attribution,
+      })
+      .eq("id", placeRow.id);
+    if (error) throw error;
+  }
+
+  const { error: savedPlaceError } = await admin
+    .from("saved_places")
+    .upsert(
+      {
+        user_id: userId,
+        place_id: placeRow.id,
+        thumbnail_url: thumbnail.url,
+      },
+      { onConflict: "user_id,place_id", ignoreDuplicates: true },
+    );
+  if (savedPlaceError) throw savedPlaceError;
+
+  const { error: reelPlaceError } = await admin
+    .from("reel_places")
+    .upsert(
+      { reel_id: reelId, place_id: placeRow.id, position },
+      { onConflict: "reel_id,place_id" },
+    );
+  if (reelPlaceError) throw reelPlaceError;
+
+  return placeRow.id as string;
+}
+
 interface ThumbnailResult {
   url: string | null;
-  source: "google_places" | "instagram" | "naver" | null;
+  source: "google_places" | "instagram" | "kakao" | null;
   googlePlaceId: string | null;
   attribution: string | null;
 }
@@ -278,12 +388,12 @@ async function reserveGooglePlacesThumbnail(
 
 async function resolveThumbnail(
   admin: SupabaseClient,
-  reelId: string,
+  thumbnailKey: string,
   place: {
     name: string;
     roadAddress: string | null;
     address: string | null;
-    link: string | null;
+    placeUrl: string | null;
   },
   instagramThumbnailUrl: string | null,
   stub: boolean,
@@ -291,7 +401,7 @@ async function resolveThumbnail(
   if (stub) {
     const url = await rehostThumbnail(
       admin,
-      `${reelId}-google`,
+      `${thumbnailKey}-google`,
       STUB_THUMBNAIL.url,
     );
     if (url) {
@@ -312,7 +422,7 @@ async function resolveThumbnail(
     if (googlePhoto) {
       const url = await rehostThumbnail(
         admin,
-        `${reelId}-google`,
+        `${thumbnailKey}-google`,
         googlePhoto.photoUri,
       );
       if (url) {
@@ -329,7 +439,7 @@ async function resolveThumbnail(
   if (instagramThumbnailUrl) {
     const url = await rehostThumbnail(
       admin,
-      `${reelId}-instagram`,
+      `${thumbnailKey}-instagram`,
       instagramThumbnailUrl,
     );
     if (url) {
@@ -342,29 +452,19 @@ async function resolveThumbnail(
     }
   }
 
-  const naverImage = await scrapeNaverImage(place.link);
-  if (naverImage) {
-    const url = await rehostThumbnail(admin, `${reelId}-naver`, naverImage);
+  const kakaoImage = await scrapePageImage(place.placeUrl);
+  if (kakaoImage) {
+    const url = await rehostThumbnail(
+      admin,
+      `${thumbnailKey}-kakao`,
+      kakaoImage,
+    );
     if (url) {
-      return { url, source: "naver", googlePlaceId: null, attribution: null };
+      return { url, source: "kakao", googlePlaceId: null, attribution: null };
     }
   }
 
   return { url: null, source: null, googlePlaceId: null, attribution: null };
-}
-
-function buildQueries(
-  { address, placeName, region }: {
-    address: string | null;
-    placeName: string | null;
-    region: string | null;
-  },
-): string[] {
-  const q: string[] = [];
-  if (region && placeName) q.push(`${region} ${placeName}`);
-  if (placeName && address) q.push(`${placeName} ${address}`);
-  if (placeName) q.push(placeName);
-  return [...new Set(q.map((s) => s.trim()).filter(Boolean))];
 }
 
 async function fail(

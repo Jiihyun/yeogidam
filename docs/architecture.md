@@ -33,7 +33,7 @@ flowchart LR
 
     FN --> IG["Instagram oEmbed / HTML"]
     FN --> GEMINI["Gemini"]
-    FN --> NAVER["Naver API HUB 지역 검색"]
+    FN --> KAKAO["Kakao Local API"]
     FN --> GOOGLE["Google Places API (New)"]
     FN --> STORAGE["Supabase Storage"]
     FN -->|"service_role"| DB
@@ -48,7 +48,7 @@ flowchart LR
 - `YeogidamAPI`: Edge Function 호출과 PostgREST 조회·삭제
 - `SavedPlacesView`: 완료 장소와 처리 중·실패 릴스 표시
 - `AddByURLSheet`: Instagram URL 직접 입력
-- `SavedPlaceDetailView`: 사진, 주소, 카테고리, 좌표, Naver 링크 표시
+- `SavedPlaceDetailView`: 사진, 주소, 카테고리, 좌표, Kakao 장소 링크 표시
 
 Supabase URL과 `anon` 키는 Xcode build setting을 통해 두 타깃의 `Info.plist`에 주입합니다. `anon` 키는 공개 클라이언트 키이며 권한은 RLS로 제한합니다.
 
@@ -76,10 +76,12 @@ erDiagram
     AUTH_USERS ||--o{ SAVED_PLACES : saves
     PLACES ||--o{ REELS : matched_to
     PLACES ||--o{ SAVED_PLACES : referenced_by
+    REELS ||--o{ REEL_PLACES : contains
+    PLACES ||--o{ REEL_PLACES : appears_in
 
     PLACES {
       uuid id PK
-      text naver_place_id UK
+      text kakao_place_id UK
       text google_place_id
       text name
       text source_address
@@ -98,6 +100,11 @@ erDiagram
       text processing_status
       text failure_reason
     }
+    REEL_PLACES {
+      uuid reel_id PK,FK
+      uuid place_id PK,FK
+      int position
+    }
     SAVED_PLACES {
       uuid id PK
       uuid user_id FK
@@ -108,6 +115,7 @@ erDiagram
 
 - `places`: 모든 인증 사용자가 읽는 공용 장소 정규화 결과
 - `reels`: 사용자 요청과 처리 상태를 보관
+- `reel_places`: 하나의 릴스에서 검증된 여러 장소와 노출 순서
 - `saved_places`: 사용자와 장소의 유일한 연결, `(user_id, place_id)` unique
 - `provider_usage_monthly`: Google 썸네일 워크플로 예약 횟수
 
@@ -119,6 +127,7 @@ erDiagram
 | `places` | 전체 조회 | 생성·수정 |
 | `reels` | 본인 조회·삭제 | 생성·수정 |
 | `saved_places` | 본인 조회·삭제 | 생성·수정 |
+| `reel_places` | 접근 불가 | 생성·수정 |
 | `provider_usage_monthly` | 접근 불가 | 예약 RPC 실행 |
 | `place-thumbnails` | 공개 읽기 | 업로드 |
 
@@ -127,9 +136,9 @@ erDiagram
 | 제공자 | 역할 | 실패 시 동작 |
 |---|---|---|
 | Instagram | 캡션과 원본 썸네일 후보 | `IG_FETCH_FAILED` |
-| Gemini | 상세주소 Naver 검색 실패 후 비정형 캡션에서 장소명·지역 추출 | `PLACE_NOT_FOUND` |
-| Naver API HUB | 장소명, 주소, 카테고리, 좌표 정규화 | `PLACE_NOT_FOUND` |
-| Google Places | 대표 사진과 Google Place ID | Instagram/Naver 이미지로 폴백 |
+| Gemini | 전체 캡션에서 여러 장소명·주소·지역 구조화 | `PLACE_NOT_FOUND` |
+| Kakao Local API | 장소 ID, 이름, 주소, 카테고리, 좌표 정규화 | `PLACE_NOT_FOUND` |
+| Google Places | 대표 사진과 Google Place ID | Instagram/Kakao 이미지로 폴백 |
 | Supabase Storage | 선택된 썸네일 저장 | 이미지 없이 장소 저장 가능 |
 
 ## 6. 비동기 처리 모델
@@ -145,7 +154,8 @@ Edge Function은 인증과 입력 검증 후 `reels(PROCESSING)`을 먼저 생�
 - 익명 인증과 RLS
 - URL 직접 입력과 Share Extension
 - Instagram 캡션 다단계 추출
-- 층·동·호 포함 상세주소 우선 검색과 Gemini·Naver 장소명 폴백
+- Gemini-first 다중 장소 추출과 원문 문자열 검증
+- Kakao 장소 ID 기준 중복 방지와 유일 후보 확정
 - 장소와 사용자 저장 데이터 분리
 - Google Places 썸네일, 제공자 폴백, Storage 업로드
 - 월간 DB hard cap과 Google Cloud 일일 quota
@@ -153,7 +163,7 @@ Edge Function은 인증과 입력 검증 후 `reels(PROCESSING)`을 먼저 생�
 
 ### 미완료
 
-- Naver 지도 실제 화면
+- Kakao 지도 실제 화면
 - Apple/카카오 로그인과 익명 계정 링크
 - Share Extension의 만료 토큰 자체 갱신
 - Realtime 또는 polling 기반 자동 완료 반영
@@ -167,4 +177,4 @@ Edge Function은 인증과 입력 검증 후 `reels(PROCESSING)`을 먼저 생�
 2. Share Extension은 access token 만료 시 사용자에게 앱 실행을 요청하며 자체 refresh를 하지 않습니다.
 3. 외부 이미지 업로드 실패는 장소 저장을 막지 않지만, 일부 DB update 오류도 현재 best-effort로 처리됩니다.
 4. Google Places 사진 재호스팅은 현행 Google Maps Platform 저장 제한과 충돌할 수 있습니다. 프로덕션 출시 전에 [운영 가이드](deployment-and-operations.md)의 정책 항목을 해결해야 합니다.
-5. Naver 지역 검색의 첫 후보를 별도 일치도 검증 없이 저장하므로 동명 장소·다지점 브랜드에서 false positive가 발생할 수 있습니다. 출시 판단과 최소 보완안은 [장소 매칭 보고서](mvp-place-matching-release-report.md)를 참고합니다.
+5. Kakao 장소 ID는 중복은 막지만 오탐을 막지 못합니다. 현재는 이름·지역·건물번호 일치 후 유일한 후보만 저장하며, 상세 기준은 [장소 매칭 보고서](mvp-place-matching-release-report.md)를 참고합니다.

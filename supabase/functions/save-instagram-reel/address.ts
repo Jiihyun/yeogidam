@@ -7,12 +7,23 @@ const ROAD_ADDRESS =
   `(?:${SIDO})\\s*[가-힣]{1,10}(?:시|군|구)\\s*[가-힣0-9]{1,20}(?:로|길)\\s*\\d+(?:-\\d+)?`;
 const ADDRESS_DETAIL =
   `(?:\\s+(?:(?:지하\\s*)?\\d+\\s*층|B\\d+\\s*층|\\d+\\s*동|\\d+\\s*호))*`;
-const ADDRESS_RE = new RegExp(`${ROAD_ADDRESS}${ADDRESS_DETAIL}`, "i");
+const ADDRESS_RE = new RegExp(`${ROAD_ADDRESS}${ADDRESS_DETAIL}`, "gi");
+
+export function extractKoreanAddresses(
+  text: string | null | undefined,
+): string[] {
+  if (!text) return [];
+
+  const seen = new Set<string>();
+  for (const match of text.matchAll(ADDRESS_RE)) {
+    const address = match[0].replace(/\s+/g, " ").trim();
+    if (address) seen.add(address);
+  }
+  return [...seen];
+}
 
 export function extractKoreanAddress(
   text: string | null | undefined,
 ): string | null {
-  if (!text) return null;
-  const m = text.match(ADDRESS_RE);
-  return m ? m[0].replace(/\s+/g, " ").trim() : null;
+  return extractKoreanAddresses(text)[0] ?? null;
 }

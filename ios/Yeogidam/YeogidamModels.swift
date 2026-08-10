@@ -47,7 +47,7 @@ struct PlaceRow: Identifiable, Decodable {
     let address: String?
     let latitude: Double?
     let longitude: Double?
-    let naverLink: String?
+    let kakaoPlaceURL: String?
     let thumbnailURL: String?
     let photoAttribution: String?
 
@@ -60,7 +60,7 @@ struct PlaceRow: Identifiable, Decodable {
         case address
         case latitude
         case longitude
-        case naverLink = "naver_link"
+        case kakaoPlaceURL = "kakao_place_url"
         case thumbnailURL = "thumbnail_url"
         case photoAttribution = "photo_attribution"
     }

@@ -1,5 +1,5 @@
 // 썸네일 처리: 외부 이미지 URL → Storage 재호스팅.
-// MVP 에서는 Google Places / Instagram / Naver 후보 이미지를 Supabase Storage 에 다시 올린다.
+// MVP 에서는 Google Places / Instagram / Kakao 후보 이미지를 Supabase Storage 에 다시 올린다.
 
 import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
 
@@ -11,8 +11,8 @@ function publicStorageUrl(path: string): string {
   return `${base}/storage/v1/object/public/place-thumbnails/${path}`;
 }
 
-// 네이버 place 링크 페이지의 og:image 를 베스트에포트로 긁는다. 실패하면 null.
-export async function scrapeNaverImage(
+// 장소 상세 페이지의 og:image를 베스트에포트로 읽는다. 실패하면 null.
+export async function scrapePageImage(
   link: string | null,
 ): Promise<string | null> {
   if (!link) return null;

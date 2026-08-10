@@ -1,7 +1,7 @@
-import { extractKoreanAddress } from "./address.ts";
+import { extractKoreanAddress, extractKoreanAddresses } from "./address.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
-  if (actual !== expected) {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error(
       `Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
     );
@@ -40,4 +40,17 @@ Deno.test("does not depend on a place marker or emoji", () => {
     extractKoreanAddress(caption),
     "서울 마포구 연남로1길 44 1층",
   );
+});
+
+Deno.test("extracts every distinct road address in caption order", () => {
+  const caption = `
+    서울 서대문구 연희맛로 17-63 2층
+    광주 동구 제봉로110번길 17 1층
+    서울 서대문구 연희맛로 17-63 2층
+  `;
+
+  assertEquals(extractKoreanAddresses(caption), [
+    "서울 서대문구 연희맛로 17-63 2층",
+    "광주 동구 제봉로110번길 17 1층",
+  ]);
 });

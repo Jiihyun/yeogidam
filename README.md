@@ -2,7 +2,7 @@
 
 Instagram 릴스에서 발견한 장소를 추출해 개인 장소 목록에 저장하는 iOS MVP입니다.
 
-현재 MVP는 SwiftUI 앱과 Share Extension, Supabase Auth/Postgres/Storage/Edge Functions로 구성됩니다. 인증은 익명 로그인을 사용하며, 릴스 캡션에서 장소와 주소를 찾아 Naver 지역 검색으로 정규화합니다.
+현재 MVP는 SwiftUI 앱과 Share Extension, Supabase Auth/Postgres/Storage/Edge Functions로 구성됩니다. 인증은 익명 로그인을 사용하며, Gemini가 릴스 캡션의 여러 장소와 주소를 구조화하고 Kakao Local API로 검증·정규화합니다.
 
 ## 현재 구현 범위
 
@@ -10,7 +10,7 @@ Instagram 릴스에서 발견한 장소를 추출해 개인 장소 목록에 저
 - 릴스 URL 직접 입력
 - Instagram Share Extension
 - 비동기 장소 추출 및 처리 상태 표시
-- Naver 지역 검색 기반 장소 저장
+- Kakao 장소 ID 기반 장소 저장과 다중 장소 처리
 - Google Places 대표 사진 조회 및 썸네일 폴백
 - 저장 장소 목록, 상세 화면, 삭제
 - RLS, Storage, 외부 API 사용량 제한

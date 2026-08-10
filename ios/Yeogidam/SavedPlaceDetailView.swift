@@ -7,6 +7,23 @@ struct SavedPlaceDetailView: View {
         URL(string: savedPlace.thumbnailURL ?? savedPlace.place.thumbnailURL ?? "")
     }
 
+    private var kakaoMapURL: URL? {
+        if let rawLink = savedPlace.place.kakaoPlaceURL,
+           let link = URL(string: rawLink) {
+            return link
+        }
+
+        let address = savedPlace.place.roadAddress ?? savedPlace.place.address
+        let query = [savedPlace.place.name, address]
+            .compactMap { $0 }
+            .joined(separator: " ")
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "map.kakao.com"
+        components.path = "/link/search/\(query)"
+        return components.url
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -30,8 +47,8 @@ struct SavedPlaceDetailView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                if let link = savedPlace.place.naverLink, let url = URL(string: link) {
-                    Link("네이버 플레이스에서 보기", destination: url)
+                if let url = kakaoMapURL {
+                    Link("카카오맵에서 보기", destination: url)
                         .buttonStyle(.borderedProminent)
                 }
 
