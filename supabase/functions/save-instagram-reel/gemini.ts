@@ -6,11 +6,35 @@ export interface PlaceGuess {
   region: string | null;
 }
 
+export function parseGeminiPlaceGuess(data: unknown): PlaceGuess | null {
+  try {
+    const response = data as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: unknown }> } }>;
+    };
+    const text = response.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (typeof text !== "string") return null;
+
+    const parsed = JSON.parse(text) as {
+      placeName?: unknown;
+      region?: unknown;
+    };
+    const placeName = typeof parsed.placeName === "string"
+      ? parsed.placeName.trim() || null
+      : null;
+    const region = typeof parsed.region === "string"
+      ? parsed.region.trim() || null
+      : null;
+    return placeName || region ? { placeName, region } : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function extractPlaceWithGemini(
   caption: string,
   apiKey: string,
 ): Promise<PlaceGuess | null> {
-  const model = Deno.env.get("GEMINI_MODEL") ?? "gemini-2.0-flash";
+  const model = Deno.env.get("GEMINI_MODEL") ?? "gemini-3.5-flash-lite";
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
@@ -39,16 +63,32 @@ export async function extractPlaceWithGemini(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const errorBody = (await res.text()).slice(0, 500);
+      console.error(JSON.stringify({
+        event: "gemini_place_extraction_failed",
+        model,
+        status: res.status,
+        message: errorBody,
+      }));
+      return null;
+    }
     const data = await res.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) return null;
-    const parsed = JSON.parse(text);
-    return {
-      placeName: parsed.placeName ?? null,
-      region: parsed.region ?? null,
-    };
-  } catch {
+    const guess = parseGeminiPlaceGuess(data);
+    console.info(JSON.stringify({
+      event: "gemini_place_extraction_completed",
+      model,
+      placeName: guess?.placeName ?? null,
+      region: guess?.region ?? null,
+    }));
+    return guess;
+  } catch (error) {
+    console.error(JSON.stringify({
+      event: "gemini_place_extraction_failed",
+      model,
+      status: null,
+      message: error instanceof Error ? error.message : String(error),
+    }));
     return null;
   }
 }

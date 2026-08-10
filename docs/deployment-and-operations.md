@@ -19,7 +19,7 @@ Edge Function에 필요한 사용자 설정 secret:
 
 ```text
 GEMINI_API_KEY
-GEMINI_MODEL                 선택, 기본 gemini-2.0-flash
+GEMINI_MODEL                 선택, 기본 gemini-3.5-flash-lite
 NAVER_SEARCH_CLIENT_ID
 NAVER_SEARCH_CLIENT_SECRET
 GOOGLE_PLACES_API_KEY
