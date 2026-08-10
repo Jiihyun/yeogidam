@@ -10,9 +10,13 @@ packages:
     from: "2.0.0"
 settings:
   base:
+    DEVELOPMENT_TEAM: N76TPYXBX5
+    CODE_SIGN_STYLE: Automatic
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
     SWIFT_VERSION: "5.0"
+    SUPABASE_URL: "https://hbbrgudsbvnwuylxqlta.supabase.co"
+    SUPABASE_ANON_KEY: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhiYnJndWRzYnZud3V5bHhxbHRhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYxNzY3MTYsImV4cCI6MjEwMTc1MjcxNn0.cn1Kyqmpj9G0Q2znAI0BDaMus6wkhwvnkJhSS1sOIUo"
 targets:
   Yeogidam:
     type: application
@@ -22,10 +26,13 @@ targets:
     dependencies:
       - package: Supabase
         product: Supabase
+      - target: ShareExtension
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.yeogidam.app
         TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_ENTITLEMENTS: Yeogidam/Yeogidam.entitlements
     info:
       path: Yeogidam/Info.plist
       properties:
@@ -39,3 +46,27 @@ targets:
             127.0.0.1:
               NSExceptionAllowsInsecureHTTPLoads: true
               NSIncludesSubdomains: true
+        SUPABASE_URL: $(SUPABASE_URL)
+        SUPABASE_ANON_KEY: $(SUPABASE_ANON_KEY)
+  ShareExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - ShareExtension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yeogidam.app.ShareExtension
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_ENTITLEMENTS: ShareExtension/ShareExtension.entitlements
+    info:
+      path: ShareExtension/Info.plist
+      properties:
+        CFBundleDisplayName: 여기담
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+        SUPABASE_URL: $(SUPABASE_URL)
+        SUPABASE_ANON_KEY: $(SUPABASE_ANON_KEY)

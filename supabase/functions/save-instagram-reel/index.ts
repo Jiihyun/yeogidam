@@ -7,9 +7,10 @@
 
 import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 import { fetchInstagramMeta } from "./instagram.ts";
-import { extractKoreanAddress } from "./address.ts";
+import { extractKoreanAddress, extractPinnedPlaceName } from "./address.ts";
 import { extractPlaceWithGemini } from "./gemini.ts";
 import { searchNaverPlace } from "./naver.ts";
+import { findGooglePlacePhoto } from "./google.ts";
 import { rehostThumbnail, scrapeNaverImage } from "./thumbnail.ts";
 
 // Supabase Edge Runtime 전역 (백그라운드 처리)
@@ -17,7 +18,8 @@ declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void };
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
@@ -38,7 +40,8 @@ type FailureReason = "IG_FETCH_FAILED" | "PLACE_NOT_FOUND" | "UNKNOWN";
 // 프로덕션에서는 이 플래그를 켜지 않는다.
 const STUB_META = {
   title: "성수 카페 추천",
-  description: "서울 성동구 연무장길 12 에 있는 여기담 스텁 카페 ☕️ 분위기 좋아요",
+  description:
+    "서울 성동구 연무장길 12 에 있는 여기담 스텁 카페 ☕️ 분위기 좋아요",
   thumbnailUrl: "https://picsum.photos/seed/yeogidam/600/600",
   canonicalUrl: null as string | null,
 };
@@ -53,6 +56,11 @@ const STUB_PLACE = {
   link: null as string | null,
   telephone: null as string | null,
 };
+const STUB_THUMBNAIL = {
+  googlePlaceId: "google-stub-1001",
+  url: "https://picsum.photos/seed/yeogidam-google/600/600",
+  attribution: "Google Places stub",
+};
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
@@ -63,12 +71,17 @@ Deno.serve(async (req) => {
   const SERVICE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
   // 1) JWT 인증
-  const token = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "");
+  const token = (req.headers.get("Authorization") ?? "").replace(
+    /^Bearer\s+/i,
+    "",
+  );
   if (!token) return json({ error: "unauthorized" }, 401);
   const authClient = createClient(SUPABASE_URL, ANON, {
     global: { headers: { Authorization: `Bearer ${token}` } },
   });
-  const { data: userData, error: userErr } = await authClient.auth.getUser(token);
+  const { data: userData, error: userErr } = await authClient.auth.getUser(
+    token,
+  );
   if (userErr || !userData.user) return json({ error: "unauthorized" }, 401);
   const userId = userData.user.id;
 
@@ -80,8 +93,12 @@ Deno.serve(async (req) => {
     return json({ error: "invalid_body" }, 400);
   }
   const instagramUrl = (payload.instagramUrl ?? "").trim();
-  const source = payload.source === "url_input" ? "url_input" : "instagram_share";
-  if (!IG_RE.test(instagramUrl)) return json({ error: "invalid_instagram_url" }, 400);
+  const source = payload.source === "url_input"
+    ? "url_input"
+    : "instagram_share";
+  if (!IG_RE.test(instagramUrl)) {
+    return json({ error: "invalid_instagram_url" }, 400);
+  }
 
   // 3) reels(PROCESSING) insert (service_role → RLS 우회)
   const admin = createClient(SUPABASE_URL, SERVICE);
@@ -125,7 +142,12 @@ async function processReel(
     let meta;
     try {
       meta = stub ? STUB_META : await fetchInstagramMeta(instagramUrl);
-    } catch {
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "instagram_fetch_failed",
+        reelId,
+        message: error instanceof Error ? error.message : String(error),
+      }));
       return await fail(admin, reelId, "IG_FETCH_FAILED");
     }
     await admin
@@ -142,36 +164,35 @@ async function processReel(
     // 2. 주소 정규식(1순위)로 네이버 검색
     const naverId = Deno.env.get("NAVER_SEARCH_CLIENT_ID");
     const naverSecret = Deno.env.get("NAVER_SEARCH_CLIENT_SECRET");
-    if (!stub && (!naverId || !naverSecret)) return await fail(admin, reelId, "PLACE_NOT_FOUND");
+    if (!stub && (!naverId || !naverSecret)) {
+      return await fail(admin, reelId, "PLACE_NOT_FOUND");
+    }
 
     const address = extractKoreanAddress(caption);
+    let placeName = extractPinnedPlaceName(caption);
+    let region: string | null = null;
     let place = stub
       ? (address ? STUB_PLACE : null)
-      : (address ? await searchNaverPlace(address, naverId!, naverSecret!) : null);
+      : (address
+        ? await searchNaverPlace(address, naverId!, naverSecret!)
+        : null);
 
     // 3. 실패 시 Gemini 로 장소명 추출(2순위) 후 재검색
     if (!place && !stub && caption) {
       const geminiKey = Deno.env.get("GEMINI_API_KEY");
-      let placeName: string | null = null;
-      let region: string | null = null;
-      if (geminiKey) {
+      if (!placeName && geminiKey) {
         const guess = await extractPlaceWithGemini(caption, geminiKey);
         placeName = guess?.placeName ?? null;
         region = guess?.region ?? null;
       }
       for (const q of buildQueries({ address, placeName, region })) {
-        place = await searchNaverPlace(q, naverId, naverSecret);
+        place = await searchNaverPlace(q, naverId!, naverSecret!);
         if (place) break;
       }
     }
     if (!place) return await fail(admin, reelId, "PLACE_NOT_FOUND");
 
-    // 4. 썸네일: 네이버 대표 이미지(베스트에포트) → IG og:image → 없으면 null(로고는 앱에서)
-    const naverImage = await scrapeNaverImage(place.link);
-    const sourceImage = naverImage ?? meta.thumbnailUrl;
-    const thumbnailUrl = sourceImage ? await rehostThumbnail(admin, reelId, sourceImage) : null;
-
-    // 5. places upsert (naver_place_id 기준 중복 방지)
+    // 4. places upsert (naver_place_id 기준 중복 방지)
     const { data: placeRow, error: placeErr } = await admin
       .from("places")
       .upsert(
@@ -184,33 +205,153 @@ async function processReel(
           latitude: place.latitude,
           longitude: place.longitude,
           naver_link: place.link,
-          naver_thumbnail_url: naverImage,
           telephone: place.telephone,
         },
         { onConflict: "naver_place_id" },
       )
-      .select("id")
+      .select("id, thumbnail_url, google_place_id")
       .single();
     if (placeErr || !placeRow) return await fail(admin, reelId, "UNKNOWN");
+
+    // 5. 썸네일: places 캐시 → Google Places → Instagram og:image → 네이버 스크래핑 → null(앱 로고)
+    const thumbnail = placeRow.thumbnail_url
+      ? {
+        url: placeRow.thumbnail_url as string,
+        source: null,
+        googlePlaceId: null,
+        attribution: null,
+      }
+      : await resolveThumbnail(admin, reelId, place, meta.thumbnailUrl, stub);
+
+    if (!placeRow.thumbnail_url && thumbnail.url) {
+      await admin
+        .from("places")
+        .update({
+          google_place_id: thumbnail.googlePlaceId,
+          thumbnail_url: thumbnail.url,
+          thumbnail_source: thumbnail.source,
+          photo_attribution: thumbnail.attribution,
+        })
+        .eq("id", placeRow.id);
+    }
 
     // 6. saved_places upsert (user_id, place_id) — 이미 있으면 무시(장소 중복 방지)
     await admin
       .from("saved_places")
       .upsert(
-        { user_id: userId, place_id: placeRow.id, thumbnail_url: thumbnailUrl },
+        {
+          user_id: userId,
+          place_id: placeRow.id,
+          thumbnail_url: thumbnail.url,
+        },
         { onConflict: "user_id,place_id", ignoreDuplicates: true },
       );
 
     // 7. reels 완료
     await admin
       .from("reels")
-      .update({ place_id: placeRow.id, processing_status: "COMPLETED", failure_reason: null })
+      .update({
+        place_id: placeRow.id,
+        processing_status: "COMPLETED",
+        failure_reason: null,
+      })
       .eq("id", reelId);
 
     return { status: "COMPLETED", placeId: placeRow.id };
   } catch {
     return await fail(admin, reelId, "UNKNOWN");
   }
+}
+
+interface ThumbnailResult {
+  url: string | null;
+  source: "google_places" | "instagram" | "naver" | null;
+  googlePlaceId: string | null;
+  attribution: string | null;
+}
+
+async function reserveGooglePlacesThumbnail(
+  admin: SupabaseClient,
+): Promise<boolean> {
+  const { data, error } = await admin.rpc("reserve_google_places_thumbnail");
+  return !error && data === true;
+}
+
+async function resolveThumbnail(
+  admin: SupabaseClient,
+  reelId: string,
+  place: {
+    name: string;
+    roadAddress: string | null;
+    address: string | null;
+    link: string | null;
+  },
+  instagramThumbnailUrl: string | null,
+  stub: boolean,
+): Promise<ThumbnailResult> {
+  if (stub) {
+    const url = await rehostThumbnail(
+      admin,
+      `${reelId}-google`,
+      STUB_THUMBNAIL.url,
+    );
+    if (url) {
+      return {
+        url,
+        source: "google_places",
+        googlePlaceId: STUB_THUMBNAIL.googlePlaceId,
+        attribution: STUB_THUMBNAIL.attribution,
+      };
+    }
+  }
+
+  const googleKey = Deno.env.get("GOOGLE_PLACES_API_KEY");
+  if (googleKey && await reserveGooglePlacesThumbnail(admin)) {
+    const q = [place.name, place.roadAddress ?? place.address].filter(Boolean)
+      .join(" ");
+    const googlePhoto = await findGooglePlacePhoto(q, googleKey);
+    if (googlePhoto) {
+      const url = await rehostThumbnail(
+        admin,
+        `${reelId}-google`,
+        googlePhoto.photoUri,
+      );
+      if (url) {
+        return {
+          url,
+          source: "google_places",
+          googlePlaceId: googlePhoto.placeId,
+          attribution: googlePhoto.attribution,
+        };
+      }
+    }
+  }
+
+  if (instagramThumbnailUrl) {
+    const url = await rehostThumbnail(
+      admin,
+      `${reelId}-instagram`,
+      instagramThumbnailUrl,
+    );
+    if (url) {
+      return {
+        url,
+        source: "instagram",
+        googlePlaceId: null,
+        attribution: null,
+      };
+    }
+  }
+
+  const naverImage = await scrapeNaverImage(place.link);
+  if (naverImage) {
+    const url = await rehostThumbnail(admin, `${reelId}-naver`, naverImage);
+    if (url) {
+      return { url, source: "naver", googlePlaceId: null, attribution: null };
+    }
+  }
+
+  return { url: null, source: null, googlePlaceId: null, attribution: null };
 }
 
 function buildQueries(

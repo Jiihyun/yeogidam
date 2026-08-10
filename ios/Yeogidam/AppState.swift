@@ -17,9 +17,17 @@ final class AppState: ObservableObject {
     /// 앱 시작 시: 저장된 세션을 복원하고, 이후 인증 상태 변화를 계속 반영한다.
     func start() async {
         session = try? await auth.session
+        if session == nil, let tokens = SharedSessionStore.load() {
+            session = try? await auth.setSession(
+                accessToken: tokens.accessToken,
+                refreshToken: tokens.refreshToken
+            )
+        }
+        SharedSessionStore.save(session)
         isLoading = false
         for await change in auth.authStateChanges {
             session = change.session
+            SharedSessionStore.save(change.session)
         }
     }
 
@@ -29,6 +37,7 @@ final class AppState: ObservableObject {
         defer { isWorking = false }
         do {
             session = try await auth.signInAnonymously()
+            SharedSessionStore.save(session)
         } catch {
             errorMessage = "시작하지 못했어요. 잠시 후 다시 시도해주세요."
         }
@@ -39,6 +48,7 @@ final class AppState: ObservableObject {
         defer { isWorking = false }
         try? await auth.signOut()
         session = nil
+        SharedSessionStore.clear()
     }
 
     /// 현재 사용자 식별자(마이페이지 표시용).

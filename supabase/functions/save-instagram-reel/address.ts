@@ -8,8 +8,23 @@ const ADDRESS_RE = new RegExp(
   `(?:${SIDO})\\s*[가-힣]{1,10}(?:시|군|구)\\s*[가-힣0-9]{1,20}(?:로|길)\\s*\\d+(?:-\\d+)?`,
 );
 
-export function extractKoreanAddress(text: string | null | undefined): string | null {
+export function extractKoreanAddress(
+  text: string | null | undefined,
+): string | null {
   if (!text) return null;
   const m = text.match(ADDRESS_RE);
   return m ? m[0].replace(/\s+/g, " ").trim() : null;
+}
+
+export function extractPinnedPlaceName(
+  text: string | null | undefined,
+): string | null {
+  if (!text) return null;
+  const match = text.match(/(?:^|\n)\s*📍\s*([^\n]{1,80})/u);
+  if (!match) return null;
+
+  const name = match[1]
+    .replace(/\s*(?:[-|·]|주소\s*:)\s*.*/, "")
+    .trim();
+  return name || null;
 }

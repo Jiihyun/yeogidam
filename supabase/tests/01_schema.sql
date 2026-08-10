@@ -1,5 +1,5 @@
 begin;
-select plan(21);
+select plan(26);
 
 -- 테이블 존재
 select has_table('public', 'profiles',      'profiles 테이블 존재');
@@ -17,6 +17,10 @@ select col_is_pk('public', 'saved_places', 'id', 'saved_places.id PK');
 select has_column('public', 'reels', 'processing_status', 'reels.processing_status 존재');
 select has_column('public', 'reels', 'instagram_url',     'reels.instagram_url 존재');
 select has_column('public', 'places', 'naver_place_id',   'places.naver_place_id 존재');
+select has_column('public', 'places', 'google_place_id',  'places.google_place_id 존재');
+select has_column('public', 'places', 'thumbnail_url',    'places.thumbnail_url 존재');
+select has_column('public', 'places', 'thumbnail_source', 'places.thumbnail_source 존재');
+select has_column('public', 'places', 'photo_attribution','places.photo_attribution 존재');
 select has_column('public', 'saved_places', 'thumbnail_url', 'saved_places.thumbnail_url 존재');
 
 -- NOT NULL
@@ -49,6 +53,12 @@ prepare bad_reason as
   insert into public.reels (user_id, instagram_url, failure_reason)
   values ('00000000-0000-0000-0000-000000000000', 'https://x', 'NOPE');
 select throws_ok('bad_reason', '23514', null, 'failure_reason 잘못된 값은 check 위반');
+
+-- places.thumbnail_source CHECK
+prepare bad_thumbnail_source as
+  insert into public.places (name, thumbnail_source)
+  values ('A', 'kakao');
+select throws_ok('bad_thumbnail_source', '23514', null, 'thumbnail_source 잘못된 값은 check 위반');
 
 -- saved_places.place_id NOT NULL 위반
 prepare null_place as
