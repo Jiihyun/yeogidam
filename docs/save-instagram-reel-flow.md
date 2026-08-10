@@ -21,7 +21,7 @@ Content-Type: application/json
 }
 ```
 
-정상 접수는 `202`와 `reelId`를 반환한다. 이는 최종 저장 성공이 아니라 백그라운드 처리 시작을 뜻한다.
+신규 접수는 `202`와 `reelId`를 반환한다. 이미 완료된 동일 릴스 결과를 재사용한 경우에는 `200`, `status: COMPLETED`, `reused: true`, `placeIds`를 바로 반환한다.
 
 ## 2. 전체 순서
 
@@ -37,7 +37,12 @@ sequenceDiagram
     participant S as Storage
 
     U->>F: URL + JWT
-    F->>F: JWT와 Instagram URL 검증
+    F->>F: JWT 검증 + URL에서 shortcode 정규화
+    F->>D: 동일 사용자 또는 완료된 shortcode 조회
+    alt 재사용 가능한 결과 있음
+        F->>D: saved_places + reel_places 복원/복사
+        F-->>U: 200/202 + 기존 결과 + reused=true
+    else 신규 또는 재처리 필요
     F->>D: reels(PROCESSING) insert
     F-->>U: 202 + reelId
     F->>I: oEmbed / HTML meta
@@ -54,6 +59,7 @@ sequenceDiagram
         F->>D: saved_places + reel_places upsert
     end
     F->>D: reels(COMPLETED / FAILED)
+    end
 ```
 
 ## 3. Instagram 추출
@@ -108,6 +114,8 @@ sequenceDiagram
 - 시·도·시·군·구·동 토큰이 후보 주소와 일치
 - 출처 주소에 건물번호가 있으면 Kakao 도로명 또는 지번 주소와 일치
 
+캡션과 Kakao 상호명이 한 글자만 다른 경우에는 이름이 4글자 이상이고 주소 근거가 강할 때만 오타로 보정한다. 도로명·건물번호가 같거나, 도로명 숫자의 인접 두 자리가 뒤바뀐 경우까지 허용한다. 다른 도로·건물번호, 지역 근거만 있는 후보는 이 보정을 적용하지 않는다.
+
 중복 제거 후 후보가 하나일 때만 확정한다. 0개나 2개 이상이면 해당 추출 항목을 스킵한다.
 
 ## 6. 저장과 중복
@@ -121,6 +129,13 @@ sequenceDiagram
 - `road_address`, `address`, 좌표, 전화, 카테고리: Kakao 정규화 결과
 
 `saved_places(user_id, place_id)`는 사용자별 중복을 막고, `reel_places(reel_id, place_id, position)`는 하나의 릴스와 여러 장소 관계를 보존한다. 기존 앱 호환을 위해 `reels.place_id`는 첫 장소를 계속 가리킨다.
+
+`reels.instagram_shortcode`는 Instagram 콘텐츠 식별자다. `(user_id, instagram_shortcode)` partial unique index로 같은 사용자의 동시 중복 요청을 한 행으로 수렴시킨다.
+
+- 같은 사용자의 `PROCESSING` 또는 `COMPLETED`: 기존 `reelId`와 상태 반환
+- 다른 사용자의 같은 shortcode가 현재 알고리즘 버전으로 완료됨: 장소 관계와 저장 목록만 복사하고 외부 API 생략
+- `FAILED`, 15분 이상 갱신되지 않은 작업, 낮은 `processing_version`: 같은 행을 비우고 재처리
+- 완료된 릴스의 저장 장소를 사용자가 삭제한 뒤 다시 저장: 기존 `reel_places`에서 `saved_places` 복원
 
 Naver 전용 `naver_place_id`, `naver_link`, `naver_thumbnail_url`은 Kakao 전환 마이그레이션에서 제거한다. 장소 식별자와 지도 링크의 SSOT는 각각 `kakao_place_id`, `kakao_place_url`이다.
 

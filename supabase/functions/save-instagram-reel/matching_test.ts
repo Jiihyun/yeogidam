@@ -113,3 +113,87 @@ Deno.test("accepts a Kakao branch suffix but keeps ambiguous matches visible", (
 
   assertEquals(result.map((place) => place.kakaoPlaceId), ["one", "two"]);
 });
+
+Deno.test("accepts a one-character place-name typo at the exact road address", () => {
+  const source = guess(
+    "파티세르시즈널",
+    "광산구 수완로52번길 46-13 1층",
+    "전남광주",
+  );
+  const result = verifiedKakaoPlaces(source, [
+    candidate(
+      "seasonal",
+      "파티세리시즈널",
+      "전남광주통합특별시 광산구 수완로52번길 46-13",
+      "전남광주통합특별시 광산구 수완동 1706",
+    ),
+  ]);
+
+  assertEquals(result.map((place) => place.kakaoPlaceId), ["seasonal"]);
+});
+
+Deno.test("accepts adjacent road-number transposition with one-character name typo", () => {
+  const source = guess(
+    "브래드누아젯",
+    "광산구 수완로160번길 40",
+    "전남광주",
+  );
+  const result = verifiedKakaoPlaces(source, [
+    candidate(
+      "noisette",
+      "브레드누아젯",
+      "전남광주통합특별시 광산구 수완로106번길 40",
+      "전남광주통합특별시 광산구 수완동 1280",
+    ),
+  ]);
+
+  assertEquals(result.map((place) => place.kakaoPlaceId), ["noisette"]);
+});
+
+Deno.test("rejects fuzzy place names without strong address agreement", () => {
+  const source = guess(
+    "브래드누아젯",
+    "광산구 수완로160번길 40",
+    "전남광주",
+  );
+  const result = verifiedKakaoPlaces(source, [
+    candidate(
+      "different-road",
+      "브레드누아젯",
+      "전남광주통합특별시 광산구 임방울대로 40",
+      null,
+    ),
+    candidate(
+      "different-number",
+      "브레드누아젯",
+      "전남광주통합특별시 광산구 수완로106번길 41",
+      null,
+    ),
+    candidate(
+      "short-name",
+      "키라",
+      "광주광역시 동구 동명로 10",
+      "광주광역시 동구 동명동 200-188",
+    ),
+  ]);
+
+  assertEquals(result, []);
+});
+
+Deno.test("does not treat a building number substring as the same address", () => {
+  const source = guess(
+    "보연희",
+    "서울 서대문구 연희맛로 17-63 2층",
+    "연희동",
+  );
+  const result = verifiedKakaoPlaces(source, [
+    candidate(
+      "wrong-building",
+      "보연희",
+      "서울특별시 서대문구 연희맛로 117-63",
+      null,
+    ),
+  ]);
+
+  assertEquals(result, []);
+});

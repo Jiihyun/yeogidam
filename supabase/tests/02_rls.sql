@@ -1,5 +1,5 @@
 begin;
-select plan(8);
+select plan(10);
 
 -- 두 명의 유저를 auth.users에 직접 생성 (테스트 픽스처)
 insert into auth.users (id, aud, role, email)
@@ -17,6 +17,39 @@ insert into public.places (id, name) values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa
 insert into public.reels (id, user_id, instagram_url)
 values ('cccccccc-cccc-cccc-cccc-cccccccccccc', '11111111-1111-1111-1111-111111111111', 'https://ig/u1'),
        ('dddddddd-dddd-dddd-dddd-dddddddddddd', '22222222-2222-2222-2222-222222222222', 'https://ig/u2');
+insert into public.reels (user_id, instagram_url, instagram_shortcode)
+values (
+  '11111111-1111-1111-1111-111111111111',
+  'https://www.instagram.com/reel/cache-test/',
+  'cache-test'
+);
+
+prepare duplicate_user_reel as
+  insert into public.reels (user_id, instagram_url, instagram_shortcode)
+  values (
+    '11111111-1111-1111-1111-111111111111',
+    'https://instagram.com/reels/cache-test/?igsh=duplicate',
+    'cache-test'
+  );
+select throws_ok(
+  'duplicate_user_reel',
+  '23505',
+  null,
+  '같은 사용자의 동일 Instagram shortcode 중복 저장 불가'
+);
+
+prepare shared_reel_other_user as
+  insert into public.reels (user_id, instagram_url, instagram_shortcode)
+  values (
+    '22222222-2222-2222-2222-222222222222',
+    'https://www.instagram.com/reel/cache-test/',
+    'cache-test'
+  );
+select lives_ok(
+  'shared_reel_other_user',
+  '다른 사용자는 동일 Instagram shortcode 저장 가능'
+);
+delete from public.reels where instagram_shortcode = 'cache-test';
 insert into public.saved_places (user_id, place_id)
 values ('11111111-1111-1111-1111-111111111111', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
 

@@ -104,6 +104,13 @@ function buildingNumber(value: string): string | null {
   return match?.[1] ?? null;
 }
 
+function hasBuildingNumber(value: string, expected: string): boolean {
+  const matches = value.normalize("NFKC").matchAll(
+    /(?:^|\s)(?:산\s*)?(\d+(?:-\d+)?)(?=\s|$|번지|,|\))/g,
+  );
+  return [...matches].some((match) => match[1] === expected);
+}
+
 function candidateLocation(place: KakaoPlace): string {
   return [place.roadAddress, place.address].filter(Boolean).join(" ");
 }
@@ -114,12 +121,12 @@ function addressMatches(source: string, candidate: string): boolean {
   if (tokens.some((token) => !candidateCompact.includes(token))) return false;
 
   const number = buildingNumber(source);
-  if (number && !candidateCompact.includes(compact(number))) return false;
+  if (number && !hasBuildingNumber(candidate, number)) return false;
 
   return tokens.length > 0 || number !== null;
 }
 
-function nameMatches(expected: string, actual: string): boolean {
+function exactNameMatches(expected: string, actual: string): boolean {
   const expectedName = compact(expected);
   const actualName = compact(actual);
   if (!expectedName || !actualName) return false;
@@ -133,6 +140,94 @@ function nameMatches(expected: string, actual: string): boolean {
   return false;
 }
 
+function differsByOneCharacter(left: string, right: string): boolean {
+  if (left === right || Math.abs(left.length - right.length) > 1) return false;
+
+  let leftIndex = 0;
+  let rightIndex = 0;
+  let edits = 0;
+  while (leftIndex < left.length && rightIndex < right.length) {
+    if (left[leftIndex] === right[rightIndex]) {
+      leftIndex += 1;
+      rightIndex += 1;
+      continue;
+    }
+
+    edits += 1;
+    if (edits > 1) return false;
+    if (left.length > right.length) leftIndex += 1;
+    else if (right.length > left.length) rightIndex += 1;
+    else {
+      leftIndex += 1;
+      rightIndex += 1;
+    }
+  }
+
+  if (leftIndex < left.length || rightIndex < right.length) edits += 1;
+  return edits === 1;
+}
+
+function likelyNameTypo(expected: string, actual: string): boolean {
+  const expectedName = compact(expected);
+  const actualName = compact(actual);
+  return expectedName.length >= 4 && actualName.length >= 4 &&
+    differsByOneCharacter(expectedName, actualName);
+}
+
+function roadToken(value: string): string | null {
+  const token = value.normalize("NFKC").split(/\s+/).find((part) =>
+    /^[가-힣][가-힣0-9.·-]*(?:대로|로|길)$/.test(part)
+  );
+  return token ? compact(token) : null;
+}
+
+function isAdjacentTransposition(left: string, right: string): boolean {
+  if (left.length !== right.length) return false;
+  const differences: number[] = [];
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) differences.push(index);
+  }
+  if (differences.length !== 2 || differences[1] !== differences[0] + 1) {
+    return false;
+  }
+  const [first, second] = differences;
+  return left[first] === right[second] && left[second] === right[first];
+}
+
+function roadMatchesOrHasTransposedDigits(
+  source: string,
+  candidate: string,
+): boolean {
+  const sourceRoad = roadToken(source);
+  const candidateRoad = roadToken(candidate);
+  if (!sourceRoad || !candidateRoad) return false;
+  if (sourceRoad === candidateRoad) return true;
+
+  const sourceShape = sourceRoad.replace(/\d/g, "#");
+  const candidateShape = candidateRoad.replace(/\d/g, "#");
+  if (sourceShape !== candidateShape) return false;
+
+  const sourceDigits = sourceRoad.replace(/\D/g, "");
+  const candidateDigits = candidateRoad.replace(/\D/g, "");
+  return sourceDigits.length > 1 &&
+    isAdjacentTransposition(sourceDigits, candidateDigits);
+}
+
+function hasStrongAddressEvidence(source: string, candidate: string): boolean {
+  if (!addressMatches(source, candidate)) return false;
+
+  const number = buildingNumber(source);
+  if (!number || !hasBuildingNumber(candidate, number)) return false;
+
+  const sourceRoad = roadToken(source);
+  if (sourceRoad) return roadMatchesOrHasTransposedDigits(source, candidate);
+
+  // 지번 주소는 동/읍/면/리와 번지가 모두 맞을 때만 한 글자 상호명 보정을 허용한다.
+  return hardRegionTokens(source).some((token) =>
+    /(?:동|읍|면|리)$/.test(token)
+  );
+}
+
 export function verifiedKakaoPlaces(
   guess: PlaceGuess,
   candidates: KakaoPlace[],
@@ -140,12 +235,21 @@ export function verifiedKakaoPlaces(
   const unique = new Map<string, KakaoPlace>();
 
   for (const candidate of candidates) {
-    if (!nameMatches(guess.placeName, candidate.name)) continue;
+    const exactName = exactNameMatches(guess.placeName, candidate.name);
+    const typoName = !exactName && likelyNameTypo(
+      guess.placeName,
+      candidate.name,
+    );
+    if (!exactName && !typoName) continue;
     const location = candidateLocation(candidate);
 
     if (guess.address) {
       if (!addressMatches(guess.address, location)) continue;
+      if (typoName && !hasStrongAddressEvidence(guess.address, location)) {
+        continue;
+      }
     } else {
+      if (typoName) continue;
       const regionTokens = hardRegionTokens(guess.region);
       const locationCompact = compact(location);
       if (

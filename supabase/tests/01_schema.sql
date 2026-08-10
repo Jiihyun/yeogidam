@@ -1,5 +1,5 @@
 begin;
-select plan(37);
+select plan(40);
 
 -- 테이블 존재
 select has_table('public', 'profiles',      'profiles 테이블 존재');
@@ -17,6 +17,8 @@ select col_is_pk('public', 'saved_places', 'id', 'saved_places.id PK');
 -- 핵심 컬럼
 select has_column('public', 'reels', 'processing_status', 'reels.processing_status 존재');
 select has_column('public', 'reels', 'instagram_url',     'reels.instagram_url 존재');
+select has_column('public', 'reels', 'instagram_shortcode', 'reels.instagram_shortcode 존재');
+select has_column('public', 'reels', 'processing_version', 'reels.processing_version 존재');
 select has_column('public', 'places', 'google_place_id',  'places.google_place_id 존재');
 select has_column('public', 'places', 'thumbnail_url',    'places.thumbnail_url 존재');
 select has_column('public', 'places', 'thumbnail_source', 'places.thumbnail_source 존재');
@@ -38,6 +40,13 @@ select col_not_null('public', 'reels', 'user_id',       'reels.user_id NOT NULL'
 select col_not_null('public', 'saved_places', 'place_id','saved_places.place_id NOT NULL');
 select col_not_null('public', 'places', 'name',          'places.name NOT NULL');
 select col_not_null('public', 'reel_places', 'position', 'reel_places.position NOT NULL');
+
+select has_index(
+  'public',
+  'reels',
+  'reels_user_instagram_shortcode_key',
+  '사용자별 Instagram shortcode unique index 존재'
+);
 
 -- UNIQUE / CHECK 동작 검증
 -- places.kakao_place_id UNIQUE

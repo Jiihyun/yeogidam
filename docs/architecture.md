@@ -114,7 +114,7 @@ erDiagram
 ```
 
 - `places`: 모든 인증 사용자가 읽는 공용 장소 정규화 결과
-- `reels`: 사용자 요청과 처리 상태를 보관
+- `reels`: 사용자 요청·처리 상태·Instagram shortcode·알고리즘 버전을 보관
 - `reel_places`: 하나의 릴스에서 검증된 여러 장소와 노출 순서
 - `saved_places`: 사용자와 장소의 유일한 연결, `(user_id, place_id)` unique
 - `provider_usage_monthly`: Google 썸네일 워크플로 예약 횟수
@@ -143,7 +143,7 @@ erDiagram
 
 ## 6. 비동기 처리 모델
 
-Edge Function은 인증과 입력 검증 후 `reels(PROCESSING)`을 먼저 생성하고 HTTP `202`를 반환합니다. 실제 추출은 `EdgeRuntime.waitUntil()`에서 계속됩니다.
+Edge Function은 인증과 입력 검증 후 shortcode 캐시를 먼저 확인합니다. 같은 사용자의 처리 중·완료 행은 기존 상태를 반환하고, 다른 사용자의 현재 버전 완료 결과는 장소 관계만 복사합니다. 캐시가 없을 때 `reels(PROCESSING)`을 생성하고 HTTP `202`를 반환하며 실제 추출은 `EdgeRuntime.waitUntil()`에서 계속됩니다. 실패·구버전·15분 이상 정체된 행은 같은 `reelId`로 재처리합니다.
 
 앱은 저장 직후 `saved_places`와 `reels`를 다시 조회합니다. 현재 Realtime 구독과 자동 polling은 없으며 화면 진입 또는 당겨서 새로고침으로 갱신합니다.
 
@@ -156,6 +156,7 @@ Edge Function은 인증과 입력 검증 후 `reels(PROCESSING)`을 먼저 생�
 - Instagram 캡션 다단계 추출
 - Gemini-first 다중 장소 추출과 원문 문자열 검증
 - Kakao 장소 ID 기준 중복 방지와 유일 후보 확정
+- Instagram shortcode 기반 중복 요청 방지와 완료 결과 재사용
 - 장소와 사용자 저장 데이터 분리
 - Google Places 썸네일, 제공자 폴백, Storage 업로드
 - 월간 DB hard cap과 Google Cloud 일일 quota
