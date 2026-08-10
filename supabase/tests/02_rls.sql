@@ -1,5 +1,5 @@
 begin;
-select plan(10);
+select plan(13);
 
 -- 두 명의 유저를 auth.users에 직접 생성 (테스트 픽스처)
 insert into auth.users (id, aud, role, email)
@@ -17,6 +17,9 @@ insert into public.places (id, name) values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa
 insert into public.reels (id, user_id, instagram_url)
 values ('cccccccc-cccc-cccc-cccc-cccccccccccc', '11111111-1111-1111-1111-111111111111', 'https://ig/u1'),
        ('dddddddd-dddd-dddd-dddd-dddddddddddd', '22222222-2222-2222-2222-222222222222', 'https://ig/u2');
+insert into public.reel_places (reel_id, place_id, position)
+values ('cccccccc-cccc-cccc-cccc-cccccccccccc', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 0),
+       ('dddddddd-dddd-dddd-dddd-dddddddddddd', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 0);
 insert into public.reels (user_id, instagram_url, instagram_shortcode)
 values (
   '11111111-1111-1111-1111-111111111111',
@@ -68,6 +71,11 @@ select is(
   (select count(*)::int from public.saved_places),
   1, '유저1은 자신의 saved_places 1건만 조회');
 
+-- 유저1은 본인 릴스의 장소 관계만 봄
+select is(
+  (select count(*)::int from public.reel_places),
+  1, '유저1은 본인 릴스의 reel_places만 조회');
+
 -- places는 공개 → 조회 가능
 select is(
   (select count(*)::int from public.places),
@@ -84,6 +92,20 @@ prepare ins_reel as
   values ('11111111-1111-1111-1111-111111111111', 'https://ig/hack');
 select throws_ok('ins_reel', '42501', null, '사용자는 reels 직접 INSERT 불가');
 
+prepare ins_reel_place as
+  insert into public.reel_places (reel_id, place_id, position)
+  values (
+    'cccccccc-cccc-cccc-cccc-cccccccccccc',
+    'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+    1
+  );
+select throws_ok(
+  'ins_reel_place',
+  '42501',
+  null,
+  '사용자는 reel_places 직접 INSERT 불가'
+);
+
 -- 유저2 컨텍스트로 전환
 select set_config('request.jwt.claims',
   json_build_object('sub','22222222-2222-2222-2222-222222222222','role','authenticated')::text, true);
@@ -92,6 +114,10 @@ select set_config('request.jwt.claims',
 select is(
   (select count(*)::int from public.saved_places),
   0, '유저2는 유저1의 saved_places 조회 불가');
+
+select is(
+  (select count(*)::int from public.reel_places),
+  1, '유저2는 본인 릴스의 reel_places만 조회');
 
 -- 유저2는 유저1의 reels를 삭제 불가 (본인 것만 삭제 → 0 rows affected)
 with del as (

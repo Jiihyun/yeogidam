@@ -57,6 +57,20 @@ struct YeogidamAPI {
         _ = try await data(for: request, acceptedStatusCodes: 200..<300)
     }
 
+    func fetchRelatedReels(placeID: UUID) async throws -> [RelatedReelRow] {
+        var components = restComponents(path: "reels")
+        components.queryItems = [
+            URLQueryItem(
+                name: "select",
+                value: "id,instagram_url,instagram_thumbnail_url,created_at,reel_places!inner(place_id)"
+            ),
+            URLQueryItem(name: "processing_status", value: "eq.COMPLETED"),
+            URLQueryItem(name: "reel_places.place_id", value: "eq.\(placeID.uuidString)"),
+            URLQueryItem(name: "order", value: "created_at.desc"),
+        ]
+        return try await get(components)
+    }
+
     private func fetchSavedPlaces() async throws -> [SavedPlaceRow] {
         var components = restComponents(path: "saved_places")
         components.queryItems = [

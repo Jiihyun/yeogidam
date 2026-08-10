@@ -84,6 +84,20 @@ struct ReelRow: Identifiable, Decodable {
     }
 }
 
+struct RelatedReelRow: Identifiable, Decodable {
+    let id: UUID
+    let instagramURL: String
+    let instagramThumbnailURL: String?
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case instagramURL = "instagram_url"
+        case instagramThumbnailURL = "instagram_thumbnail_url"
+        case createdAt = "created_at"
+    }
+}
+
 struct SavedPlacesSnapshot {
     let savedPlaces: [SavedPlaceRow]
     let activeReels: [ReelRow]
