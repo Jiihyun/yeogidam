@@ -8,6 +8,7 @@
 |---|---|
 | [architecture.md](architecture.md) | iOS, Supabase, 데이터 모델, 보안 경계를 포함한 현재 시스템 설계 |
 | [save-instagram-reel-flow.md](save-instagram-reel-flow.md) | 릴스 접수부터 장소·썸네일 저장까지의 상세 구현 플로우 |
+| [mvp-place-matching-release-report.md](mvp-place-matching-release-report.md) | 현재 장소 매칭 알고리즘, 실제 성공·오탐 사례, MVP 출시 범위와 승인 기준 |
 | [deployment-and-operations.md](deployment-and-operations.md) | 로컬 개발, 클라우드 배포, Xcode 서명, 비용·정책·장애 대응 |
 
 ## 계획 및 설계 이력

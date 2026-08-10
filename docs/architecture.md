@@ -167,3 +167,4 @@ Edge Function은 인증과 입력 검증 후 `reels(PROCESSING)`을 먼저 생�
 2. Share Extension은 access token 만료 시 사용자에게 앱 실행을 요청하며 자체 refresh를 하지 않습니다.
 3. 외부 이미지 업로드 실패는 장소 저장을 막지 않지만, 일부 DB update 오류도 현재 best-effort로 처리됩니다.
 4. Google Places 사진 재호스팅은 현행 Google Maps Platform 저장 제한과 충돌할 수 있습니다. 프로덕션 출시 전에 [운영 가이드](deployment-and-operations.md)의 정책 항목을 해결해야 합니다.
+5. Naver 지역 검색의 첫 후보를 별도 일치도 검증 없이 저장하므로 동명 장소·다지점 브랜드에서 false positive가 발생할 수 있습니다. 출시 판단과 최소 보완안은 [장소 매칭 보고서](mvp-place-matching-release-report.md)를 참고합니다.

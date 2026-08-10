@@ -122,6 +122,8 @@ Gemini 이후 Naver 검색 쿼리는 중복을 제거한 뒤 아래 순서로 �
 
 Naver API HUB 지역 검색의 첫 결과를 다음 필드로 정규화합니다.
 
+> 현재 구현은 최대 5개 후보의 이름·주소 일치도나 모호성을 검증하지 않고 첫 결과를 확정합니다. 따라서 `COMPLETED`는 DB 저장 완료를 뜻할 뿐 장소의 의미상 정확성을 보장하지 않습니다. 확인된 오탐과 출시 전 권장 게이트는 [MVP 장소 매칭 출시 판단 보고서](mvp-place-matching-release-report.md)를 참고합니다.
+
 - Naver place ID 또는 `이름|주소` 폴백 키
 - 장소명, 카테고리, 도로명·지번 주소
 - Instagram 캡션에서 추출한 층·동·호 포함 `source_address`
