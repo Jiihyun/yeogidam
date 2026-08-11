@@ -28,6 +28,44 @@ struct LoginView: View {
                     .foregroundStyle(.red)
             }
 
+            Button {
+                Task { await appState.signInWithKakao() }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "bubble.left.fill")
+                    Text("카카오로 계속하기")
+                        .font(.system(size: 17, weight: .semibold))
+                }
+                .frame(maxWidth: .infinity, minHeight: 52, maxHeight: 52)
+                .foregroundStyle(Color.black.opacity(0.85))
+                .background(Color(red: 1.0, green: 0.90, blue: 0.0))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+            .buttonStyle(.plain)
+            .disabled(appState.isWorking)
+
+            Button {
+                Task { await appState.signInWithGoogle() }
+            } label: {
+                HStack(spacing: 10) {
+                    Text("G")
+                        .font(.system(size: 20, weight: .bold))
+                        .foregroundStyle(Color(red: 0.26, green: 0.52, blue: 0.96))
+                    Text("Google로 계속하기")
+                        .font(.system(size: 17, weight: .semibold))
+                }
+                .frame(maxWidth: .infinity, minHeight: 52, maxHeight: 52)
+                .foregroundStyle(Color.primary)
+                .background(Color(uiColor: .systemBackground))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.secondary.opacity(0.35), lineWidth: 1)
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+            .buttonStyle(.plain)
+            .disabled(appState.isWorking)
+
             SignInWithAppleButton(.signIn) { request in
                 appState.prepareSignInWithApple(request)
             } onCompletion: { result in
@@ -42,7 +80,7 @@ struct LoginView: View {
                     .font(.caption)
             }
 
-            Text("Apple 계정으로 안전하게 로그인합니다.\n이메일 주소는 공개하지 않아도 돼요.")
+            Text("카카오, Google 또는 Apple 계정으로 안전하게 로그인합니다.\n계정 비밀번호는 여기담에 저장되지 않아요.")
                 .font(.caption2)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.tertiary)

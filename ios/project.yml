@@ -42,6 +42,11 @@ targets:
       path: Yeogidam/Info.plist
       properties:
         CFBundleDisplayName: 여기담
+        CFBundleURLTypes:
+          - CFBundleTypeRole: Editor
+            CFBundleURLName: com.yeogidamm.app.auth
+            CFBundleURLSchemes:
+              - com.yeogidamm.app
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

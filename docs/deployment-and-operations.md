@@ -250,6 +250,7 @@ Edge Function은 Instagram fetch, Gemini 구조화, Kakao 검색·후보 검증 
 - [ ] Anonymous sign-in 활성화
 - [ ] Google API key restriction과 quota 확인
 - [ ] Apple Team과 App Group provisioning 확인
+- [ ] Apple 유료 Developer Team을 Xcode에 추가·선택하고 `com.yeogidamm.app`의 Sign in with Apple 개발용 provisioning profile을 발급한 뒤 `정콩이🌳` 실기기 빌드·설치 및 로그인 E2E 확인
 - [ ] 실기기 Share Extension E2E 통과
 - [ ] 10개·11개 이상 다중 장소 캡션의 부분 성공 동작 확인
 - [ ] 장소 상세에서 관련 릴스 여러 개 조회 및 Instagram 이동 확인

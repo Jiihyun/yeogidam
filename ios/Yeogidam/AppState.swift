@@ -1,11 +1,13 @@
 import AuthenticationServices
 import CryptoKit
 import Foundation
+import OSLog
 import Supabase
 import SwiftUI
 
 /// 로그인 세션 상태를 관리하는 앱 전역 상태.
 /// Apple이 발급한 신원 토큰을 Supabase 세션으로 교환한다.
+/// 카카오와 Google은 Supabase PKCE OAuth를 사용해 비밀키를 앱에 넣지 않고 로그인한다.
 /// 기존 익명 세션이 있으면 Apple 계정을 연결해 저장된 장소의 소유권을 유지한다.
 @MainActor
 final class AppState: ObservableObject {
@@ -15,7 +17,9 @@ final class AppState: ObservableObject {
     @Published var errorMessage: String?
 
     private let auth = SupabaseManager.client.auth
+    private let logger = Logger(subsystem: "com.yeogidamm.app", category: "Authentication")
     private var currentAppleNonce: String?
+    private static let oauthRedirectURL = URL(string: "com.yeogidamm.app://auth-callback")!
 
     /// 익명 사용자는 로그인 화면에 머물고, Apple 계정이 연결된 사용자만 앱으로 진입한다.
     var hasPermanentSession: Bool {
@@ -101,6 +105,62 @@ final class AppState: ObservableObject {
             } catch {
                 errorMessage = "Apple 로그인 정보를 확인하지 못했어요. 다시 시도해주세요."
             }
+        }
+    }
+
+    /// Supabase가 여는 카카오 로그인 창에서 인증한 뒤 앱 세션을 저장한다.
+    func signInWithKakao() async {
+        isWorking = true
+        errorMessage = nil
+        defer { isWorking = false }
+
+        do {
+            session = try await auth.signInWithOAuth(
+                provider: .kakao,
+                redirectTo: Self.oauthRedirectURL,
+                configure: { webSession in
+                    // 기존 카카오 로그인 상태를 재사용해 불필요한 재로그인을 줄인다.
+                    webSession.prefersEphemeralWebBrowserSession = false
+                }
+            )
+            SharedSessionStore.save(session)
+        } catch let error as ASWebAuthenticationSessionError where error.code == .canceledLogin {
+            return
+        } catch {
+            logger.error("Kakao OAuth failed: \(error.localizedDescription, privacy: .public)")
+            #if DEBUG
+            errorMessage = "카카오 로그인 오류: \(error.localizedDescription)"
+            #else
+            errorMessage = "카카오 로그인을 완료하지 못했어요. 잠시 후 다시 시도해주세요."
+            #endif
+        }
+    }
+
+    /// Supabase가 여는 Google 로그인 창에서 인증한 뒤 앱 세션을 저장한다.
+    func signInWithGoogle() async {
+        isWorking = true
+        errorMessage = nil
+        defer { isWorking = false }
+
+        do {
+            session = try await auth.signInWithOAuth(
+                provider: .google,
+                redirectTo: Self.oauthRedirectURL,
+                configure: { webSession in
+                    // 기존 Google 로그인 상태를 재사용해 계정 선택 과정을 간단하게 한다.
+                    webSession.prefersEphemeralWebBrowserSession = false
+                }
+            )
+            SharedSessionStore.save(session)
+        } catch let error as ASWebAuthenticationSessionError where error.code == .canceledLogin {
+            return
+        } catch {
+            logger.error("Google OAuth failed: \(error.localizedDescription, privacy: .public)")
+            #if DEBUG
+            errorMessage = "Google 로그인 오류: \(error.localizedDescription)"
+            #else
+            errorMessage = "Google 로그인을 완료하지 못했어요. 잠시 후 다시 시도해주세요."
+            #endif
         }
     }
 
