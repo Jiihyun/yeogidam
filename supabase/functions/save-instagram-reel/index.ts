@@ -42,13 +42,12 @@ function json(body: unknown, status = 200): Response {
 
 type FailureReason = "IG_FETCH_FAILED" | "PLACE_NOT_FOUND" | "UNKNOWN";
 const STALE_PROCESSING_MS = 15 * 60 * 1000;
-const PIPELINE_VERSION = 2;
+const PIPELINE_VERSION = 3;
 
 // 로컬 검증 전용 스텁 (STUB_PROVIDERS=1 일 때만 사용). Gemini/Kakao 키 없이
 // 파이프라인 전체(추출→매칭→저장→썸네일)를 결정적으로 검증하기 위한 것.
 // 프로덕션에서는 이 플래그를 켜지 않는다.
 const STUB_META = {
-  title: "성수 카페 추천",
   description:
     "서울 성동구 연무장길 12 에 있는 여기담 스텁 카페 ☕️ 분위기 좋아요",
   thumbnailUrl: "https://picsum.photos/seed/yeogidam/600/600",
@@ -190,7 +189,7 @@ Deno.serve(async (req) => {
   const { data: completedSource, error: sourceError } = await admin
     .from("reels")
     .select(
-      "id, place_id, instagram_title, instagram_description, instagram_thumbnail_url",
+      "id, place_id, instagram_description, instagram_thumbnail_url",
     )
     .eq("instagram_shortcode", reelReference.shortcode)
     .eq("processing_status", "COMPLETED")
@@ -288,7 +287,6 @@ interface CachedReel {
 interface CompletedSourceReel {
   id: string;
   place_id: string | null;
-  instagram_title: string | null;
   instagram_description: string | null;
   instagram_thumbnail_url: string | null;
 }
@@ -356,7 +354,6 @@ async function copyCompletedReel(
 
   const { error: reelError } = await admin.from("reels").update({
     place_id: placeIds[0],
-    instagram_title: source.instagram_title,
     instagram_description: source.instagram_description,
     instagram_thumbnail_url: source.instagram_thumbnail_url,
     processing_status: "COMPLETED",
@@ -427,16 +424,16 @@ async function processReel(
       }));
       return await fail(admin, reelId, "IG_FETCH_FAILED");
     }
+    const caption = meta.description;
+    if (!caption) return await fail(admin, reelId, "IG_FETCH_FAILED");
+
     await admin
       .from("reels")
       .update({
-        instagram_title: meta.title,
         instagram_description: meta.description,
         instagram_thumbnail_url: meta.thumbnailUrl,
       })
       .eq("id", reelId);
-
-    const caption = [meta.title, meta.description].filter(Boolean).join("\n");
 
     // 2. 정규식 추출은 의사결정에 쓰지 않고 커버리지 관측용으로만 남겨둔다.
     const regexAddresses = extractKoreanAddresses(caption);

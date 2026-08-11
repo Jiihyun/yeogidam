@@ -1,6 +1,6 @@
 # 여기담 MVP 현재 시스템 설계
 
-- 기준일: 2026-08-10
+- 기준일: 2026-08-11
 - 상태: 구현 기준(as-built)
 - 대상: iOS 17+, Supabase 프로젝트 `hbbrgudsbvnwuylxqlta`
 
@@ -31,7 +31,7 @@ flowchart LR
     SHARE -->|"URL + JWT"| FN
     APP -->|"RLS 적용 REST 조회/삭제"| DB[("Supabase Postgres")]
 
-    FN --> IG["Instagram HTML head / fallback"]
+    FN --> IG["Instagram HTML head"]
     FN --> GEMINI["Gemini"]
     FN --> KAKAO["Kakao Local API"]
     FN --> GOOGLE["Google Places API (New)"]
@@ -48,7 +48,7 @@ flowchart LR
 - `YeogidamAPI`: Edge Function 호출과 PostgREST 조회·삭제
 - `SavedPlacesView`: 완료 장소와 처리 중·실패 릴스 표시
 - `AddByURLSheet`: Instagram URL 직접 입력
-- `SavedPlaceDetailView`: 사진, 주소, 카테고리, 좌표, Kakao 장소 링크 표시
+- `SavedPlaceDetailView`: 사진, 주소, 카테고리, Kakao 장소 링크와 현재 사용자가 저장한 관련 릴스 목록 표시
 
 Supabase URL과 `anon` 키는 Xcode build setting을 통해 두 타깃의 `Info.plist`에 주입합니다. `anon` 키는 공개 클라이언트 키이며 권한은 RLS로 제한합니다.
 
@@ -115,7 +115,7 @@ erDiagram
 
 - `places`: 모든 인증 사용자가 읽는 공용 장소 정규화 결과
 - `reels`: 사용자 요청·처리 상태·Instagram shortcode·알고리즘 버전을 보관
-- `reel_places`: 하나의 릴스에서 검증된 여러 장소와 노출 순서
+- `reel_places`: 하나의 릴스에서 검증된 여러 장소와 성공 결과의 상대 순서
 - `saved_places`: 사용자와 장소의 유일한 연결, `(user_id, place_id)` unique
 - `provider_usage_monthly`: Google 썸네일 워크플로 예약 횟수
 
@@ -127,7 +127,7 @@ erDiagram
 | `places` | 전체 조회 | 생성·수정 |
 | `reels` | 본인 조회·삭제 | 생성·수정 |
 | `saved_places` | 본인 조회·삭제 | 생성·수정 |
-| `reel_places` | 접근 불가 | 생성·수정 |
+| `reel_places` | 본인 `reels`에 연결된 행 조회 | 생성·수정 |
 | `provider_usage_monthly` | 접근 불가 | 예약 RPC 실행 |
 | `place-thumbnails` | 공개 읽기 | 업로드 |
 
@@ -161,6 +161,7 @@ Edge Function은 인증과 입력 검증 후 shortcode 캐시를 먼저 확인�
 - Google Places 썸네일, 제공자 폴백, Storage 업로드
 - 월간 DB hard cap과 Google Cloud 일일 quota
 - 저장 목록, 상세, 삭제, 처리 실패 표시
+- 장소 상세의 관련 릴스 다중 조회와 Instagram 원본 이동
 
 ### 미완료
 
@@ -174,8 +175,14 @@ Edge Function은 인증과 입력 검증 후 shortcode 캐시를 먼저 확인�
 
 ## 8. 주요 기술 부채
 
-1. Instagram HTML head를 캡션 SSOT로 사용하지만 요청 환경에 따라 메타데이터가 누락될 수 있습니다. 내부 oEmbed는 HTML에 캡션이 없을 때만 사용하는 fallback이며 응답 형식 변경에 대한 회귀 테스트와 실패 관측이 필요합니다.
+1. Instagram HTML head의 `og:description`을 우선 캡션 SSOT로 사용하고 일반·Twitter description만 대체한다. 요청 환경에 따라 description이 누락되면 `IG_FETCH_FAILED`다. `og:title`은 파싱·저장·Gemini 입력에 사용하지 않는다. 공개 릴스의 메타데이터 형식 변경과 비로그인 요청 차단에 대한 회귀 테스트·실패 관측이 필요합니다.
 2. Share Extension은 access token 만료 시 사용자에게 앱 실행을 요청하며 자체 refresh를 하지 않습니다.
 3. 외부 이미지 업로드 실패는 장소 저장을 막지 않지만, 일부 DB update 오류도 현재 best-effort로 처리됩니다.
 4. Google Places 사진 재호스팅은 현행 Google Maps Platform 저장 제한과 충돌할 수 있습니다. 프로덕션 출시 전에 [운영 가이드](deployment-and-operations.md)의 정책 항목을 해결해야 합니다.
 5. Kakao 장소 ID는 중복은 막지만 오탐을 막지 못합니다. 현재는 이름·지역·건물번호 일치 후 유일한 후보만 저장하며, 상세 기준은 [장소 매칭 보고서](mvp-place-matching-release-report.md)를 참고합니다.
+6. Gemini 장소 배열은 현재 최대 10개다. 상한을 초과해 응답에서 제외된 장소는 후속 검증에 들어가지 않으며 포함된 장소가 하나라도 저장되면 전체 상태가 `COMPLETED`라서 절단 여부가 사용자에게 드러나지 않습니다.
+7. Kakao 검색은 장소당 최대 세 쿼리를 순차 실행한다. 추출 상한을 확대하려면 제한된 병렬 처리, 릴스당 쿼리 예산, 처리 시간과 절단 여부 관측을 함께 도입해야 합니다.
+8. `reel_places.position`은 원문 절대 인덱스가 아니라 검증 성공 결과의 압축 순서다. Gemini가 원문 순서를 지키도록 강제하지도 않아 정확한 캡션 위치 추적에는 사용할 수 없습니다.
+9. 다중 장소 쓰기는 하나의 DB 트랜잭션이 아니다. 뒤 장소 저장이 실패하면 앞 장소의 일부 관계가 남을 수 있어 RPC 트랜잭션 또는 보상 정리가 필요합니다.
+10. `places.source_address`는 공용 장소의 최근 non-null 원문 주소에 가깝다. 릴스별 주소 이력이 필요하면 관계 테이블로 이동해야 합니다.
+11. 알고리즘 변경 시 `PIPELINE_VERSION`을 올리지 않으면 완료된 shortcode는 이전 결과를 재사용한다. 버전 변경과 기존 `saved_places` 정리 정책을 한 릴리스 단위로 관리해야 합니다.
