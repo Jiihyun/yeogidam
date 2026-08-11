@@ -21,6 +21,10 @@ targets:
   Yeogidam:
     type: application
     platform: iOS
+    attributes:
+      SystemCapabilities:
+        com.apple.SignInWithApple:
+          enabled: 1
     sources:
       - Yeogidam
     dependencies:
@@ -30,7 +34,7 @@ targets:
         embed: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.yeogidam.app
+        PRODUCT_BUNDLE_IDENTIFIER: com.yeogidamm.app
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_ENTITLEMENTS: Yeogidam/Yeogidam.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -56,7 +60,7 @@ targets:
       - ShareExtension
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.yeogidam.app.ShareExtension
+        PRODUCT_BUNDLE_IDENTIFIER: com.yeogidamm.app.ShareExtension
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_ENTITLEMENTS: ShareExtension/ShareExtension.entitlements
     info:

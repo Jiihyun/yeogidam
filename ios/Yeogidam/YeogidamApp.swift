@@ -9,7 +9,7 @@ struct YeogidamApp: App {
             Group {
                 if appState.isLoading {
                     ProgressView()
-                } else if appState.session == nil {
+                } else if !appState.hasPermanentSession {
                     LoginView()
                 } else {
                     RootTabView()

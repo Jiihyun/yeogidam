@@ -1,3 +1,4 @@
+import AuthenticationServices
 import SwiftUI
 
 struct LoginView: View {
@@ -27,23 +28,21 @@ struct LoginView: View {
                     .foregroundStyle(.red)
             }
 
-            Button {
-                Task { await appState.signInAnonymously() }
-            } label: {
-                Group {
-                    if appState.isWorking {
-                        ProgressView()
-                    } else {
-                        Text("시작하기")
-                            .font(.headline)
-                    }
-                }
-                .frame(maxWidth: .infinity, minHeight: 52)
+            SignInWithAppleButton(.signIn) { request in
+                appState.prepareSignInWithApple(request)
+            } onCompletion: { result in
+                Task { await appState.completeSignInWithApple(result) }
             }
-            .buttonStyle(.borderedProminent)
+            .signInWithAppleButtonStyle(.black)
+            .frame(maxWidth: .infinity, minHeight: 52, maxHeight: 52)
             .disabled(appState.isWorking)
 
-            Text("빠른 개발을 위해 지금은 익명으로 시작합니다.\n카카오·Apple 로그인은 곧 추가됩니다.")
+            if appState.isWorking {
+                ProgressView("로그인 확인 중...")
+                    .font(.caption)
+            }
+
+            Text("Apple 계정으로 안전하게 로그인합니다.\n이메일 주소는 공개하지 않아도 돼요.")
                 .font(.caption2)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.tertiary)
