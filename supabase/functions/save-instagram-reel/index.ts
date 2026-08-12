@@ -6,19 +6,34 @@
 // 최종 상태를 응답에 담아 반환한다(테스트 편의). 프로덕션 기본은 비동기(202).
 
 import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
+import { createRequestId, errorResponse } from "../_shared/error_code.ts";
 import { fetchInstagramMeta } from "./instagram.ts";
 import { extractKoreanAddresses } from "./address.ts";
-import { extractPlacesWithGemini, type PlaceGuess } from "./gemini.ts";
+import {
+  extractPlacesWithGemini,
+  judgeKakaoCandidatesWithGemini,
+  type KakaoCandidateReviewItem,
+  type PlaceGuess,
+} from "./gemini.ts";
 import {
   buildKakaoMapURL,
   type KakaoPlace,
   searchKakaoPlaces,
 } from "./kakao.ts";
 import {
+  buildKakaoFallbackQueries,
   buildKakaoQueries,
+  classifyKakaoCandidates,
+  deduplicateKakaoPlaces,
+  resolveAiSelectedKakaoPlace,
   sanitizePlaceGuesses,
-  verifiedKakaoPlaces,
 } from "./matching.ts";
+import {
+  type MatchSearchOrigin,
+  type PlaceMatchFailure,
+  type PlaceMatchFailureReason,
+  placeMatchFailureRow,
+} from "./match_failure.ts";
 import { findGooglePlacePhoto } from "./google.ts";
 import { rehostThumbnail, scrapePageImage } from "./thumbnail.ts";
 import { parseInstagramReelURL, shouldRetryReel } from "./reel.ts";
@@ -40,9 +55,30 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-type FailureReason = "IG_FETCH_FAILED" | "PLACE_NOT_FOUND" | "UNKNOWN";
+function databaseErrorResponse(requestId: string, error?: unknown): Response {
+  console.error(JSON.stringify({
+    event: "api_error",
+    requestId,
+    errorCode: "DATA500_001",
+    internalMessage: error instanceof Error
+      ? error.message
+      : typeof error === "object" && error && "message" in error
+      ? String(error.message)
+      : undefined,
+  }));
+  return errorResponse("DATABASE_ERROR", requestId, { headers: cors });
+}
+
+type FailureReason =
+  | "IG_FETCH_FAILED"
+  | "IG_CAPTION_NOT_FOUND"
+  | "PROVIDER_CONFIG_MISSING"
+  | "GEMINI_PLACE_NOT_FOUND"
+  | "KAKAO_PLACE_NOT_FOUND"
+  | "PLACE_NOT_FOUND"
+  | "UNKNOWN";
 const STALE_PROCESSING_MS = 15 * 60 * 1000;
-const PIPELINE_VERSION = 3;
+const PIPELINE_VERSION = 4;
 
 // 로컬 검증 전용 스텁 (STUB_PROVIDERS=1 일 때만 사용). Gemini/Kakao 키 없이
 // 파이프라인 전체(추출→매칭→저장→썸네일)를 결정적으로 검증하기 위한 것.
@@ -72,184 +108,218 @@ const STUB_THUMBNAIL = {
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
-  if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
-
-  const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-  const ANON = Deno.env.get("SUPABASE_ANON_KEY")!;
-  const SERVICE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-
-  // 1) JWT 인증
-  const token = (req.headers.get("Authorization") ?? "").replace(
-    /^Bearer\s+/i,
-    "",
-  );
-  if (!token) return json({ error: "unauthorized" }, 401);
-  const authClient = createClient(SUPABASE_URL, ANON, {
-    global: { headers: { Authorization: `Bearer ${token}` } },
-  });
-  const { data: userData, error: userErr } = await authClient.auth.getUser(
-    token,
-  );
-  if (userErr || !userData.user) return json({ error: "unauthorized" }, 401);
-  const userId = userData.user.id;
-
-  // 2) 입력 검증
-  let payload: { instagramUrl?: string; source?: string };
+  const requestId = createRequestId();
   try {
-    payload = await req.json();
-  } catch {
-    return json({ error: "invalid_body" }, 400);
-  }
-  const reelReference = parseInstagramReelURL(
-    (payload.instagramUrl ?? "").trim(),
-  );
-  const source = payload.source === "url_input"
-    ? "url_input"
-    : "instagram_share";
-  if (!reelReference) {
-    return json({ error: "invalid_instagram_url" }, 400);
-  }
-  const instagramUrl = reelReference.canonicalUrl;
-
-  // 3) 같은 사용자의 shortcode가 이미 처리 중이거나 완료됐다면 그대로 반환한다.
-  const admin = createClient(SUPABASE_URL, SERVICE);
-  const { data: existing, error: existingError } = await admin
-    .from("reels")
-    .select(
-      "id, place_id, processing_status, failure_reason, processing_version, updated_at",
-    )
-    .eq("user_id", userId)
-    .eq("instagram_shortcode", reelReference.shortcode)
-    .maybeSingle();
-  if (existingError) return json({ error: "db_error" }, 500);
-
-  if (
-    existing && !shouldRetryReel(
-      {
-        processingStatus: existing.processing_status,
-        processingVersion: existing.processing_version,
-        updatedAt: existing.updated_at,
-      },
-      PIPELINE_VERSION,
-      STALE_PROCESSING_MS,
-    )
-  ) {
-    return await cachedReelResponse(admin, existing, userId, true);
-  }
-
-  // FAILED 또는 오래 멈춘 작업은 같은 행을 원자적으로 비우고 재시도한다.
-  if (existing) {
-    const { data: retryReel, error: retryError } = await admin
-      .from("reels")
-      .update({
-        instagram_url: instagramUrl,
-        source,
-        place_id: null,
-        processing_version: PIPELINE_VERSION,
-        processing_status: "PROCESSING",
-        failure_reason: null,
-      })
-      .eq("id", existing.id)
-      .eq("updated_at", existing.updated_at)
-      .select("id")
-      .maybeSingle();
-    if (retryError) return json({ error: "db_error" }, 500);
-    if (retryReel) {
-      const { error: cleanupError } = await admin.from("reel_places").delete()
-        .eq("reel_id", retryReel.id);
-      if (cleanupError) {
-        await admin.from("reels").update({
-          processing_status: "FAILED",
-          failure_reason: "UNKNOWN",
-        }).eq("id", retryReel.id);
-        return json({ error: "db_error" }, 500);
-      }
-      return scheduleOrProcess(
-        admin,
-        retryReel.id,
-        userId,
-        instagramUrl,
-        false,
-      );
+    if (req.method !== "POST") {
+      return errorResponse("METHOD_NOT_ALLOWED", requestId, { headers: cors });
     }
 
-    const { data: raced } = await admin
-      .from("reels")
-      .select(
-        "id, place_id, processing_status, failure_reason, processing_version, updated_at",
-      )
-      .eq("id", existing.id)
-      .single();
-    return raced
-      ? await cachedReelResponse(admin, raced, userId, true)
-      : json({ error: "db_error" }, 500);
-  }
+    const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+    const ANON = Deno.env.get("SUPABASE_ANON_KEY")!;
+    const SERVICE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-  // 다른 사용자가 이미 완료한 동일 릴스가 있으면 외부 API 결과를 재사용한다.
-  const { data: completedSource, error: sourceError } = await admin
-    .from("reels")
-    .select(
-      "id, place_id, instagram_description, instagram_thumbnail_url",
-    )
-    .eq("instagram_shortcode", reelReference.shortcode)
-    .eq("processing_status", "COMPLETED")
-    .eq("processing_version", PIPELINE_VERSION)
-    .order("created_at", { ascending: true })
-    .limit(1)
-    .maybeSingle();
-  if (sourceError) return json({ error: "db_error" }, 500);
+    // 1) JWT 인증
+    const token = (req.headers.get("Authorization") ?? "").replace(
+      /^Bearer\s+/i,
+      "",
+    );
+    if (!token) {
+      return errorResponse("AUTH_REQUIRED", requestId, { headers: cors });
+    }
+    const authClient = createClient(SUPABASE_URL, ANON, {
+      global: { headers: { Authorization: `Bearer ${token}` } },
+    });
+    const { data: userData, error: userErr } = await authClient.auth.getUser(
+      token,
+    );
+    if (userErr || !userData.user) {
+      return errorResponse("AUTH_SESSION_EXPIRED", requestId, {
+        headers: cors,
+      });
+    }
+    const userId = userData.user.id;
 
-  // 4) 신규 사용자 저장 행 생성. partial unique index가 동시 중복 요청도 막는다.
-  const { data: reel, error: insErr } = await admin
-    .from("reels")
-    .insert({
-      user_id: userId,
-      instagram_url: instagramUrl,
-      instagram_shortcode: reelReference.shortcode,
-      processing_version: PIPELINE_VERSION,
-      source,
-      processing_status: "PROCESSING",
-    })
-    .select("id")
-    .single();
-  if (insErr?.code === "23505") {
-    const { data: raced } = await admin
+    // 2) 입력 검증
+    let payload: { instagramUrl?: string; source?: string };
+    try {
+      payload = await req.json();
+    } catch {
+      return errorResponse("INVALID_REQUEST_BODY", requestId, {
+        headers: cors,
+        details: { field: "body" },
+      });
+    }
+    const reelReference = parseInstagramReelURL(
+      (payload.instagramUrl ?? "").trim(),
+    );
+    const source = payload.source === "url_input"
+      ? "url_input"
+      : "instagram_share";
+    if (!reelReference) {
+      return errorResponse("INVALID_INSTAGRAM_URL", requestId, {
+        headers: cors,
+        details: { field: "instagramUrl" },
+      });
+    }
+    const instagramUrl = reelReference.canonicalUrl;
+
+    // 3) 같은 사용자의 shortcode가 이미 처리 중이거나 완료됐다면 그대로 반환한다.
+    const admin = createClient(SUPABASE_URL, SERVICE);
+    const { data: existing, error: existingError } = await admin
       .from("reels")
       .select(
         "id, place_id, processing_status, failure_reason, processing_version, updated_at",
       )
       .eq("user_id", userId)
       .eq("instagram_shortcode", reelReference.shortcode)
-      .single();
-    return raced
-      ? await cachedReelResponse(admin, raced, userId, true)
-      : json({ error: "db_error" }, 500);
-  }
-  if (insErr || !reel) return json({ error: "db_error" }, 500);
+      .maybeSingle();
+    if (existingError) return databaseErrorResponse(requestId, existingError);
 
-  if (completedSource) {
-    try {
-      const reused = await copyCompletedReel(
-        admin,
-        completedSource,
-        reel.id,
-        userId,
-      );
-      if (reused) {
-        return json({ reelId: reel.id, ...reused, reused: true }, 200);
-      }
-    } catch (error) {
-      console.error(JSON.stringify({
-        event: "reel_cache_reuse_failed",
-        reelId: reel.id,
-        sourceReelId: completedSource.id,
-        message: error instanceof Error ? error.message : String(error),
-      }));
-      await admin.from("reel_places").delete().eq("reel_id", reel.id);
+    if (
+      existing && !shouldRetryReel(
+        {
+          processingStatus: existing.processing_status,
+          processingVersion: existing.processing_version,
+          updatedAt: existing.updated_at,
+        },
+        PIPELINE_VERSION,
+        STALE_PROCESSING_MS,
+      )
+    ) {
+      return await cachedReelResponse(admin, existing, userId, true);
     }
-  }
 
-  return scheduleOrProcess(admin, reel.id, userId, instagramUrl, false);
+    // FAILED 또는 오래 멈춘 작업은 같은 행을 원자적으로 비우고 재시도한다.
+    if (existing) {
+      const { data: retryReel, error: retryError } = await admin
+        .from("reels")
+        .update({
+          instagram_url: instagramUrl,
+          source,
+          place_id: null,
+          processing_version: PIPELINE_VERSION,
+          processing_status: "PROCESSING",
+          failure_reason: null,
+        })
+        .eq("id", existing.id)
+        .eq("updated_at", existing.updated_at)
+        .select("id")
+        .maybeSingle();
+      if (retryError) return databaseErrorResponse(requestId, retryError);
+      if (retryReel) {
+        const { error: cleanupError } = await admin.from("reel_places").delete()
+          .eq("reel_id", retryReel.id);
+        const { error: failureCleanupError } = await admin
+          .from("reel_place_match_failures")
+          .delete()
+          .eq("reel_id", retryReel.id);
+        if (cleanupError || failureCleanupError) {
+          await admin.from("reels").update({
+            processing_status: "FAILED",
+            failure_reason: "UNKNOWN",
+          }).eq("id", retryReel.id);
+          return databaseErrorResponse(
+            requestId,
+            cleanupError ?? failureCleanupError,
+          );
+        }
+        return scheduleOrProcess(
+          admin,
+          retryReel.id,
+          userId,
+          instagramUrl,
+          false,
+        );
+      }
+
+      const { data: raced } = await admin
+        .from("reels")
+        .select(
+          "id, place_id, processing_status, failure_reason, processing_version, updated_at",
+        )
+        .eq("id", existing.id)
+        .single();
+      return raced
+        ? await cachedReelResponse(admin, raced, userId, true)
+        : databaseErrorResponse(requestId);
+    }
+
+    // 다른 사용자가 이미 완료한 동일 릴스가 있으면 외부 API 결과를 재사용한다.
+    const { data: completedSource, error: sourceError } = await admin
+      .from("reels")
+      .select(
+        "id, place_id, instagram_description, instagram_thumbnail_url",
+      )
+      .eq("instagram_shortcode", reelReference.shortcode)
+      .eq("processing_status", "COMPLETED")
+      .eq("processing_version", PIPELINE_VERSION)
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (sourceError) return databaseErrorResponse(requestId, sourceError);
+
+    // 4) 신규 사용자 저장 행 생성. partial unique index가 동시 중복 요청도 막는다.
+    const { data: reel, error: insErr } = await admin
+      .from("reels")
+      .insert({
+        user_id: userId,
+        instagram_url: instagramUrl,
+        instagram_shortcode: reelReference.shortcode,
+        processing_version: PIPELINE_VERSION,
+        source,
+        processing_status: "PROCESSING",
+      })
+      .select("id")
+      .single();
+    if (insErr?.code === "23505") {
+      const { data: raced } = await admin
+        .from("reels")
+        .select(
+          "id, place_id, processing_status, failure_reason, processing_version, updated_at",
+        )
+        .eq("user_id", userId)
+        .eq("instagram_shortcode", reelReference.shortcode)
+        .single();
+      return raced
+        ? await cachedReelResponse(admin, raced, userId, true)
+        : databaseErrorResponse(requestId);
+    }
+    if (insErr || !reel) {
+      return databaseErrorResponse(requestId, insErr);
+    }
+
+    if (completedSource) {
+      try {
+        const reused = await copyCompletedReel(
+          admin,
+          completedSource,
+          reel.id,
+          userId,
+        );
+        if (reused) {
+          return json({ reelId: reel.id, ...reused, reused: true }, 200);
+        }
+      } catch (error) {
+        console.error(JSON.stringify({
+          event: "reel_cache_reuse_failed",
+          reelId: reel.id,
+          sourceReelId: completedSource.id,
+          message: error instanceof Error ? error.message : String(error),
+        }));
+        await admin.from("reel_places").delete().eq("reel_id", reel.id);
+      }
+    }
+
+    return scheduleOrProcess(admin, reel.id, userId, instagramUrl, false);
+  } catch (error) {
+    console.error(JSON.stringify({
+      event: "api_error",
+      requestId,
+      errorCode: "COMMON500_001",
+      internalMessage: error instanceof Error ? error.message : String(error),
+    }));
+    return errorResponse("INTERNAL_ERROR", requestId, { headers: cors });
+  }
 });
 
 async function scheduleOrProcess(
@@ -404,6 +474,18 @@ interface MatchedPlace {
   place: KakaoPlace;
 }
 
+interface PendingCandidateReview extends KakaoCandidateReviewItem {
+  searchOrigin: MatchSearchOrigin;
+  reason: "NO_VERIFIED_CANDIDATE" | "MULTIPLE_VERIFIED_CANDIDATES";
+}
+
+function aiNoneFailureReason(
+  reason: "MATCH" | "AMBIGUOUS_SAME_NAME" | "NAME_MISMATCH" |
+    "ADDRESS_CONFLICT" | "INSUFFICIENT_CONTEXT",
+): PlaceMatchFailureReason {
+  return reason === "MATCH" ? "INSUFFICIENT_CONTEXT" : reason;
+}
+
 async function processReel(
   admin: SupabaseClient,
   reelId: string,
@@ -425,7 +507,15 @@ async function processReel(
       return await fail(admin, reelId, "IG_FETCH_FAILED");
     }
     const caption = meta.description;
-    if (!caption) return await fail(admin, reelId, "IG_FETCH_FAILED");
+    if (!caption) {
+      console.error(JSON.stringify({
+        event: "instagram_caption_not_found",
+        reelId,
+        hasThumbnail: Boolean(meta.thumbnailUrl),
+        hasCanonicalUrl: Boolean(meta.canonicalUrl),
+      }));
+      return await fail(admin, reelId, "IG_CAPTION_NOT_FOUND");
+    }
 
     await admin
       .from("reels")
@@ -447,10 +537,11 @@ async function processReel(
     const kakaoKey = Deno.env.get("KAKAO_REST_API_KEY");
     const geminiKey = Deno.env.get("GEMINI_API_KEY");
     if (!stub && (!kakaoKey || !geminiKey)) {
-      return await fail(admin, reelId, "PLACE_NOT_FOUND");
+      return await fail(admin, reelId, "PROVIDER_CONFIG_MISSING");
     }
 
     let matchedPlaces: MatchedPlace[] = [];
+    const matchFailures: PlaceMatchFailure[] = [];
     if (stub) {
       matchedPlaces = [{
         guess: {
@@ -470,33 +561,173 @@ async function processReel(
         extractedCount: extracted.length,
         sanitizedCount: guesses.length,
       }));
+      if (extracted.length === 0 || guesses.length === 0) {
+        return await fail(admin, reelId, "GEMINI_PLACE_NOT_FOUND");
+      }
 
-      for (const guess of guesses) {
-        const candidates: KakaoPlace[] = [];
+      const pendingReviews: PendingCandidateReview[] = [];
+      for (const [guessIndex, guess] of guesses.entries()) {
+        let candidates: KakaoPlace[] = [];
         for (const query of buildKakaoQueries(guess)) {
           candidates.push(
             ...await searchKakaoPlaces(query, kakaoKey!),
           );
         }
-        const verified = verifiedKakaoPlaces(guess, candidates);
+        candidates = deduplicateKakaoPlaces(candidates);
+
+        let searchOrigin: PendingCandidateReview["searchOrigin"] = "INITIAL";
+        let decision = classifyKakaoCandidates(guess, candidates);
+        let expansionAttempted = false;
+
+        // 원본 Kakao 후보가 정말 0개일 때만 검색어를 한 번 확장한다.
+        // 검증 탈락(후보는 존재)은 이 분기로 되돌아오지 않고 2차 AI로 간다.
+        if (decision.type === "NO_CANDIDATE") {
+          const fallbackQueries = buildKakaoFallbackQueries(guess);
+          const fallbackCandidates: KakaoPlace[] = [];
+          for (const query of fallbackQueries) {
+            fallbackCandidates.push(
+              ...await searchKakaoPlaces(query, kakaoKey!),
+            );
+          }
+          expansionAttempted = fallbackQueries.length > 0;
+          candidates = deduplicateKakaoPlaces(fallbackCandidates);
+          if (fallbackQueries.length > 0) {
+            searchOrigin = "EXPANDED_NAME_ONLY";
+          }
+          decision = classifyKakaoCandidates(guess, candidates, {
+            requireStrongAddressEvidence: true,
+          });
+          console.info(JSON.stringify({
+            event: "kakao_name_only_fallback_completed",
+            reelId,
+            guessIndex,
+            placeName: guess.placeName,
+            queryCount: fallbackQueries.length,
+            candidateCount: candidates.length,
+            decision: decision.type,
+          }));
+        }
+
         console.info(JSON.stringify({
-          event: "kakao_place_candidates_verified",
+          event: "kakao_place_candidates_classified",
           reelId,
+          guessIndex,
           guess,
           candidateCount: candidates.length,
-          verifiedCount: verified.length,
-          verifiedPlaceIds: verified.map((place) => place.kakaoPlaceId),
+          searchOrigin,
+          decision: decision.type,
+          reason: decision.type === "NEEDS_AI_REVIEW"
+            ? decision.reason
+            : null,
         }));
 
-        // 0개는 실패, 2개 이상은 모호함이다. 유일하게 검증된 장소만 저장한다.
-        if (verified.length === 1) {
-          matchedPlaces.push({ guess, place: verified[0] });
+        if (decision.type === "AUTO_MATCH") {
+          matchedPlaces.push({ guess, place: decision.place });
+        } else if (decision.type === "NEEDS_AI_REVIEW") {
+          pendingReviews.push({
+            guessIndex,
+            guess,
+            candidates: decision.candidates,
+            searchOrigin,
+            reason: decision.reason,
+          });
+        } else {
+          matchFailures.push({
+            guessIndex,
+            guess,
+            stage: "KAKAO_SEARCH",
+            reason: expansionAttempted
+              ? "NO_KAKAO_CANDIDATE_AFTER_EXPANSION"
+              : "NO_KAKAO_CANDIDATE",
+            searchOrigin,
+            classifierReason: null,
+            candidates: [],
+          });
+        }
+      }
+
+      // 애매한 장소들을 한 번의 2차 AI 호출로 판단한다. AI 결과에서 다시
+      // 검색하거나 재호출하지 않으므로 이 요청 안에 역방향 간선/루프가 없다.
+      if (pendingReviews.length > 0) {
+        const judgments = await judgeKakaoCandidatesWithGemini(
+          caption,
+          pendingReviews,
+          geminiKey!,
+        );
+        const judgmentByGuess = new Map(
+          judgments.map((judgment) => [judgment.guessIndex, judgment]),
+        );
+
+        for (const review of pendingReviews) {
+          const judgment = judgmentByGuess.get(review.guessIndex);
+          if (
+            !judgment || judgment.decision === "NONE" ||
+            !judgment.candidateId
+          ) {
+            matchFailures.push({
+              guessIndex: review.guessIndex,
+              guess: review.guess,
+              stage: "AI_REVIEW",
+              reason: judgment
+                ? aiNoneFailureReason(judgment.reason)
+                : "AI_JUDGMENT_UNAVAILABLE",
+              searchOrigin: review.searchOrigin,
+              classifierReason: review.reason,
+              candidates: review.candidates,
+            });
+            console.info(JSON.stringify({
+              event: "gemini_candidate_judgment_unresolved",
+              reelId,
+              guessIndex: review.guessIndex,
+              reason: review.reason,
+              decision: judgment?.decision ?? "MISSING",
+            }));
+            continue;
+          }
+
+          const resolution = resolveAiSelectedKakaoPlace(
+            review.guess,
+            review.candidates,
+            judgment.candidateId,
+            {
+              requireStrongAddressEvidence:
+                review.searchOrigin === "EXPANDED_NAME_ONLY",
+            },
+          );
+          console.info(JSON.stringify({
+            event: "gemini_candidate_selection_guarded",
+            reelId,
+            guessIndex: review.guessIndex,
+            candidateId: judgment.candidateId,
+            searchOrigin: review.searchOrigin,
+            result: resolution.status,
+            reason: resolution.status === "REJECTED"
+              ? resolution.reason
+              : null,
+          }));
+          if (resolution.status === "ACCEPTED") {
+            matchedPlaces.push({
+              guess: review.guess,
+              place: resolution.place,
+            });
+          } else {
+            matchFailures.push({
+              guessIndex: review.guessIndex,
+              guess: review.guess,
+              stage: "FINAL_GUARD",
+              reason: resolution.reason,
+              searchOrigin: review.searchOrigin,
+              classifierReason: review.reason,
+              candidates: review.candidates,
+            });
+          }
         }
       }
     }
+    await persistPlaceMatchFailures(admin, reelId, matchFailures);
     matchedPlaces = deduplicateMatchedPlaces(matchedPlaces);
     if (matchedPlaces.length === 0) {
-      return await fail(admin, reelId, "PLACE_NOT_FOUND");
+      return await fail(admin, reelId, "KAKAO_PLACE_NOT_FOUND");
     }
 
     // 4. 검증된 모든 장소를 places/saved_places/reel_places에 순서대로 저장한다.
@@ -538,6 +769,20 @@ async function processReel(
     }));
     return await fail(admin, reelId, "UNKNOWN");
   }
+}
+
+async function persistPlaceMatchFailures(
+  admin: SupabaseClient,
+  reelId: string,
+  failures: PlaceMatchFailure[],
+): Promise<void> {
+  if (failures.length === 0) return;
+
+  const { error } = await admin.from("reel_place_match_failures").upsert(
+    failures.map((failure) => placeMatchFailureRow(reelId, failure)),
+    { onConflict: "reel_id,guess_index" },
+  );
+  if (error) throw error;
 }
 
 function deduplicateMatchedPlaces(matches: MatchedPlace[]): MatchedPlace[] {
@@ -642,7 +887,22 @@ async function reserveGooglePlacesThumbnail(
   admin: SupabaseClient,
 ): Promise<boolean> {
   const { data, error } = await admin.rpc("reserve_google_places_thumbnail");
-  return !error && data === true;
+  if (error) {
+    console.warn(JSON.stringify({
+      event: "google_places_thumbnail_skipped",
+      reason: "reservation_error",
+      message: error.message,
+    }));
+    return false;
+  }
+  if (data !== true) {
+    console.info(JSON.stringify({
+      event: "google_places_thumbnail_skipped",
+      reason: "monthly_quota_exhausted",
+    }));
+    return false;
+  }
+  return true;
 }
 
 async function resolveThumbnail(
@@ -674,7 +934,14 @@ async function resolveThumbnail(
   }
 
   const googleKey = Deno.env.get("GOOGLE_PLACES_API_KEY");
-  if (googleKey && await reserveGooglePlacesThumbnail(admin)) {
+  if (!googleKey) {
+    console.info(JSON.stringify({
+      event: "google_places_thumbnail_skipped",
+      reason: "missing_api_key",
+      thumbnailKey,
+      placeName: place.name,
+    }));
+  } else if (await reserveGooglePlacesThumbnail(admin)) {
     const q = [place.name, place.roadAddress ?? place.address].filter(Boolean)
       .join(" ");
     const googlePhoto = await findGooglePlacePhoto(q, googleKey);
@@ -692,10 +959,31 @@ async function resolveThumbnail(
           attribution: googlePhoto.attribution,
         };
       }
+      console.warn(JSON.stringify({
+        event: "google_places_thumbnail_failed",
+        reason: "rehost_failed",
+        thumbnailKey,
+        placeName: place.name,
+        googlePlaceId: googlePhoto.placeId,
+      }));
+    } else {
+      console.info(JSON.stringify({
+        event: "google_places_thumbnail_failed",
+        reason: "photo_not_found",
+        thumbnailKey,
+        placeName: place.name,
+        query: q,
+      }));
     }
   }
 
   if (instagramThumbnailUrl) {
+    console.info(JSON.stringify({
+      event: "thumbnail_fallback_selected",
+      source: "instagram",
+      thumbnailKey,
+      placeName: place.name,
+    }));
     const url = await rehostThumbnail(
       admin,
       `${thumbnailKey}-instagram`,

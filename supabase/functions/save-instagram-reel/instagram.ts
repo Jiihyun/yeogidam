@@ -69,8 +69,7 @@ export async function fetchInstagramMeta(
   request: typeof fetch = fetch,
 ): Promise<InstagramMeta> {
   const headers = {
-    "User-Agent":
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": "Twitterbot/1.0",
     "Accept-Language": "ko,en;q=0.9",
   };
 
@@ -82,7 +81,5 @@ export async function fetchInstagramMeta(
   });
   if (!res.ok) throw new Error(`instagram fetch failed: ${res.status}`);
   const html = await res.text();
-  const meta = parseInstagramMeta(html);
-  if (!meta.description) throw new Error("instagram metadata empty");
-  return meta;
+  return parseInstagramMeta(html);
 }

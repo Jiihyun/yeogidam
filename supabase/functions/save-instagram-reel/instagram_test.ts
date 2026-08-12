@@ -58,22 +58,26 @@ Deno.test("falls back between head description tags only", () => {
 Deno.test("uses reel HTML head metadata as the only caption source", async () => {
   const url = "https://www.instagram.com/reel/Db0azgWTF1h/";
   const calls: string[] = [];
-  const request = (async (input: string | URL | Request) => {
-    calls.push(String(input));
-    return new Response(
-      `<head><meta name="description" content="보연희 서울 서대문구 연희맛로 17-63 2층"></head>`,
-      { status: 200, headers: { "content-type": "text/html" } },
-    );
-  }) as typeof fetch;
+  let userAgent = "";
+  const request =
+    (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push(String(input));
+      userAgent = new Headers(init?.headers).get("User-Agent") ?? "";
+      return new Response(
+        `<head><meta name="description" content="보연희 서울 서대문구 연희맛로 17-63 2층"></head>`,
+        { status: 200, headers: { "content-type": "text/html" } },
+      );
+    }) as typeof fetch;
 
   const meta = await fetchInstagramMeta(url, request);
 
   assertEquals(meta.description, "보연희 서울 서대문구 연희맛로 17-63 2층");
   assertEquals(calls.length, 1);
   assertEquals(calls[0], url);
+  assertEquals(userAgent, "Twitterbot/1.0");
 });
 
-Deno.test("fails without a head caption and makes no fallback request", async () => {
+Deno.test("returns empty metadata without a head caption or fallback request", async () => {
   const url = "https://www.instagram.com/reel/Db0azgWTF1h/";
   const calls: string[] = [];
   const request = (async (input: string | URL | Request) => {
@@ -84,6 +88,19 @@ Deno.test("fails without a head caption and makes no fallback request", async ()
     });
   }) as typeof fetch;
 
+  const meta = await fetchInstagramMeta(url, request);
+
+  assertEquals(meta.description, null);
+  assertEquals(calls.length, 1);
+  assertEquals(calls[0], url);
+});
+
+Deno.test("fails when Instagram returns a non-success response", async () => {
+  const url = "https://www.instagram.com/reel/Db0azgWTF1h/";
+  const request = (async () => {
+    return new Response("Forbidden", { status: 403 });
+  }) as typeof fetch;
+
   let message = "";
   try {
     await fetchInstagramMeta(url, request);
@@ -91,7 +108,5 @@ Deno.test("fails without a head caption and makes no fallback request", async ()
     message = error instanceof Error ? error.message : String(error);
   }
 
-  assertEquals(message, "instagram metadata empty");
-  assertEquals(calls.length, 1);
-  assertEquals(calls[0], url);
+  assertEquals(message, "instagram fetch failed: 403");
 });

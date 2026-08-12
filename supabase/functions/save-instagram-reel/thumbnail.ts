@@ -46,7 +46,15 @@ export async function rehostThumbnail(
       headers: { "User-Agent": "Mozilla/5.0" },
       redirect: "follow",
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.warn(JSON.stringify({
+        event: "thumbnail_rehost_failed",
+        stage: "download",
+        key,
+        status: res.status,
+      }));
+      return null;
+    }
     const contentType = res.headers.get("content-type") ?? "image/jpeg";
     const ext = contentType.includes("png") ? "png" : "jpg";
     const buf = new Uint8Array(await res.arrayBuffer());
@@ -54,9 +62,23 @@ export async function rehostThumbnail(
     const { error } = await supabase.storage
       .from("place-thumbnails")
       .upload(path, buf, { contentType, upsert: true });
-    if (error) return null;
+    if (error) {
+      console.warn(JSON.stringify({
+        event: "thumbnail_rehost_failed",
+        stage: "storage_upload",
+        key,
+        message: error.message,
+      }));
+      return null;
+    }
     return publicStorageUrl(path);
-  } catch {
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: "thumbnail_rehost_failed",
+      stage: "unexpected",
+      key,
+      message: error instanceof Error ? error.message : String(error),
+    }));
     return null;
   }
 }

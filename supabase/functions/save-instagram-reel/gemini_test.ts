@@ -1,4 +1,7 @@
-import { parseGeminiPlaceGuesses } from "./gemini.ts";
+import {
+  parseGeminiCandidateJudgments,
+  parseGeminiPlaceGuesses,
+} from "./gemini.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -67,4 +70,77 @@ Deno.test("rejects missing or malformed Gemini place responses", () => {
     [],
   );
   assertEquals(parseGeminiPlaceGuesses(response({ places: null })), []);
+});
+
+Deno.test("parses only bounded SELECT or NONE candidate judgments", () => {
+  assertEquals(
+    parseGeminiCandidateJudgments(response({
+      decisions: [{
+        guessIndex: 0,
+        decision: "SELECT",
+        candidateId: " 1102574979 ",
+        reason: "MATCH",
+      }, {
+        guessIndex: 1,
+        decision: "NONE",
+        candidateId: "must-be-cleared",
+        reason: "AMBIGUOUS_SAME_NAME",
+      }, {
+        guessIndex: 0,
+        decision: "SELECT",
+        candidateId: "duplicate",
+        reason: "MATCH",
+      }, {
+        guessIndex: 2,
+        decision: "SELECT",
+        candidateId: null,
+        reason: "MATCH",
+      }, {
+        guessIndex: 11,
+        decision: "NONE",
+        candidateId: null,
+        reason: "INSUFFICIENT_CONTEXT",
+      }, {
+        guessIndex: 3,
+        decision: "INVENT",
+        candidateId: "new-id",
+        reason: "MATCH",
+      }, {
+        guessIndex: 4,
+        decision: "SELECT",
+        candidateId: "candidate",
+        reason: "NAME_MISMATCH",
+      }, {
+        guessIndex: 5,
+        decision: "NONE",
+        candidateId: null,
+        reason: "MATCH",
+      }],
+    })),
+    [{
+      guessIndex: 0,
+      decision: "SELECT",
+      candidateId: "1102574979",
+      reason: "MATCH",
+    }, {
+      guessIndex: 1,
+      decision: "NONE",
+      candidateId: null,
+      reason: "AMBIGUOUS_SAME_NAME",
+    }],
+  );
+});
+
+Deno.test("rejects malformed Gemini candidate judgment responses", () => {
+  assertEquals(parseGeminiCandidateJudgments({ candidates: [] }), []);
+  assertEquals(
+    parseGeminiCandidateJudgments({
+      candidates: [{ content: { parts: [{ text: "not-json" }] } }],
+    }),
+    [],
+  );
+  assertEquals(
+    parseGeminiCandidateJudgments(response({ decisions: null })),
+    [],
+  );
 });
