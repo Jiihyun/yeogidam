@@ -49,14 +49,28 @@ sequenceDiagram
     I-->>F: caption + thumbnail
     F->>AI: 전체 caption, places[] schema
     AI-->>F: 0..N 장소명·주소·지역
-    loop 원문에서 검증된 각 장소
-        F->>K: 범위 제한 키워드 검색
+    loop 원문에 근거가 있는 각 장소
+        F->>K: 장소명 키워드 검색
         K-->>F: 0..15 후보 + Kakao place id
-        F->>F: 이름·지역·건물번호 대조
-        F->>D: places upsert on kakao_place_id
-        F->>G: 대표 사진 조회
-        F->>S: 선택된 이미지 업로드
-        F->>D: saved_places + reel_places upsert
+        F->>F: Kakao place id 중복 제거
+        alt 후보 0개
+            F->>F: 장소별 실패 기록
+        else 후보 1개
+            F->>F: 즉시 선택
+        else 후보 2개 이상
+            F->>F: 주소·지역으로 유일 후보 확인
+            opt 위치만으로 하나를 못 고름
+                F->>AI: 전체 caption + Kakao 후보
+                AI-->>F: candidateId 또는 NONE
+                F->>F: 전달한 candidateId인지 확인
+            end
+        end
+        opt 후보가 선택됨
+            F->>D: places upsert on kakao_place_id
+            F->>G: 대표 사진 조회
+            F->>S: 선택된 이미지 업로드
+            F->>D: saved_places + reel_places upsert
+        end
     end
     F->>D: reels(COMPLETED / FAILED)
     end
@@ -96,38 +110,35 @@ Gemini 입력과 DB의 캡션 원문은 선택된 description 하나다. `og:tit
 - 층·동·호를 포함한 상세주소 보존
 - 이름·주소·지역은 추론하지 않고 원문 문자열 복사
 
-호출 후 각 필드가 실제로 캡션에 있는지 다시 검증한다. 장소명만 있고 주소·지역 근거가 없으면 제거한다.
+호출 후 각 필드가 실제로 캡션에 있는지 다시 검증한다. 장소명이 원문에 없으면 항목을 제거하고, 주소·지역이 원문에 없으면 해당 필드만 `null`로 둔다. 주소와 지역이 모두 없어도 원문에 실제 방문 장소로 언급된 장소명은 후속 Kakao 검색에 넘긴다.
 
 상한은 response schema의 `maxItems: 10`과 파서의 `slice(0, 10)` 양쪽에 적용된다. 캡션에 11개 이상 장소가 있어도 응답에 포함된 10개 중 하나가 저장되면 최종 상태는 `COMPLETED`이며, 이후 장소가 잘렸다는 경고는 현재 응답과 DB에 없다. 따라서 응답에 포함되지 않은 항목은 Gemini 이후의 Kakao 단계에 도달하지 않는다.
 
-현재 프롬프트는 원문 순서대로 반환하라고 명시하지 않는다. `reel_places.position`도 원문 절대 인덱스가 아니라 검증에 성공한 결과를 0부터 다시 센 순서다. 원문 1·3·5번째만 성공하면 position은 0·1·2가 된다.
+현재 프롬프트는 원문 순서대로 반환하라고 명시하지 않는다. `reel_places.position`도 원문 절대 인덱스가 아니라 최종 매칭에 성공한 결과를 0부터 다시 센 순서다. 원문 1·3·5번째만 성공하면 position은 0·1·2가 된다.
 
-장소 수가 늘어도 Gemini 호출은 캡션당 한 번이다. 비용과 지연은 주로 각 결과에 대한 Kakao 검색, 새 장소의 Google 사진 조회, Storage 업로드에서 증가한다.
+1차 장소 추출 Gemini는 캡션당 한 번 호출한다. 복수 Kakao 후보가 남은 장소가 있으면 해당 장소들을 묶어 2차 후보 선택 Gemini를 최대 한 번 추가 호출한다. 비용과 지연은 주로 각 결과에 대한 Kakao 검색, 필요한 2차 Gemini 판단, 새 장소의 Google 사진 조회, Storage 업로드에서 증가한다.
 
 `address.ts`는 캡션의 도로명 주소를 `matchAll()`로 모두 수집하지만 현재는 shadow log에만 사용한다.
 
-## 5. Kakao 후보 생성과 검증
+## 5. Kakao 후보 생성과 선택
 
-각 `PlaceGuess`에서 다음 쿼리를 생성한다.
+각 `PlaceGuess`는 주소·지역 유무와 관계없이 `장소명` 하나로 Kakao 키워드 검색을 한 번 호출한다. 주소 문자열을 검색어에 섞거나, 결과가 없을 때 장소명으로 다시 검색하는 fallback은 없다. Kakao 응답은 정확도순 최대 15개이며, 같은 Kakao place id가 반복되면 첫 결과만 남긴다.
 
-1. `장소명 + 주소`
-2. `지역 + 장소명`
-3. `주소`
+후보 선택 정책은 다음과 같다.
 
-`장소명` 단독 전국 검색은 임의 지점 저장을 막기 위해 사용하지 않는다. Kakao는 쿼리당 정확도순 최대 15개를 반환한다.
+| Kakao place id 중복 제거 후 후보 수 | 처리 |
+|---|---|
+| 0개 | 해당 장소를 `NO_KAKAO_CANDIDATE`로 기록하고 저장하지 않음 |
+| 1개 | 이름·주소를 다시 비교하지 않고 즉시 `AUTO_MATCH` |
+| 2개 이상 | 캡션에서 추출한 주소·지역으로 정확히 하나만 특정되면 `AUTO_MATCH`; 그 외에는 원본 후보 전체를 2차 Gemini에 전달 |
 
-현재 장소와 쿼리는 순차 처리한다. 한 장소에서 세 쿼리가 모두 만들어질 수 있으므로 10개 상한은 Kakao 키워드 검색 최대 30회를 뜻한다. 주소 없는 `지역 + 장소명` 항목은 보통 한 쿼리만 만들기 때문에 실제 호출 수는 캡션 구성에 따라 작아진다.
+복수 후보의 위치 자동 선택은 **양성 일치**에만 쓴다. 파싱 가능한 행정구역 토큰, 도로명, 건물번호가 후보 주소와 정확히 맞아 하나만 남을 때만 자동 선택한다. 불완전하거나 파싱할 수 없는 위치, 일치 후보 0개, 일치 후보 2개 이상은 후보를 버리는 근거가 아니라 2차 Gemini로 넘기는 조건이다.
 
-후보는 다음 조건을 모두 통과해야 한다.
+2차 Gemini는 전체 캡션과 최대 15개의 Kakao 후보를 함께 받는다. `@아이디`, 해시태그, 지점명, 지역 문맥, 한글·영문·음차·철자 차이를 종합해 전달된 `candidateId` 하나를 선택하거나 근거가 부족하면 `NONE`을 반환한다. 코드의 최종 가드는 Gemini가 새 장소를 만들어 내지 못하도록 선택 ID가 전달 후보 목록에 있는지만 확인하며, 이름이나 주소 규칙으로 그 판단을 다시 뒤집지 않는다.
 
-- 이름 정규화 후 정확히 같음
-- 또는 `종각점`, `본점`, `2호점`, `관`, `센터` 같은 유효한 지점 접미사만 덧붙음
-- 시·도·시·군·구·동 토큰이 후보 주소와 일치
-- 출처 주소에 건물번호가 있으면 Kakao 도로명 또는 지번 주소와 일치
+이전의 상호명 지점 접미사 규칙, 4글자 이상 한 글자 오타 규칙, 도로명 숫자 전치 허용, 상세주소 기반 장소명-only fallback, Gemini 선택 후 이름·다지역·도로·건물번호 재검증은 제거했다. 표기 차이와 문맥 판단은 2차 Gemini가 맡는다.
 
-캡션과 Kakao 상호명이 한 글자만 다른 경우에는 이름이 4글자 이상이고 주소 근거가 강할 때만 오타로 보정한다. 도로명·건물번호가 같거나, 도로명 숫자의 인접 두 자리가 뒤바뀐 경우까지 허용한다. 다른 도로·건물번호, 지역 근거만 있는 후보는 이 보정을 적용하지 않는다.
-
-중복 제거 후 후보가 하나일 때만 확정한다. 0개나 2개 이상이면 해당 추출 항목을 스킵한다.
+현재 장소는 순차 처리하며, Gemini가 최대 10개 장소를 추출하므로 Kakao 키워드 검색도 최대 10회다.
 
 ## 6. 저장과 중복
 
@@ -173,22 +184,26 @@ Naver 전용 `naver_place_id`, `naver_link`, `naver_thumbnail_url`은 Kakao 전�
 | 상태 | 의미 |
 |---|---|
 | `PROCESSING` | 접수 후 백그라운드 처리 중 |
-| `COMPLETED` | 검증된 장소가 1개 이상 저장됨 |
+| `COMPLETED` | 선택된 장소가 1개 이상 저장됨 |
 | `FAILED` | 구조화 또는 저장 실패 |
 
 | 실패 사유 | 대표 원인 |
 |---|---|
-| `IG_FETCH_FAILED` | Instagram 차단·메타데이터 없음 |
-| `PLACE_NOT_FOUND` | Gemini/Kakao 키 누락, 추출 0개, Kakao 0건, 유일 후보 없음 |
+| `IG_FETCH_FAILED` | Instagram 요청 실패 또는 non-2xx 응답 |
+| `IG_CAPTION_NOT_FOUND` | HTML 응답은 성공했지만 description 메타데이터 없음 |
+| `PROVIDER_CONFIG_MISSING` | Gemini 또는 Kakao API 키 누락 |
+| `GEMINI_PLACE_NOT_FOUND` | Gemini 결과가 없거나 원문 검증 후 후보가 0개 |
+| `KAKAO_PLACE_NOT_FOUND` | Kakao 후보가 없거나 2차 Gemini가 선택하지 않아 저장할 장소가 0개 |
+| `PLACE_NOT_FOUND` | 이전 버전 호환용 일반 장소 탐색 실패 |
 | `UNKNOWN` | DB·Storage 또는 예상하지 못한 예외 |
 
 `COMPLETED`가 모든 캡션 장소의 저장을 보장하지는 않는다. 다음은 실패 상태가 아닌 부분 성공이다.
 
 - 10개 상한 때문에 Gemini 응답에서 제외된 장소가 처리되지 않음
-- 여러 Gemini 항목 중 일부만 Kakao에서 유일 후보로 검증됨
+- 여러 Gemini 항목 중 일부만 Kakao 후보 선택에 성공함
 - 동일 Kakao 장소 ID가 캡션에 반복되어 하나로 합쳐짐
 - 썸네일 제공자가 모두 실패하여 이미지 없이 장소만 저장됨
 
-운영에서 저장 개수가 예상보다 적으면 `instagram_description`의 장소 순서, Gemini `placeCount`, sanitized count, 장소별 Kakao `verifiedCount`, 최종 `reel_places.position`을 차례로 확인한다.
+운영에서 저장 개수가 예상보다 적으면 `instagram_description`의 장소 순서, Gemini `placeCount`, sanitized count, 장소별 Kakao `candidateCount`·`decision`, 2차 Gemini의 `NONE` 사유, 최종 `reel_places.position`을 차례로 확인한다.
 
 상세 알고리즘, 정규식 조사, 실패 매트릭스는 [MVP 장소 매칭 보고서](mvp-place-matching-release-report.md)를 참고한다.

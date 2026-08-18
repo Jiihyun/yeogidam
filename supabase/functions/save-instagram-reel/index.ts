@@ -21,7 +21,6 @@ import {
   searchKakaoPlaces,
 } from "./kakao.ts";
 import {
-  buildKakaoFallbackQueries,
   buildKakaoQueries,
   classifyKakaoCandidates,
   deduplicateKakaoPlaces,
@@ -29,7 +28,6 @@ import {
   sanitizePlaceGuesses,
 } from "./matching.ts";
 import {
-  type MatchSearchOrigin,
   type PlaceMatchFailure,
   type PlaceMatchFailureReason,
   placeMatchFailureRow,
@@ -78,7 +76,7 @@ type FailureReason =
   | "PLACE_NOT_FOUND"
   | "UNKNOWN";
 const STALE_PROCESSING_MS = 15 * 60 * 1000;
-const PIPELINE_VERSION = 4;
+const PIPELINE_VERSION = 7;
 
 // 로컬 검증 전용 스텁 (STUB_PROVIDERS=1 일 때만 사용). Gemini/Kakao 키 없이
 // 파이프라인 전체(추출→매칭→저장→썸네일)를 결정적으로 검증하기 위한 것.
@@ -474,14 +472,13 @@ interface MatchedPlace {
   place: KakaoPlace;
 }
 
-interface PendingCandidateReview extends KakaoCandidateReviewItem {
-  searchOrigin: MatchSearchOrigin;
-  reason: "NO_VERIFIED_CANDIDATE" | "MULTIPLE_VERIFIED_CANDIDATES";
-}
-
 function aiNoneFailureReason(
-  reason: "MATCH" | "AMBIGUOUS_SAME_NAME" | "NAME_MISMATCH" |
-    "ADDRESS_CONFLICT" | "INSUFFICIENT_CONTEXT",
+  reason:
+    | "MATCH"
+    | "AMBIGUOUS_SAME_NAME"
+    | "NAME_MISMATCH"
+    | "ADDRESS_CONFLICT"
+    | "INSUFFICIENT_CONTEXT",
 ): PlaceMatchFailureReason {
   return reason === "MATCH" ? "INSUFFICIENT_CONTEXT" : reason;
 }
@@ -565,48 +562,16 @@ async function processReel(
         return await fail(admin, reelId, "GEMINI_PLACE_NOT_FOUND");
       }
 
-      const pendingReviews: PendingCandidateReview[] = [];
+      const pendingReviews: KakaoCandidateReviewItem[] = [];
       for (const [guessIndex, guess] of guesses.entries()) {
-        let candidates: KakaoPlace[] = [];
+        const searchedCandidates: KakaoPlace[] = [];
         for (const query of buildKakaoQueries(guess)) {
-          candidates.push(
+          searchedCandidates.push(
             ...await searchKakaoPlaces(query, kakaoKey!),
           );
         }
-        candidates = deduplicateKakaoPlaces(candidates);
-
-        let searchOrigin: PendingCandidateReview["searchOrigin"] = "INITIAL";
-        let decision = classifyKakaoCandidates(guess, candidates);
-        let expansionAttempted = false;
-
-        // 원본 Kakao 후보가 정말 0개일 때만 검색어를 한 번 확장한다.
-        // 검증 탈락(후보는 존재)은 이 분기로 되돌아오지 않고 2차 AI로 간다.
-        if (decision.type === "NO_CANDIDATE") {
-          const fallbackQueries = buildKakaoFallbackQueries(guess);
-          const fallbackCandidates: KakaoPlace[] = [];
-          for (const query of fallbackQueries) {
-            fallbackCandidates.push(
-              ...await searchKakaoPlaces(query, kakaoKey!),
-            );
-          }
-          expansionAttempted = fallbackQueries.length > 0;
-          candidates = deduplicateKakaoPlaces(fallbackCandidates);
-          if (fallbackQueries.length > 0) {
-            searchOrigin = "EXPANDED_NAME_ONLY";
-          }
-          decision = classifyKakaoCandidates(guess, candidates, {
-            requireStrongAddressEvidence: true,
-          });
-          console.info(JSON.stringify({
-            event: "kakao_name_only_fallback_completed",
-            reelId,
-            guessIndex,
-            placeName: guess.placeName,
-            queryCount: fallbackQueries.length,
-            candidateCount: candidates.length,
-            decision: decision.type,
-          }));
-        }
+        const candidates = deduplicateKakaoPlaces(searchedCandidates);
+        const decision = classifyKakaoCandidates(guess, candidates);
 
         console.info(JSON.stringify({
           event: "kakao_place_candidates_classified",
@@ -614,11 +579,7 @@ async function processReel(
           guessIndex,
           guess,
           candidateCount: candidates.length,
-          searchOrigin,
           decision: decision.type,
-          reason: decision.type === "NEEDS_AI_REVIEW"
-            ? decision.reason
-            : null,
         }));
 
         if (decision.type === "AUTO_MATCH") {
@@ -628,19 +589,13 @@ async function processReel(
             guessIndex,
             guess,
             candidates: decision.candidates,
-            searchOrigin,
-            reason: decision.reason,
           });
         } else {
           matchFailures.push({
             guessIndex,
             guess,
             stage: "KAKAO_SEARCH",
-            reason: expansionAttempted
-              ? "NO_KAKAO_CANDIDATE_AFTER_EXPANSION"
-              : "NO_KAKAO_CANDIDATE",
-            searchOrigin,
-            classifierReason: null,
+            reason: "NO_KAKAO_CANDIDATE",
             candidates: [],
           });
         }
@@ -671,39 +626,29 @@ async function processReel(
               reason: judgment
                 ? aiNoneFailureReason(judgment.reason)
                 : "AI_JUDGMENT_UNAVAILABLE",
-              searchOrigin: review.searchOrigin,
-              classifierReason: review.reason,
               candidates: review.candidates,
             });
             console.info(JSON.stringify({
               event: "gemini_candidate_judgment_unresolved",
               reelId,
               guessIndex: review.guessIndex,
-              reason: review.reason,
+              reason: judgment?.reason ?? "AI_JUDGMENT_UNAVAILABLE",
               decision: judgment?.decision ?? "MISSING",
             }));
             continue;
           }
 
           const resolution = resolveAiSelectedKakaoPlace(
-            review.guess,
             review.candidates,
             judgment.candidateId,
-            {
-              requireStrongAddressEvidence:
-                review.searchOrigin === "EXPANDED_NAME_ONLY",
-            },
           );
           console.info(JSON.stringify({
             event: "gemini_candidate_selection_guarded",
             reelId,
             guessIndex: review.guessIndex,
             candidateId: judgment.candidateId,
-            searchOrigin: review.searchOrigin,
             result: resolution.status,
-            reason: resolution.status === "REJECTED"
-              ? resolution.reason
-              : null,
+            reason: resolution.status === "REJECTED" ? resolution.reason : null,
           }));
           if (resolution.status === "ACCEPTED") {
             matchedPlaces.push({
@@ -716,8 +661,6 @@ async function processReel(
               guess: review.guess,
               stage: "FINAL_GUARD",
               reason: resolution.reason,
-              searchOrigin: review.searchOrigin,
-              classifierReason: review.reason,
               candidates: review.candidates,
             });
           }
@@ -730,7 +673,7 @@ async function processReel(
       return await fail(admin, reelId, "KAKAO_PLACE_NOT_FOUND");
     }
 
-    // 4. 검증된 모든 장소를 places/saved_places/reel_places에 순서대로 저장한다.
+    // 4. 선택된 모든 장소를 places/saved_places/reel_places에 순서대로 저장한다.
     const placeIds: string[] = [];
     for (const [position, match] of matchedPlaces.entries()) {
       const placeId = await persistMatchedPlace(

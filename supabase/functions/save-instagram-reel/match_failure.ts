@@ -8,32 +8,18 @@ export type PlaceMatchFailureStage =
 
 export type PlaceMatchFailureReason =
   | "NO_KAKAO_CANDIDATE"
-  | "NO_KAKAO_CANDIDATE_AFTER_EXPANSION"
   | "AI_JUDGMENT_UNAVAILABLE"
   | "AMBIGUOUS_SAME_NAME"
   | "NAME_MISMATCH"
   | "ADDRESS_CONFLICT"
   | "INSUFFICIENT_CONTEXT"
-  | "AI_SELECTED_UNKNOWN_CANDIDATE"
-  | "REGION_CONFLICT"
-  | "ROAD_CONFLICT"
-  | "BUILDING_NUMBER_CONFLICT"
-  | "UNRESOLVED_MULTI_REGION"
-  | "INSUFFICIENT_ADDRESS_EVIDENCE";
-
-export type CandidateClassifierReason =
-  | "NO_VERIFIED_CANDIDATE"
-  | "MULTIPLE_VERIFIED_CANDIDATES";
-
-export type MatchSearchOrigin = "INITIAL" | "EXPANDED_NAME_ONLY";
+  | "AI_SELECTED_UNKNOWN_CANDIDATE";
 
 export interface PlaceMatchFailure {
   guessIndex: number;
   guess: PlaceGuess;
   stage: PlaceMatchFailureStage;
   reason: PlaceMatchFailureReason;
-  searchOrigin: MatchSearchOrigin;
-  classifierReason: CandidateClassifierReason | null;
   candidates: KakaoPlace[];
 }
 
@@ -45,8 +31,8 @@ export interface PlaceMatchFailureRow {
   source_region: string | null;
   failure_stage: PlaceMatchFailureStage;
   failure_reason: PlaceMatchFailureReason;
-  search_origin: MatchSearchOrigin;
-  classifier_reason: CandidateClassifierReason | null;
+  search_origin: "INITIAL";
+  classifier_reason: null;
   candidate_count: number;
   candidate_ids: string[];
 }
@@ -66,8 +52,8 @@ export function placeMatchFailureRow(
     source_region: failure.guess.region,
     failure_stage: failure.stage,
     failure_reason: failure.reason,
-    search_origin: failure.searchOrigin,
-    classifier_reason: failure.classifierReason,
+    search_origin: "INITIAL",
+    classifier_reason: null,
     candidate_count: candidateIds.length,
     candidate_ids: candidateIds,
   };

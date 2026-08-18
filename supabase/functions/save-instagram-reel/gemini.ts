@@ -154,7 +154,8 @@ export async function extractPlacesWithGemini(
     `- placeName, address, region은 추론하거나 보정하지 말고 캡션에 실제 적힌 문자열을 그대로 복사한다.\n` +
     `- address에는 층·동·호를 포함한 가장 상세한 주소를 넣는다.\n` +
     `- addressType은 도로명 주소 ROAD, 지번 주소 JIBUN, 불완전 주소 PARTIAL, 주소 없음 NONE이다.\n` +
-    `- 지점·주소·지역을 특정할 수 없는 일반 브랜드 홍보는 장소로 반환하지 않는다.\n` +
+    `- 캡션에서 실제 방문 장소로 언급된 구체적인 상호명은 주소·지역이 없어도 반환한다.\n` +
+    `- 방문 장소가 아닌 단순 상품·브랜드 홍보는 장소로 반환하지 않는다.\n` +
     `- 실제 장소가 없으면 places는 빈 배열이다.`;
 
   const body = {
@@ -228,8 +229,8 @@ export async function extractPlacesWithGemini(
 }
 
 /**
- * 결정론적 검증만으로 확정하지 못한 Kakao 후보를 한 번에 판단한다.
- * 호출자는 반환 ID가 원래 후보 목록에 있는지와 주소의 명백한 충돌을 다시 검사한다.
+ * 후보 수와 위치 근거만으로 하나를 확정하지 못한 Kakao 후보를 한 번에 판단한다.
+ * 호출자는 반환 ID가 원래 후보 목록에 있는지만 다시 검사한다.
  */
 export async function judgeKakaoCandidatesWithGemini(
   caption: string,
@@ -260,8 +261,9 @@ export async function judgeKakaoCandidatesWithGemini(
     `아래 데이터에서 추출 장소마다 같은 실제 장소인 Kakao 후보 하나를 고르거나 NONE을 골라줘.\n` +
     `판단 규칙:\n` +
     `- 전체 캡션 문맥, 추출된 상호명·주소·지역, 후보 이름·주소를 함께 비교한다.\n` +
-    `- 표기 차이, 지점명 덧붙임, 명백한 한 글자 오타는 허용할 수 있다.\n` +
-    `- 동명이점이거나 주소가 충돌하거나 근거가 부족하면 반드시 NONE이다.\n` +
+    `- 캡션의 @아이디, 해시태그, 지점명과 지역 표현도 장소를 특정하는 근거로 사용한다.\n` +
+    `- 띄어쓰기, 한글·영문 표기, 음차, 철자 차이만으로 같은 장소를 배제하지 않는다.\n` +
+    `- 동명이점이어도 캡션 근거로 하나를 특정할 수 있으면 SELECT하고, 근거가 부족하거나 주소가 충돌하면 NONE이다.\n` +
     `- SELECT의 reason은 MATCH만 사용한다.\n` +
     `- NONE이면 reason을 AMBIGUOUS_SAME_NAME, NAME_MISMATCH, ADDRESS_CONFLICT, INSUFFICIENT_CONTEXT 중 가장 직접적인 원인 하나로 반환한다.\n` +
     `- candidateId는 해당 guessIndex의 kakaoCandidates에 실제 있는 값만 복사한다. 새 ID나 장소를 만들지 않는다.\n` +
@@ -328,7 +330,9 @@ export async function judgeKakaoCandidatesWithGemini(
       model,
       reviewCount: items.length,
       judgmentCount: judgments.length,
-      decisions: judgments.map(({ guessIndex, decision, candidateId, reason }) => ({
+      decisions: judgments.map((
+        { guessIndex, decision, candidateId, reason },
+      ) => ({
         guessIndex,
         decision,
         candidateId,

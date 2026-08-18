@@ -4,6 +4,8 @@
 - 기준 구현: Instagram HTML-head-only + Gemini-first 다중 추출 + Kakao Local API 검증
 - 대상: `save-instagram-reel` Edge Function
 
+> **2026-08-18 정책 변경:** 이 문서의 후보 매칭 설명은 2026-08-11 출시 판단 당시의 기록이다. 현재 구현은 장소명 단독 Kakao 검색 후 `0개=실패`, `1개=즉시 선택`, `2개 이상=주소·지역으로 유일 후보를 찾거나 전체 후보를 2차 Gemini에 전달`하는 정책을 사용한다. 이름 접미사·한 글자 오타·도로 숫자 전치·검색 fallback과 Gemini 선택 후 이름·주소 재검증은 제거했다. 최신 실행 계약은 [릴스 장소 저장 구현 플로우](save-instagram-reel-flow.md)를 기준으로 한다.
+
 ## 1. 결론
 
 현재 MVP는 릴스 HTML head의 `og:description`을 캡션 SSOT로 사용한다. 없으면 `name="description"`, `twitter:description` 순서로 같은 description 계열만 대체한다. 선택한 description 하나를 Gemini에 보내 장소명과 상세 주소를 다중 추출한 뒤, Kakao Local API 후보의 이름과 주소를 원문과 다시 대조한다. 유일하게 검증된 후보만 저장하고, 중복은 Kakao 장소 ID로 막는다.
