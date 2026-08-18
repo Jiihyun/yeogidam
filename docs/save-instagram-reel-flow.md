@@ -124,6 +124,8 @@ Gemini 입력과 DB의 캡션 원문은 선택된 description 하나다. `og:tit
 
 각 `PlaceGuess`는 주소·지역 유무와 관계없이 `장소명` 하나로 Kakao 키워드 검색을 한 번 호출한다. 주소 문자열을 검색어에 섞거나, 결과가 없을 때 장소명으로 다시 검색하는 fallback은 없다. Kakao 응답은 정확도순 최대 15개이며, 같은 Kakao place id가 반복되면 첫 결과만 남긴다.
 
+HTTP 200 응답의 `documents: []`만 실제 후보 0개로 처리한다. Kakao가 401·403·429·5xx를 반환하거나 네트워크·응답 형식 오류가 발생하면 후보 0개로 바꾸지 않고 공급자 오류로 중단한다. 현재 별도 DB 실패 enum을 늘리지 않고 재시도 가능한 `UNKNOWN`으로 기록하며, `kakao_place_search_failed` 로그에 오류 종류·HTTP status·재시도 가능 여부를 남긴다.
+
 후보 선택 정책은 다음과 같다.
 
 | Kakao place id 중복 제거 후 후보 수 | 처리 |

@@ -13,6 +13,54 @@ export interface KakaoPlace {
   telephone: string | null;
 }
 
+export type KakaoPlaceSearchFailureKind =
+  | "AUTH"
+  | "RATE_LIMIT"
+  | "SERVER"
+  | "HTTP"
+  | "NETWORK"
+  | "INVALID_RESPONSE";
+
+export class KakaoPlaceSearchError extends Error {
+  constructor(
+    public readonly kind: KakaoPlaceSearchFailureKind,
+    public readonly status: number | null,
+    public readonly retryable: boolean,
+    cause?: unknown,
+  ) {
+    super(
+      `kakao place search failed: ${kind}${
+        status === null ? "" : ` (${status})`
+      }`,
+      cause === undefined ? undefined : { cause },
+    );
+    this.name = "KakaoPlaceSearchError";
+  }
+}
+
+function httpFailure(status: number): KakaoPlaceSearchError {
+  if (status === 401 || status === 403) {
+    return new KakaoPlaceSearchError("AUTH", status, false);
+  }
+  if (status === 429) {
+    return new KakaoPlaceSearchError("RATE_LIMIT", status, true);
+  }
+  if (status >= 500) {
+    return new KakaoPlaceSearchError("SERVER", status, true);
+  }
+  return new KakaoPlaceSearchError("HTTP", status, status === 408);
+}
+
+function logSearchFailure(query: string, error: KakaoPlaceSearchError): void {
+  console.error(JSON.stringify({
+    event: "kakao_place_search_failed",
+    query,
+    kind: error.kind,
+    status: error.status,
+    retryable: error.retryable,
+  }));
+}
+
 function optionalString(value: unknown): string | null {
   return typeof value === "string" ? value.trim() || null : null;
 }
@@ -60,6 +108,7 @@ export function buildKakaoMapURL(kakaoPlaceId: string): string {
 export async function searchKakaoPlaces(
   query: string,
   restApiKey: string,
+  request: typeof fetch = fetch,
 ): Promise<KakaoPlace[]> {
   const params = new URLSearchParams({
     query,
@@ -67,20 +116,60 @@ export async function searchKakaoPlaces(
     sort: "accuracy",
   });
   const url = `https://dapi.kakao.com/v2/local/search/keyword.json?${params}`;
-  const response = await fetch(url, {
-    headers: { Authorization: `KakaoAK ${restApiKey}` },
-  });
-
-  if (!response.ok) {
-    console.error(JSON.stringify({
-      event: "kakao_place_search_failed",
-      query,
-      status: response.status,
-    }));
-    return [];
+  let response: Response;
+  try {
+    response = await request(url, {
+      headers: { Authorization: `KakaoAK ${restApiKey}` },
+    });
+  } catch (cause) {
+    const error = new KakaoPlaceSearchError("NETWORK", null, true, cause);
+    logSearchFailure(query, error);
+    throw error;
   }
 
-  const places = parseKakaoPlaces(await response.json());
+  if (!response.ok || response.status !== 200) {
+    const error = httpFailure(response.status);
+    logSearchFailure(query, error);
+    throw error;
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (cause) {
+    const error = new KakaoPlaceSearchError(
+      "INVALID_RESPONSE",
+      response.status,
+      true,
+      cause,
+    );
+    logSearchFailure(query, error);
+    throw error;
+  }
+  if (
+    !payload || typeof payload !== "object" ||
+    !Array.isArray((payload as { documents?: unknown }).documents)
+  ) {
+    const error = new KakaoPlaceSearchError(
+      "INVALID_RESPONSE",
+      response.status,
+      true,
+    );
+    logSearchFailure(query, error);
+    throw error;
+  }
+
+  const documents = (payload as { documents: unknown[] }).documents;
+  const places = parseKakaoPlaces(payload);
+  if (places.length !== documents.length) {
+    const error = new KakaoPlaceSearchError(
+      "INVALID_RESPONSE",
+      response.status,
+      true,
+    );
+    logSearchFailure(query, error);
+    throw error;
+  }
   console.info(JSON.stringify({
     event: "kakao_place_search_completed",
     query,
