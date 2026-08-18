@@ -157,14 +157,14 @@ xcodebuild -project ios/Yeogidam.xcodeproj \
 
 ### 애플리케이션 레벨
 
-- Gemini structured output은 현재 장소 최대 10개로 제한합니다. 이는 Gemini 자체 제한이 아니라 후속 Kakao·사진 호출량을 제한하는 MVP 안전 상한입니다.
-- 장소당 Kakao 쿼리는 최대 3개이며 현재 순차 실행합니다. 따라서 릴스 하나의 Kakao 키워드 검색은 이론상 최대 30회입니다.
+- Gemini structured output과 파서는 장소 개수 상한을 두지 않습니다. 모델이 반환한 모든 유효 장소를 후속 처리합니다.
+- 장소당 Kakao 쿼리는 한 번이며 현재 순차 실행합니다. 따라서 Kakao 호출 수는 추출 장소 수에 비례합니다.
 - `places.thumbnail_url`이 있으면 외부 사진 API를 다시 호출하지 않습니다.
 - `reserve_google_places_thumbnail()`은 UTC 월 기준 900회까지만 원자적으로 예약합니다.
 - 900회를 넘으면 Instagram, Kakao, placeholder 순으로 폴백합니다.
 - RPC는 `service_role`만 실행할 수 있습니다.
 
-장소 상한은 비용 방어인 동시에 커버리지 제한이다. 10개를 초과해 Gemini 응답에서 제외된 장소는 처리되지 않지만 포함된 항목 중 한 곳이라도 저장되면 릴스는 `COMPLETED`가 된다. 상한을 올릴 때는 Kakao 동시 실행 3~5개, 릴스당 쿼리 예산, 처리 시간 상한, 절단 여부 관측을 함께 도입합니다.
+장소 개수 상한을 제거했으므로 매우 긴 장소 모음 캡션에서는 Kakao·사진·Storage 호출량과 처리 시간이 함께 증가한다. 공급자 quota와 Edge Function 실행 시간을 관측하고, 필요하면 장소를 잘라내는 방식이 아닌 제한된 병렬 처리와 재개 가능한 배치 처리로 보호합니다.
 
 ### Google Cloud Console
 
@@ -220,7 +220,7 @@ Google Maps Platform 약관은 Google Maps Content의 저장·재호스팅과 �
 | `PLACE_NOT_FOUND` | Gemini 다중 장소, 원문 검증, Kakao API status·itemCount·verifiedCount |
 | `UNKNOWN` | places upsert와 DB 제약, Function exception log |
 | 사진만 없음 | 월 예약 한도, Google quota, Storage upload, 폴백 URL |
-| `COMPLETED`인데 일부 장소가 없음 | 캡션 장소 순서와 10개 상한, Gemini placeCount·sanitizedCount, 장소별 verifiedCount, `reel_places.position` |
+| `COMPLETED`인데 일부 장소가 없음 | 캡션 장소 수와 Gemini placeCount·sanitizedCount, 장소별 candidateCount·2차 판단, `reel_places.position` |
 | 같은 릴스를 다시 보내도 재처리 안 됨 | 같은 사용자 shortcode 캐시, processing version, 기존 `reel_places` 복원 여부 |
 | 알고리즘 배포 후 기존 릴스 결과가 그대로임 | `PIPELINE_VERSION`을 올렸는지 확인. 같은 버전의 완료 결과는 정상적으로 캐시됨 |
 | `FAILED/UNKNOWN`인데 일부 장소가 목록에 보임 | 다중 장소 비트랜잭션 저장 중 뒤 항목 실패 여부, 남은 `saved_places`·`reel_places` 확인 |
@@ -230,13 +230,13 @@ Edge Function은 Instagram fetch, Gemini 구조화, Kakao 검색·후보 검증 
 
 ### 부분 저장 진단 순서
 
-1. `reels.instagram_description`에서 장소가 몇 번째로 등장하는지 확인합니다.
-2. `gemini_place_extraction_completed.placeCount`가 10이면 상한 도달 가능성을 먼저 봅니다.
-3. `gemini_place_guesses_sanitized`의 `extractedCount`와 `sanitizedCount` 차이로 원문 검증 탈락을 확인합니다.
-4. 각 `kakao_place_candidates_verified`의 `candidateCount`, `verifiedCount`를 확인합니다.
+1. `reels.instagram_description`의 장소 수와 `gemini_place_extraction_completed.placeCount`를 비교합니다.
+2. `gemini_place_guesses_sanitized`의 `extractedCount`와 `sanitizedCount` 차이로 원문 검증 탈락을 확인합니다.
+3. 각 `kakao_place_candidates_classified`의 `candidateCount`, `decision`을 확인합니다.
+4. 2차 Gemini의 선택 또는 `NONE` 사유를 확인합니다.
 5. 최종 `reel_places`의 `position`과 장소명을 확인합니다.
 
-현재는 `truncated` 플래그를 저장하지 않으므로 10개가 반환됐다는 사실만으로 실제 캡션이 절단됐다고 단정할 수는 없다. 캡션 원문과 함께 판단해야 합니다.
+애플리케이션 개수 상한은 없지만 Gemini가 원문의 모든 장소를 항상 반환한다는 보장은 없다. 캡션과 추출 로그를 비교해 모델 누락을 판단합니다.
 
 `reel_places.position`은 캡션 절대 순번이 아니라 성공한 결과의 압축 순서다. 누락 위치를 판단할 때 position만 보지 말고 캡션과 Gemini 구조화 로그를 같이 확인합니다.
 
@@ -252,7 +252,7 @@ Edge Function은 Instagram fetch, Gemini 구조화, Kakao 검색·후보 검증 
 - [ ] Apple Team과 App Group provisioning 확인
 - [ ] Apple 유료 Developer Team을 Xcode에 추가·선택하고 `com.yeogidamm.app`의 Sign in with Apple 개발용 provisioning profile을 발급한 뒤 `정콩이🌳` 실기기 빌드·설치 및 로그인 E2E 확인
 - [ ] 실기기 Share Extension E2E 통과
-- [ ] 10개·11개 이상 다중 장소 캡션의 부분 성공 동작 확인
+- [ ] 12개 이상 다중 장소가 끝 항목까지 추출·검색되는지 확인
 - [ ] 장소 상세에서 관련 릴스 여러 개 조회 및 Instagram 이동 확인
 - [ ] 매칭 알고리즘 변경 시 `PIPELINE_VERSION` 증가와 기존 결과 정리 정책 확인
 - [ ] 다중 장소 중간 DB 실패 후 잔여 관계가 없는지 확인
