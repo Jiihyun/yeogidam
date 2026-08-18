@@ -48,7 +48,7 @@ Deno.test("parses multiple structured Gemini places", () => {
   );
 });
 
-Deno.test("drops malformed places and caps the result", () => {
+Deno.test("drops malformed places without capping valid results", () => {
   const places = Array.from({ length: 12 }, (_, index) => ({
     placeName: index === 1 ? "" : `장소${index}`,
     address: null,
@@ -57,8 +57,9 @@ Deno.test("drops malformed places and caps the result", () => {
   }));
   const result = parseGeminiPlaceGuesses(response({ places }));
 
-  assertEquals(result.length, 9);
+  assertEquals(result.length, 11);
   assertEquals(result[1].addressType, "NONE");
+  assertEquals(result.at(-1)?.placeName, "장소11");
 });
 
 Deno.test("rejects missing or malformed Gemini place responses", () => {
@@ -72,7 +73,7 @@ Deno.test("rejects missing or malformed Gemini place responses", () => {
   assertEquals(parseGeminiPlaceGuesses(response({ places: null })), []);
 });
 
-Deno.test("parses only bounded SELECT or NONE candidate judgments", () => {
+Deno.test("parses only valid unique SELECT or NONE candidate judgments", () => {
   assertEquals(
     parseGeminiCandidateJudgments(response({
       decisions: [{
@@ -127,8 +128,27 @@ Deno.test("parses only bounded SELECT or NONE candidate judgments", () => {
       decision: "NONE",
       candidateId: null,
       reason: "AMBIGUOUS_SAME_NAME",
+    }, {
+      guessIndex: 11,
+      decision: "NONE",
+      candidateId: null,
+      reason: "INSUFFICIENT_CONTEXT",
     }],
   );
+});
+
+Deno.test("parses more than ten candidate judgments", () => {
+  const decisions = Array.from({ length: 12 }, (_, guessIndex) => ({
+    guessIndex,
+    decision: "NONE",
+    candidateId: null,
+    reason: "INSUFFICIENT_CONTEXT",
+  }));
+
+  const result = parseGeminiCandidateJudgments(response({ decisions }));
+
+  assertEquals(result.length, 12);
+  assertEquals(result.at(-1)?.guessIndex, 11);
 });
 
 Deno.test("rejects malformed Gemini candidate judgment responses", () => {

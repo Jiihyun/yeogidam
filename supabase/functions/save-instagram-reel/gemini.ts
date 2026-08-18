@@ -62,7 +62,7 @@ export function parseGeminiPlaceGuesses(data: unknown): PlaceGuess[] {
     if (!Array.isArray(parsed.places)) return [];
 
     const guesses: PlaceGuess[] = [];
-    for (const item of parsed.places.slice(0, 10)) {
+    for (const item of parsed.places) {
       if (!item || typeof item !== "object") continue;
       const raw = item as Record<string, unknown>;
       const placeName = optionalString(raw.placeName);
@@ -95,13 +95,13 @@ export function parseGeminiCandidateJudgments(
 
     const judgments: GeminiCandidateJudgment[] = [];
     const seen = new Set<number>();
-    for (const item of parsed.decisions.slice(0, 10)) {
+    for (const item of parsed.decisions) {
       if (!item || typeof item !== "object") continue;
       const raw = item as Record<string, unknown>;
       const guessIndex = raw.guessIndex;
       if (
         typeof guessIndex !== "number" || !Number.isInteger(guessIndex) ||
-        guessIndex < 0 || guessIndex >= 10 || seen.has(guessIndex)
+        guessIndex < 0 || seen.has(guessIndex)
       ) continue;
 
       const reason = candidateJudgmentReason(raw.reason);
@@ -168,7 +168,6 @@ export async function extractPlacesWithGemini(
         properties: {
           places: {
             type: "array",
-            maxItems: 10,
             items: {
               type: "object",
               required: ["placeName", "address", "addressType", "region"],
@@ -245,7 +244,7 @@ export async function judgeKakaoCandidatesWithGemini(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   const reviewInput = {
     caption,
-    places: items.slice(0, 10).map(({ guessIndex, guess, candidates }) => ({
+    places: items.map(({ guessIndex, guess, candidates }) => ({
       guessIndex,
       extracted: guess,
       kakaoCandidates: candidates.map((candidate) => ({
@@ -281,12 +280,11 @@ export async function judgeKakaoCandidatesWithGemini(
         properties: {
           decisions: {
             type: "array",
-            maxItems: 10,
             items: {
               type: "object",
               required: ["guessIndex", "decision", "candidateId", "reason"],
               properties: {
-                guessIndex: { type: "integer", minimum: 0, maximum: 9 },
+                guessIndex: { type: "integer", minimum: 0 },
                 decision: { type: "string", enum: ["SELECT", "NONE"] },
                 candidateId: { type: "string", nullable: true },
                 reason: {

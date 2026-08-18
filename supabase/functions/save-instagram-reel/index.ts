@@ -76,7 +76,7 @@ type FailureReason =
   | "PLACE_NOT_FOUND"
   | "UNKNOWN";
 const STALE_PROCESSING_MS = 15 * 60 * 1000;
-const PIPELINE_VERSION = 7;
+const PIPELINE_VERSION = 8;
 
 // 로컬 검증 전용 스텁 (STUB_PROVIDERS=1 일 때만 사용). Gemini/Kakao 키 없이
 // 파이프라인 전체(추출→매칭→저장→썸네일)를 결정적으로 검증하기 위한 것.
