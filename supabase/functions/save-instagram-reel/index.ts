@@ -12,7 +12,6 @@ import { extractKoreanAddresses } from "./address.ts";
 import {
   extractPlacesWithGemini,
   judgeKakaoCandidatesWithGemini,
-  type KakaoCandidateReviewItem,
   type PlaceGuess,
 } from "./gemini.ts";
 import {
@@ -20,21 +19,19 @@ import {
   type KakaoPlace,
   searchKakaoPlaces,
 } from "./kakao.ts";
-import {
-  buildKakaoQueries,
-  classifyKakaoCandidates,
-  deduplicateKakaoPlaces,
-  resolveAiSelectedKakaoPlace,
-  sanitizePlaceGuesses,
-} from "./matching.ts";
+import { sanitizePlaceGuesses } from "./matching.ts";
 import {
   type PlaceMatchFailure,
-  type PlaceMatchFailureReason,
   placeMatchFailureRow,
 } from "./match_failure.ts";
+import { resolvePlacesFromKakao } from "./place_resolution.ts";
 import { findGooglePlacePhoto } from "./google.ts";
 import { rehostThumbnail, scrapePageImage } from "./thumbnail.ts";
-import { parseInstagramReelURL, shouldRetryReel } from "./reel.ts";
+import {
+  completedProcessingVersion,
+  parseInstagramReelURL,
+  shouldRetryReel,
+} from "./reel.ts";
 
 // Supabase Edge Runtime 전역 (백그라운드 처리)
 declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void };
@@ -76,7 +73,7 @@ type FailureReason =
   | "PLACE_NOT_FOUND"
   | "UNKNOWN";
 const STALE_PROCESSING_MS = 15 * 60 * 1000;
-const PIPELINE_VERSION = 8;
+const PIPELINE_VERSION = 9;
 
 // 로컬 검증 전용 스텁 (STUB_PROVIDERS=1 일 때만 사용). Gemini/Kakao 키 없이
 // 파이프라인 전체(추출→매칭→저장→썸네일)를 결정적으로 검증하기 위한 것.
@@ -472,17 +469,6 @@ interface MatchedPlace {
   place: KakaoPlace;
 }
 
-function aiNoneFailureReason(
-  reason:
-    | "MATCH"
-    | "AMBIGUOUS_SAME_NAME"
-    | "NAME_MISMATCH"
-    | "ADDRESS_CONFLICT"
-    | "INSUFFICIENT_CONTEXT",
-): PlaceMatchFailureReason {
-  return reason === "MATCH" ? "INSUFFICIENT_CONTEXT" : reason;
-}
-
 async function processReel(
   admin: SupabaseClient,
   reelId: string,
@@ -562,113 +548,18 @@ async function processReel(
         return await fail(admin, reelId, "GEMINI_PLACE_NOT_FOUND");
       }
 
-      const pendingReviews: KakaoCandidateReviewItem[] = [];
-      for (const [guessIndex, guess] of guesses.entries()) {
-        const searchedCandidates: KakaoPlace[] = [];
-        for (const query of buildKakaoQueries(guess)) {
-          searchedCandidates.push(
-            ...await searchKakaoPlaces(query, kakaoKey!),
-          );
-        }
-        const candidates = deduplicateKakaoPlaces(searchedCandidates);
-        const decision = classifyKakaoCandidates(guess, candidates);
-
-        console.info(JSON.stringify({
-          event: "kakao_place_candidates_classified",
-          reelId,
-          guessIndex,
-          guess,
-          candidateCount: candidates.length,
-          decision: decision.type,
-        }));
-
-        if (decision.type === "AUTO_MATCH") {
-          matchedPlaces.push({ guess, place: decision.place });
-        } else if (decision.type === "NEEDS_AI_REVIEW") {
-          pendingReviews.push({
-            guessIndex,
-            guess,
-            candidates: decision.candidates,
-          });
-        } else {
-          matchFailures.push({
-            guessIndex,
-            guess,
-            stage: "KAKAO_SEARCH",
-            reason: "NO_KAKAO_CANDIDATE",
-            candidates: [],
-          });
-        }
-      }
-
-      // 애매한 장소들을 한 번의 2차 AI 호출로 판단한다. AI 결과에서 다시
-      // 검색하거나 재호출하지 않으므로 이 요청 안에 역방향 간선/루프가 없다.
-      if (pendingReviews.length > 0) {
-        const judgments = await judgeKakaoCandidatesWithGemini(
-          caption,
-          pendingReviews,
-          geminiKey!,
-        );
-        const judgmentByGuess = new Map(
-          judgments.map((judgment) => [judgment.guessIndex, judgment]),
-        );
-
-        for (const review of pendingReviews) {
-          const judgment = judgmentByGuess.get(review.guessIndex);
-          if (
-            !judgment || judgment.decision === "NONE" ||
-            !judgment.candidateId
-          ) {
-            matchFailures.push({
-              guessIndex: review.guessIndex,
-              guess: review.guess,
-              stage: "AI_REVIEW",
-              reason: judgment
-                ? aiNoneFailureReason(judgment.reason)
-                : "AI_JUDGMENT_UNAVAILABLE",
-              candidates: review.candidates,
-            });
-            console.info(JSON.stringify({
-              event: "gemini_candidate_judgment_unresolved",
-              reelId,
-              guessIndex: review.guessIndex,
-              reason: judgment?.reason ?? "AI_JUDGMENT_UNAVAILABLE",
-              decision: judgment?.decision ?? "MISSING",
-            }));
-            continue;
-          }
-
-          const resolution = resolveAiSelectedKakaoPlace(
-            review.candidates,
-            judgment.candidateId,
-          );
-          console.info(JSON.stringify({
-            event: "gemini_candidate_selection_guarded",
-            reelId,
-            guessIndex: review.guessIndex,
-            candidateId: judgment.candidateId,
-            result: resolution.status,
-            reason: resolution.status === "REJECTED" ? resolution.reason : null,
-          }));
-          if (resolution.status === "ACCEPTED") {
-            matchedPlaces.push({
-              guess: review.guess,
-              place: resolution.place,
-            });
-          } else {
-            matchFailures.push({
-              guessIndex: review.guessIndex,
-              guess: review.guess,
-              stage: "FINAL_GUARD",
-              reason: resolution.reason,
-              candidates: review.candidates,
-            });
-          }
-        }
-      }
+      const resolution = await resolvePlacesFromKakao(caption, guesses, {
+        search: (query) => searchKakaoPlaces(query, kakaoKey!),
+        judge: (reviewCaption, items) =>
+          judgeKakaoCandidatesWithGemini(reviewCaption, items, geminiKey!),
+        log: (event, details) => {
+          console.info(JSON.stringify({ event, reelId, ...details }));
+        },
+      });
+      matchedPlaces = resolution.matches;
+      matchFailures.push(...resolution.failures);
     }
     await persistPlaceMatchFailures(admin, reelId, matchFailures);
-    matchedPlaces = deduplicateMatchedPlaces(matchedPlaces);
     if (matchedPlaces.length === 0) {
       return await fail(admin, reelId, "KAKAO_PLACE_NOT_FOUND");
     }
@@ -693,6 +584,12 @@ async function processReel(
       .from("reels")
       .update({
         place_id: placeIds[0],
+        // 부분 성공은 다음 공유에서 누락 장소를 다시 판단하고 다른 사용자에게
+        // 완료 캐시로 전파하지 않도록 현재 파이프라인과 겹치지 않는 예약값으로 표시한다.
+        processing_version: completedProcessingVersion(
+          PIPELINE_VERSION,
+          matchFailures.length,
+        ),
         processing_status: "COMPLETED",
         failure_reason: null,
       })
@@ -726,16 +623,6 @@ async function persistPlaceMatchFailures(
     { onConflict: "reel_id,guess_index" },
   );
   if (error) throw error;
-}
-
-function deduplicateMatchedPlaces(matches: MatchedPlace[]): MatchedPlace[] {
-  const unique = new Map<string, MatchedPlace>();
-  for (const match of matches) {
-    if (!unique.has(match.place.kakaoPlaceId)) {
-      unique.set(match.place.kakaoPlaceId, match);
-    }
-  }
-  return [...unique.values()];
 }
 
 async function persistMatchedPlace(

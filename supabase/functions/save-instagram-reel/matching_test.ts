@@ -3,10 +3,14 @@ import {
   buildKakaoQueries,
   classifyKakaoCandidates,
   deduplicateKakaoPlaces,
+  groundedRetryQueries,
   hasDetailedAddressEvidence,
   locationMatchedKakaoPlaces,
+  placeNamesCompatible,
   resolveAiSelectedKakaoPlace,
+  resolveRetriedKakaoPlace,
   sanitizePlaceGuesses,
+  withCaptionRegionHints,
 } from "./matching.ts";
 import type { KakaoPlace } from "./kakao.ts";
 
@@ -117,7 +121,7 @@ Deno.test("classifies zero raw Kakao candidates as not found", () => {
   });
 });
 
-Deno.test("auto-matches one raw candidate without name or address validation", () => {
+Deno.test("does not auto-match one candidate that conflicts with the extracted address", () => {
   const only = candidate(
     "only",
     "브레드누아젯",
@@ -129,7 +133,77 @@ Deno.test("auto-matches one raw candidate without name or address validation", (
       guess("브래드 누아젯", "서울 성동구 연무장길 12", "서울"),
       [only],
     ),
-    { type: "AUTO_MATCH", place: only },
+    { type: "NEEDS_AI_REVIEW", candidates: [only] },
+  );
+});
+
+Deno.test("does not treat arbitrary short-name prefixes as the same place", () => {
+  const icarus = candidate("icarus", "이카루스", null, null);
+  assertEquals(placeNamesCompatible("이카", "이카루스"), false);
+  assertEquals(classifyKakaoCandidates(guess("이카", null, null), [icarus]), {
+    type: "NEEDS_AI_REVIEW",
+    candidates: [icarus],
+  });
+  assertEquals(
+    sanitizePlaceGuesses(
+      [guess("이카", null, null)],
+      "오늘은 이카루스 카페를 방문",
+    ),
+    [],
+  );
+});
+
+Deno.test("does not treat added location or facility tokens as fuzzy typos", () => {
+  assertEquals(
+    placeNamesCompatible(
+      "윤숲 후루츠산도점",
+      "윤숲 후루츠산도점 부산",
+    ),
+    false,
+  );
+  for (const suffix of ["회관", "센터", "입구", "시장"]) {
+    assertEquals(
+      classifyKakaoCandidates(
+        guess("기장 대변항 해녀촌", null, null),
+        [candidate("facility", `기장 대변항 해녀촌 ${suffix}`, null, null)],
+      ).type,
+      "NEEDS_AI_REVIEW",
+    );
+  }
+  for (
+    const [source, target] of [
+      ["기장 대변항 해녀촌", "기장 대변항 해녀촌관"],
+      ["미쁘동", "미쁘동관"],
+      ["이카", "이카관"],
+    ]
+  ) {
+    assertEquals(placeNamesCompatible(source, target), false);
+  }
+});
+
+Deno.test("does not auto-select an unspecified chain branch or area facility", () => {
+  const chain = candidate(
+    "chain",
+    "용용선생 부산점",
+    "부산광역시 부산진구 중앙대로 1",
+    null,
+  );
+  const parking = candidate(
+    "parking",
+    "대변항 해녀촌 주차장",
+    "부산광역시 기장군 기장해안로 1",
+    null,
+  );
+  assertEquals(
+    classifyKakaoCandidates(guess("용용선생", null, null), [chain]),
+    {
+      type: "NEEDS_AI_REVIEW",
+      candidates: [chain],
+    },
+  );
+  assertEquals(
+    classifyKakaoCandidates(guess("대변항 해녀촌", null, null), [parking]),
+    { type: "NEEDS_AI_REVIEW", candidates: [parking] },
   );
 });
 
@@ -346,7 +420,7 @@ Deno.test("passes all fifteen Kakao keyword candidates to AI review", () => {
   }
 });
 
-Deno.test("accepts any Gemini-selected candidate from the supplied allowlist", () => {
+Deno.test("accepts a compatible Gemini-selected candidate from the supplied allowlist", () => {
   const selected = candidate(
     "selected",
     "Candy 성수점",
@@ -360,16 +434,603 @@ Deno.test("accepts any Gemini-selected candidate from the supplied allowlist", (
     null,
   );
 
-  assertEquals(resolveAiSelectedKakaoPlace([selected, other], "selected"), {
+  assertEquals(
+    resolveAiSelectedKakaoPlace(
+      guess("Candy", "서울 성동구 연무장길 12", "서울"),
+      [selected, other],
+      "selected",
+    ),
+    {
+      status: "ACCEPTED",
+      place: selected,
+    },
+  );
+});
+
+Deno.test("allows a narrow Hangul-Latin transliteration without bypassing name checks", () => {
+  const source = guess("오우드", null, null);
+  const oud = candidate(
+    "oud",
+    "OUD",
+    "서울특별시 성동구 연무장길 12",
+    null,
+  );
+  assertEquals(resolveAiSelectedKakaoPlace(source, [oud], "oud"), {
     status: "ACCEPTED",
-    place: selected,
+    place: oud,
   });
+
+  const unrelated = candidate(
+    "unrelated",
+    "전혀다른가게",
+    "서울특별시 성동구 연무장길 12",
+    null,
+  );
+  assertEquals(
+    resolveAiSelectedKakaoPlace(
+      guess("오우드", "서울 성동구 연무장길 12", "서울"),
+      [unrelated],
+      "unrelated",
+    ),
+    { status: "REJECTED", reason: "NAME_MISMATCH" },
+  );
 });
 
 Deno.test("rejects a Gemini candidate ID that was not supplied", () => {
   const candidateList = [candidate("known", "오우드", null, null)];
-  assertEquals(resolveAiSelectedKakaoPlace(candidateList, "invented"), {
+  assertEquals(
+    resolveAiSelectedKakaoPlace(
+      guess("오우드", null, null),
+      candidateList,
+      "invented",
+    ),
+    {
+      status: "REJECTED",
+      reason: "AI_SELECTED_UNKNOWN_CANDIDATE",
+    },
+  );
+});
+
+Deno.test("allows only caption-grounded Kakao retry queries", () => {
+  const woozik = guess("우직", null, null);
+  const caption = "#부산신상카페 오늘은 @woozik.busan 우직에 다녀왔어요";
+  assertEquals(
+    groundedRetryQueries(woozik, caption, [
+      "우직 부산",
+      "우직 서울",
+      "다른가게 부산",
+      " 우직   부산 ",
+    ]),
+    ["우직 부산"],
+  );
+  assertEquals(
+    groundedRetryQueries(woozik, "@woozik.busan 우직에 다녀왔어요", [
+      "우직 부산",
+      "부산 우직",
+    ]),
+    ["우직 부산"],
+  );
+  assertEquals(
+    groundedRetryQueries(
+      guess("@woozik.busan", null, null),
+      "오늘의 카페 @woozik.busan",
+      ["우직 부산"],
+    ),
+    ["우직 부산"],
+  );
+
+  const yunsoop = guess(
+    "윤숲 후루츠산도점",
+    "서울 중랑구 면목로7길 8",
+    "서울",
+  );
+  assertEquals(
+    groundedRetryQueries(yunsoop, "윤숲 후루츠산도점 서울 중랑구 면목로7길 8", [
+      "윤숲 후르츠산도점",
+      "윤숲",
+    ]),
+    ["윤숲 후르츠산도점"],
+  );
+  assertEquals(placeNamesCompatible("후루츠산도점", "후르츠산도점"), true);
+});
+
+Deno.test("does not absorb a fabricated region into a long corrected name", () => {
+  assertEquals(
+    groundedRetryQueries(
+      guess("윤숲 후루츠산도점", null, null),
+      "윤숲 후루츠산도점 맛있어요",
+      ["윤숲 후루츠산도점 부산"],
+    ),
+    [],
+  );
+});
+
+Deno.test("does not borrow another place segment region for a retry", () => {
+  for (
+    const caption of [
+      "우직 소개 / 다른 장소는 서울",
+      "우직 소개. 다른 장소는 서울",
+      "우직 소개, 다음은 서울 오우드",
+      "📍우직 @woozik.busan 📍다른장소 서울",
+    ]
+  ) {
+    assertEquals(
+      groundedRetryQueries(guess("우직", null, null), caption, ["우직 서울"]),
+      [],
+    );
+  }
+  assertEquals(
+    groundedRetryQueries(
+      guess("기장 대변항 해녀촌", null, null),
+      "기장 대변항 해녀촌에 다녀왔어요",
+      ["기장"],
+    ),
+    [],
+  );
+});
+
+Deno.test("does not interpret store names or prose endings as caption regions", () => {
+  assertEquals(
+    withCaptionRegionHints(guess("미쁘동", null, null), "#미쁘동 #부산맛집")
+      .region,
+    "부산",
+  );
+  assertEquals(
+    withCaptionRegionHints(
+      guess("우직", null, null),
+      "우직에서 맛있는 요리로 하루 마무리",
+    ).region,
+    null,
+  );
+  for (
+    const caption of [
+      "우직 대구탕 맛집",
+      "우직 서울우유 디저트",
+      "우직 부산물 활용 메뉴",
+      "우직 과일 광주리 선물",
+      "우직 경기장 근처",
+      "우직\n서울 오우드",
+    ]
+  ) {
+    assertEquals(
+      withCaptionRegionHints(guess("우직", null, null), caption, ["우직"])
+        .region,
+      null,
+    );
+  }
+  assertEquals(
+    groundedRetryQueries(
+      guess("미쁘동", null, null),
+      "#미쁘동 #부산맛집",
+      ["미쁘동 부산"],
+    ),
+    ["미쁘동 부산"],
+  );
+  assertEquals(
+    groundedRetryQueries(
+      guess("우직", null, null),
+      "우직 부산 전포동",
+      ["우직 부산 전포동"],
+    ),
+    ["우직 부산 전포동"],
+  );
+});
+
+Deno.test("uses a place-local broad region for initial and SELECT validation", () => {
+  const source = withCaptionRegionHints(
+    guess("미쁘동", null, null),
+    "#부산맛집 #미쁘동",
+    ["미쁘동"],
+  );
+  const seoul = candidate(
+    "seoul",
+    "미쁘동",
+    "서울특별시 마포구 월드컵로 1",
+    null,
+  );
+  assertEquals(source.region, "부산");
+  assertEquals(
+    classifyKakaoCandidates(source, [seoul]).type,
+    "NEEDS_AI_REVIEW",
+  );
+  assertEquals(resolveAiSelectedKakaoPlace(source, [seoul], "seoul"), {
     status: "REJECTED",
-    reason: "AI_SELECTED_UNKNOWN_CANDIDATE",
+    reason: "ADDRESS_CONFLICT",
+  });
+});
+
+Deno.test("keeps extracted location evidence with its nearest place", () => {
+  const sanitized = sanitizePlaceGuesses([
+    guess("우직", "서울 성동구 연무장길 12", "서울"),
+    guess("오우드", "서울 성동구 연무장길 12", "서울"),
+  ], "우직 소개, 다음은 서울 성동구 연무장길 12 오우드");
+  assertEquals(sanitized[0].address, null);
+  assertEquals(sanitized[0].region, null);
+  assertEquals(sanitized[1].address, "서울 성동구 연무장길 12");
+  assertEquals(sanitized[1].region, "서울");
+
+  const storeNameAsAddress = sanitizePlaceGuesses([
+    guess("미쁘동", "미쁘동", "미쁘동"),
+  ], "미쁘동 다녀왔어요");
+  assertEquals(storeNameAsAddress[0].address, null);
+  assertEquals(storeNameAsAddress[0].region, null);
+});
+
+Deno.test("rejects invented chain branches in SELECT and RETRY", () => {
+  const source = guess("용용선생", null, null);
+  const busan = candidate(
+    "busan",
+    "용용선생 부산점",
+    "부산광역시 부산진구 중앙대로 1",
+    null,
+  );
+  assertEquals(resolveAiSelectedKakaoPlace(source, [busan], "busan"), {
+    status: "REJECTED",
+    reason: "INSUFFICIENT_CONTEXT",
+  });
+  assertEquals(
+    groundedRetryQueries(source, "용용선생 맛있어요", [
+      "용용선생 부산점",
+      "용용선생 강남점",
+      "용용선생 본점",
+    ]),
+    [],
+  );
+  assertEquals(
+    groundedRetryQueries(source, "용용선생 부산 점심 맛집", [
+      "용용선생 부산점",
+    ]),
+    [],
+  );
+  assertEquals(
+    groundedRetryQueries(
+      source,
+      "용용선생 콜라보 다른브랜드 부산점은 신메뉴",
+      ["용용선생 부산점"],
+    ),
+    [],
+  );
+  assertEquals(
+    groundedRetryQueries(source, "용용선생 부산", ["용용선생 부산"]),
+    ["용용선생 부산"],
+  );
+  assertEquals(
+    resolveRetriedKakaoPlace(source, ["용용선생 부산"], [busan]),
+    { status: "ACCEPTED", place: busan },
+  );
+
+  const seomyeon = candidate(
+    "seomyeon",
+    "용용선생 서면점",
+    "부산광역시 부산진구 중앙대로 2",
+    null,
+  );
+  const busanSource = guess("용용선생", null, "부산");
+  assertEquals(
+    classifyKakaoCandidates(busanSource, [seomyeon]).type,
+    "NEEDS_AI_REVIEW",
+  );
+  assertEquals(
+    resolveAiSelectedKakaoPlace(busanSource, [seomyeon], "seomyeon"),
+    {
+      status: "REJECTED",
+      reason: "INSUFFICIENT_CONTEXT",
+    },
+  );
+  assertEquals(
+    resolveAiSelectedKakaoPlace(
+      source,
+      [seomyeon],
+      "seomyeon",
+      "용용선생 서면점",
+    ),
+    { status: "ACCEPTED", place: seomyeon },
+  );
+});
+
+Deno.test("requires an exact matching handle name and city segment", () => {
+  assertEquals(placeNamesCompatible("우진", "UZIN"), false);
+  assertEquals(
+    groundedRetryQueries(
+      guess("@woozik.busan", null, null),
+      "@woozik.busan",
+      ["우진 부산"],
+    ),
+    [],
+  );
+  assertEquals(
+    groundedRetryQueries(
+      guess("우직", null, null),
+      "우직 @woozik.busanlover",
+      ["우직 부산"],
+    ),
+    [],
+  );
+});
+
+Deno.test("uses a same-segment Instagram handle region for SELECT validation", () => {
+  const source = withCaptionRegionHints(
+    guess("우직", null, null),
+    "우직 @woozik.busan / 다른 장소는 서울",
+  );
+  const seoul = candidate(
+    "seoul",
+    "우직",
+    "서울특별시 성동구 연무장길 12",
+    null,
+  );
+  assertEquals(source.region, "부산");
+  assertEquals(resolveAiSelectedKakaoPlace(source, [seoul], "seoul"), {
+    status: "REJECTED",
+    reason: "ADDRESS_CONFLICT",
+  });
+});
+
+Deno.test("supports handle-only SELECT and a handle on the following line", () => {
+  const source = withCaptionRegionHints(
+    guess("@woozik.busan", null, null),
+    "📍@woozik.busan",
+    ["@woozik.busan"],
+  );
+  const woozik = candidate(
+    "1595758078",
+    "우직",
+    "부산광역시 부산진구 전포대로256번길 34-3",
+    null,
+  );
+  assertEquals(source.region, "부산");
+  assertEquals(resolveAiSelectedKakaoPlace(source, [woozik], "1595758078"), {
+    status: "ACCEPTED",
+    place: woozik,
+  });
+  assertEquals(
+    withCaptionRegionHints(
+      guess("우직", null, null),
+      "우직\n@woozik.busan",
+      ["우직"],
+    ).region,
+    "부산",
+  );
+});
+
+Deno.test("treats common short city names as their official metro names", () => {
+  const seoul = candidate(
+    "seoul",
+    "오우드",
+    "서울특별시 성동구 연무장길 12",
+    null,
+  );
+  assertEquals(
+    classifyKakaoCandidates(guess("오우드", null, "서울시"), [seoul]).type,
+    "AUTO_MATCH",
+  );
+});
+
+Deno.test("resolves the 윤숲 typo retry only at the caption address", () => {
+  const source = guess(
+    "윤숲 후루츠산도점",
+    "서울 중랑구 면목로7길 8",
+    "서울",
+  );
+  const right = candidate(
+    "1775568752",
+    "윤숲 후르츠산도점",
+    "서울특별시 중랑구 면목로7길 8",
+    null,
+  );
+  const wrong = candidate(
+    "wrong",
+    "윤숲 후르츠산도점",
+    "서울특별시 마포구 월드컵로 8",
+    null,
+  );
+  assertEquals(
+    resolveRetriedKakaoPlace(source, ["윤숲 후르츠산도점", "윤숲"], [
+      wrong,
+      right,
+    ]),
+    { status: "ACCEPTED", place: right },
+  );
+});
+
+Deno.test("resolves 우직 only in the grounded 부산 region", () => {
+  const source = guess("우직", null, null);
+  const busan = candidate(
+    "1595758078",
+    "우직",
+    "부산광역시 부산진구 전포대로256번길 34-3",
+    null,
+  );
+  const seoul = candidate(
+    "seoul",
+    "우직",
+    "서울특별시 성동구 연무장길 12",
+    null,
+  );
+  assertEquals(
+    resolveRetriedKakaoPlace(source, ["우직 부산"], [seoul, busan]),
+    { status: "ACCEPTED", place: busan },
+  );
+  assertEquals(
+    resolveRetriedKakaoPlace(source, ["우직"], [seoul, busan]),
+    { status: "REJECTED", reason: "AMBIGUOUS_SAME_NAME" },
+  );
+  assertEquals(
+    resolveRetriedKakaoPlace(source, ["우직 부산"], [
+      candidate(
+        "region-name",
+        "부산",
+        "부산광역시 부산진구 중앙대로 1",
+        null,
+      ),
+    ]),
+    { status: "REJECTED", reason: "NAME_MISMATCH" },
+  );
+});
+
+Deno.test("does not borrow an omitted neighboring place location", () => {
+  for (
+    const caption of [
+      "우직 소개 그리고 서울 성동구 연무장길 12 오우드",
+      "우직. 서울 오우드",
+      "우직 · 서울 오우드",
+      "우직 🔹 서울 오우드",
+      "우직 🍽 서울 오우드",
+    ]
+  ) {
+    const sanitized = sanitizePlaceGuesses([
+      guess("우직", "서울 성동구 연무장길 12", "서울"),
+    ], caption);
+    assertEquals(sanitized, [guess("우직", null, null)]);
+    assertEquals(
+      withCaptionRegionHints(guess("우직", null, null), caption, ["우직"])
+        .region,
+      null,
+    );
+  }
+});
+
+Deno.test("assigns a next-line city to the place on that line", () => {
+  const sanitized = sanitizePlaceGuesses([
+    guess("우직", null, "서울"),
+    guess("미쁘동", null, "서울"),
+  ], "우직\n서울 미쁘동");
+  assertEquals(sanitized, [
+    guess("우직", null, null),
+    guess("미쁘동", null, "서울"),
+  ]);
+});
+
+Deno.test("accepts explicit address labels on the following line", () => {
+  for (
+    const caption of [
+      "오우드\n주소는 서울 성동구 연무장길 12",
+      "오우드\n📍 주소는 서울 성동구 연무장길 12",
+      "오우드\n📌 위치는 서울 성동구 연무장길 12",
+    ]
+  ) {
+    assertEquals(
+      sanitizePlaceGuesses([
+        guess("오우드", "서울 성동구 연무장길 12", "서울"),
+      ], caption),
+      [guess("오우드", "서울 성동구 연무장길 12", "서울")],
+    );
+  }
+});
+
+Deno.test("does not treat product or origin words as a store region", () => {
+  for (
+    const caption of [
+      "우직 대구탕 맛집",
+      "우직 서울우유 디저트",
+      "우직 부산물 활용 메뉴",
+      "우직 과일 광주리 선물",
+      "우직 경기장 근처",
+      "우직은 부산에서 공수한 재료로 운영해요",
+      "우직 셰프는 부산에서 태어났어요",
+    ]
+  ) {
+    assertEquals(
+      withCaptionRegionHints(guess("우직", null, null), caption, ["우직"])
+        .region,
+      null,
+    );
+  }
+});
+
+Deno.test("requires a place name boundary after Korean particles", () => {
+  for (
+    const caption of [
+      "오늘은 이카로스 카페",
+      "오늘은 이카로제 파스타",
+      "우직의자 전문점",
+    ]
+  ) {
+    const placeName = caption.includes("우직") ? "우직" : "이카";
+    assertEquals(
+      sanitizePlaceGuesses([guess(placeName, null, null)], caption),
+      [],
+    );
+  }
+});
+
+Deno.test("allows spacing and a one-character typo together", () => {
+  assertEquals(placeNamesCompatible("브래드 누아젯", "브레드누아젯"), true);
+  assertEquals(
+    placeNamesCompatible("윤숲 후루츠 산도점", "윤숲 후르츠산도점"),
+    true,
+  );
+});
+
+Deno.test("requires location evidence before accepting a one-character name typo", () => {
+  for (
+    const [sourceName, candidateName] of [
+      ["용용학생", "용용선생"],
+      ["미쁘동", "미쁜동"],
+      ["오우드", "오유드"],
+    ]
+  ) {
+    const only = candidate("only", candidateName, null, null);
+    const source = guess(sourceName, null, null);
+    assertEquals(
+      classifyKakaoCandidates(source, [only]).type,
+      "NEEDS_AI_REVIEW",
+    );
+    assertEquals(resolveAiSelectedKakaoPlace(source, [only], "only"), {
+      status: "REJECTED",
+      reason: "NAME_MISMATCH",
+    });
+  }
+
+  const corrected = candidate(
+    "yunsoop",
+    "윤숲 후르츠산도점",
+    "서울특별시 중랑구 면목로7길 8",
+    null,
+  );
+  assertEquals(
+    classifyKakaoCandidates(
+      guess("윤숲 후루츠산도점", "서울 중랑구 면목로7길 8", "서울"),
+      [corrected],
+    ).type,
+    "AUTO_MATCH",
+  );
+});
+
+Deno.test("applies the chain branch guard after location filtering", () => {
+  const source = guess("용용선생", null, "부산");
+  const seomyeon = candidate(
+    "seomyeon",
+    "용용선생 서면점",
+    "부산광역시 부산진구 중앙대로 2",
+    null,
+  );
+  const gangnam = candidate(
+    "gangnam",
+    "용용선생 강남점",
+    "서울특별시 강남구 강남대로 2",
+    null,
+  );
+  assertEquals(
+    classifyKakaoCandidates(source, [seomyeon, gangnam]).type,
+    "NEEDS_AI_REVIEW",
+  );
+});
+
+Deno.test("does not replace an explicit branch with a generic wrong-city POI", () => {
+  const genericSeoul = candidate(
+    "generic",
+    "용용선생",
+    "서울특별시 강남구 강남대로 2",
+    null,
+  );
+  const source = guess("용용선생 부산점", null, null);
+  assertEquals(
+    classifyKakaoCandidates(source, [genericSeoul]).type,
+    "NEEDS_AI_REVIEW",
+  );
+  assertEquals(resolveAiSelectedKakaoPlace(source, [genericSeoul], "generic"), {
+    status: "REJECTED",
+    reason: "NAME_MISMATCH",
   });
 });

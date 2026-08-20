@@ -73,7 +73,7 @@ Deno.test("rejects missing or malformed Gemini place responses", () => {
   assertEquals(parseGeminiPlaceGuesses(response({ places: null })), []);
 });
 
-Deno.test("parses only valid unique SELECT or NONE candidate judgments", () => {
+Deno.test("parses only valid unique SELECT RETRY or NONE candidate judgments", () => {
   assertEquals(
     parseGeminiCandidateJudgments(response({
       decisions: [{
@@ -96,6 +96,30 @@ Deno.test("parses only valid unique SELECT or NONE candidate judgments", () => {
         decision: "SELECT",
         candidateId: null,
         reason: "MATCH",
+      }, {
+        guessIndex: 6,
+        decision: "RETRY",
+        candidateId: null,
+        retryQueries: [" 우직 부산 ", "우직   부산", "우직"],
+        reason: "CANDIDATE_MISSING",
+      }, {
+        guessIndex: 7,
+        decision: "RETRY",
+        candidateId: "must-be-null",
+        retryQueries: ["윤숲"],
+        reason: "CANDIDATE_MISSING",
+      }, {
+        guessIndex: 8,
+        decision: "RETRY",
+        candidateId: null,
+        retryQueries: [],
+        reason: "CANDIDATE_MISSING",
+      }, {
+        guessIndex: 9,
+        decision: "NONE",
+        candidateId: null,
+        retryQueries: ["should-not-exist"],
+        reason: "INSUFFICIENT_CONTEXT",
       }, {
         guessIndex: 11,
         decision: "NONE",
@@ -122,16 +146,25 @@ Deno.test("parses only valid unique SELECT or NONE candidate judgments", () => {
       guessIndex: 0,
       decision: "SELECT",
       candidateId: "1102574979",
+      retryQueries: [],
       reason: "MATCH",
     }, {
       guessIndex: 1,
       decision: "NONE",
       candidateId: null,
+      retryQueries: [],
       reason: "AMBIGUOUS_SAME_NAME",
+    }, {
+      guessIndex: 6,
+      decision: "RETRY",
+      candidateId: null,
+      retryQueries: ["우직 부산", "우직"],
+      reason: "CANDIDATE_MISSING",
     }, {
       guessIndex: 11,
       decision: "NONE",
       candidateId: null,
+      retryQueries: [],
       reason: "INSUFFICIENT_CONTEXT",
     }],
   );
@@ -142,6 +175,7 @@ Deno.test("parses more than ten candidate judgments", () => {
     guessIndex,
     decision: "NONE",
     candidateId: null,
+    retryQueries: [],
     reason: "INSUFFICIENT_CONTEXT",
   }));
 

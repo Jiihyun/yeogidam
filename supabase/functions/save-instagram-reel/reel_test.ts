@@ -1,4 +1,9 @@
-import { parseInstagramReelURL, shouldRetryReel } from "./reel.ts";
+import {
+  completedProcessingVersion,
+  parseInstagramReelURL,
+  PARTIAL_PROCESSING_VERSION,
+  shouldRetryReel,
+} from "./reel.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -103,4 +108,13 @@ Deno.test("retries outdated, failed, or stale processing rows", () => {
     ),
     false,
   );
+});
+
+Deno.test("keeps only complete results at the current cache version", () => {
+  assertEquals(completedProcessingVersion(9, 0), 9);
+  assertEquals(completedProcessingVersion(9, 1), PARTIAL_PROCESSING_VERSION);
+  assertEquals(completedProcessingVersion(10, 1), PARTIAL_PROCESSING_VERSION);
+  assertEquals(PARTIAL_PROCESSING_VERSION > 0, true);
+  const activeVersions: number[] = [9, 10];
+  assertEquals(activeVersions.includes(PARTIAL_PROCESSING_VERSION), false);
 });

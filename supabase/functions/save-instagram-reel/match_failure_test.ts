@@ -59,3 +59,17 @@ Deno.test("builds a queryable per-place failure row with deduped candidate IDs",
     },
   );
 });
+
+Deno.test("records Kakao retry failures as expanded name searches", () => {
+  const row = placeMatchFailureRow("reel-2", {
+    guessIndex: 3,
+    guess,
+    stage: "KAKAO_SEARCH",
+    reason: "NO_KAKAO_CANDIDATE_AFTER_EXPANSION",
+    candidates: [],
+    searchOrigin: "EXPANDED_NAME_ONLY",
+  });
+
+  assertEquals(row.failure_reason, "NO_KAKAO_CANDIDATE_AFTER_EXPANSION");
+  assertEquals(row.search_origin, "EXPANDED_NAME_ONLY");
+});

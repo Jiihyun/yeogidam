@@ -59,3 +59,13 @@ export function shouldRetryReel(
   const updatedAt = Date.parse(state.updatedAt);
   return Number.isFinite(updatedAt) && now - updatedAt >= staleProcessingMs;
 }
+
+/** 부분 성공은 현재 버전의 완전한 캐시로 취급하지 않는다. */
+export const PARTIAL_PROCESSING_VERSION = 2_147_483_647;
+
+export function completedProcessingVersion(
+  pipelineVersion: number,
+  failureCount: number,
+): number {
+  return failureCount === 0 ? pipelineVersion : PARTIAL_PROCESSING_VERSION;
+}
