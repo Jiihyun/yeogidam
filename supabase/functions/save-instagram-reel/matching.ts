@@ -227,6 +227,41 @@ function namesHaveSingleCharacterTypo(left: string, right: string): boolean {
     editDistance(a, b) === 1;
 }
 
+function administrativeLocationStem(value: string): string {
+  return compact(value).replace(
+    /(?:특별자치도|특별자치시|특별시|광역시|시|군|구|동|읍|면|리)$/u,
+    "",
+  );
+}
+
+/**
+ * Kakao가 `상호 군자`처럼 행정동을 이름 뒤에 붙이는 경우를 다룬다.
+ * 상세주소가 실제로 일치할 때만 호출하며, 접미사도 후보 주소의 행정구역과
+ * 일치해야 하므로 임의의 체인 지점명이나 다른 업종을 이름 유사도로 통과시키지 않는다.
+ */
+function nameMatchesCandidateWithLocationSuffix(
+  sourceName: string,
+  candidate: KakaoPlace,
+): boolean {
+  const tokens = candidate.name.normalize("NFKC").trim().split(/\s+/u)
+    .filter(Boolean);
+  if (tokens.length < 2) return false;
+
+  const baseName = tokens.slice(0, -1).join(" ");
+  if (
+    !namesCompatibleWithoutTypo(sourceName, baseName) &&
+    !namesHaveSingleCharacterTypo(sourceName, baseName)
+  ) return false;
+
+  const suffix = administrativeLocationStem(
+    compact(tokens.at(-1) ?? "").replace(/점$/u, ""),
+  );
+  if (Array.from(suffix).length < 2) return false;
+  return hardRegionTokens(candidateLocation(candidate)).some((token) =>
+    administrativeLocationStem(token) === suffix
+  );
+}
+
 /** 띄어쓰기·구두점·한 글자 오타와 지점 접미사 정도만 같은 이름으로 본다. */
 export function placeNamesCompatible(left: string, right: string): boolean {
   return namesCompatibleWithoutTypo(left, right) ||
@@ -304,13 +339,24 @@ function lineLooksLocationOnly(line: string): boolean {
       /(?:주소|위치|도로명|지번|지역)(?:은|는|이|가)?\s*[:：]?/g,
       " ",
     )
-    .split(/[^가-힣0-9.-]+/).filter(Boolean);
+    .split(/[^가-힣A-Za-z0-9.-]+/).filter(Boolean);
   return tokens.length > 0 &&
     tokens.every((token) =>
       hardRegionTokens(token).length > 0 ||
       /^[가-힣][가-힣0-9.·-]*(?:대로|로|길|번길)$/.test(token) ||
-      /^(?:산)?\d+(?:-\d+)?(?:번지|층|호)?$/.test(token)
+      /^(?:산)?\d+(?:-\d+)?(?:번지|층|호)?$/.test(token) ||
+      /^[A-Za-z]\d*(?:동|관)$/.test(token)
     );
+}
+
+function withoutTrailingPlaceName(line: string, placeName: string): string {
+  const trimmed = line.trimEnd();
+  if (!trimmed.endsWith(placeName)) return line;
+  const start = trimmed.length - placeName.length;
+  const before = start === 0 ? "" : trimmed[start - 1];
+  return before && /[\p{L}\p{N}]/u.test(before)
+    ? line
+    : trimmed.slice(0, start);
 }
 
 const LOCATION_BRIDGE_WORDS = new Set([
@@ -448,9 +494,9 @@ function fieldGroundedToPlace(
         fieldIndex,
         normalizedField.length,
       ),
-    })).sort((left, right) => left.distance - right.distance)[0];
+    })).filter(({ distance }) => distance > 0)
+      .sort((left, right) => left.distance - right.distance)[0];
     if (!nearestPlace || nearestPlace.distance > 240) continue;
-    if (nearestPlace.distance === 0) continue;
 
     const nearestPlaceEnd = nearestPlace.placeIndex + normalizedPlace.length;
     const fieldEnd = fieldIndex + normalizedField.length;
@@ -486,7 +532,10 @@ function fieldGroundedToPlace(
       const lineStart = normalizedCaption.lastIndexOf("\n", fieldIndex) + 1;
       const nextBreak = normalizedCaption.indexOf("\n", fieldEnd);
       const lineEnd = nextBreak < 0 ? normalizedCaption.length : nextBreak;
-      const fieldLine = normalizedCaption.slice(lineStart, lineEnd);
+      const fieldLine = withoutTrailingPlaceName(
+        normalizedCaption.slice(lineStart, lineEnd),
+        normalizedPlace,
+      );
       const hasExplicitLabel =
         /(?:주소|위치|도로명|지번|지역)(?:은|는|이|가)?\s*[:：]?/.test(
           fieldLine,
@@ -500,7 +549,14 @@ function fieldGroundedToPlace(
         continue;
       }
     }
-    if (!locationBridgeOnly(bridge)) continue;
+    // A list marker at the start of the next line belongs to that line, not to
+    // a separate place item. The next-line branch above has already required
+    // the whole line to be a detailed address (or explicitly labelled), so it
+    // is safe to ignore only these presentation markers here.
+    const locationBridge = bridge.includes("\n") && fieldIndex >= placeEnd
+      ? bridge.replace(/[•▶▷▪◾📍📌]/gu, " ")
+      : bridge;
+    if (!locationBridgeOnly(locationBridge)) continue;
     if (
       fieldIndex >= placeEnd &&
       hasNonLocationContinuation(normalizedCaption, fieldEnd)
@@ -841,6 +897,14 @@ export function validateKakaoCandidate(
       ? candidate.roadAddress
       : candidate.address ?? candidate.roadAddress
     : null;
+  const detailedAddressMatches = Boolean(
+    guess.address && candidateAddress && hasDetailedAddressEvidence(guess) &&
+      addressMatches(
+        guess.address,
+        candidateAddress,
+        placeRegionTokens(guess).join(" ") || null,
+      ),
+  );
   if (candidateOmitsSpecifiedBranch(guess, candidate)) {
     return { status: "REJECTED", reason: "NAME_MISMATCH" };
   }
@@ -849,7 +913,9 @@ export function validateKakaoCandidate(
       namesCompatibleWithoutTypo(name, candidate.name) ||
       (hardLocationEvidence &&
         namesHaveSingleCharacterTypo(name, candidate.name)) ||
-      handleNameCompatible(name, candidate.name)
+      handleNameCompatible(name, candidate.name) ||
+      (detailedAddressMatches &&
+        nameMatchesCandidateWithLocationSuffix(name, candidate))
     )
   ) {
     return { status: "REJECTED", reason: "NAME_MISMATCH" };
@@ -1023,6 +1089,22 @@ function retryLocationGrounded(
   );
 }
 
+function retryLocationGroundedInDetailedAddress(
+  guess: PlaceGuess,
+  locationToken: string,
+): boolean {
+  if (!hasDetailedAddressEvidence(guess)) return false;
+  const expected = compact(locationToken);
+  if (Array.from(expected).length < 2) return false;
+
+  const road = roadToken(guess.address ?? "");
+  const roadStem = road?.replace(/(?:대로|번길|로|길)$/u, "") ?? null;
+  if (roadStem === expected) return true;
+  return hardRegionTokens(guess.address).some((token) =>
+    administrativeLocationStem(token) === expected
+  );
+}
+
 /**
  * Gemini 재검색어는 원 상호와 관련되고, 추가 토큰이 캡션에 있거나 한 글자
  * 수준의 표기 보정일 때만 허용한다. 캡션에 없는 도시·지점 발명은 버린다.
@@ -1073,11 +1155,13 @@ export function groundedRetryQueries(
       compactPlaceName,
     );
     if (
-      parsed.locationTokens.some((token) =>
-        hardRegionTokens(token).length === 0 ||
-        (!fullQueryGrounded &&
-          !retryLocationGrounded(guess, retryName, token, localContext))
-      )
+      parsed.locationTokens.some((token) => {
+        if (hardRegionTokens(token).length === 0) {
+          return !retryLocationGroundedInDetailedAddress(guess, token);
+        }
+        return !fullQueryGrounded &&
+          !retryLocationGrounded(guess, retryName, token, localContext);
+      })
     ) continue;
     const canonicalQuery = [retryName, ...parsed.locationTokens].join(" ");
     const key = compactPlaceName(canonicalQuery);

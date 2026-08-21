@@ -531,6 +531,14 @@ Deno.test("allows only caption-grounded Kakao retry queries", () => {
     ]),
     ["윤숲 후르츠산도점"],
   );
+  assertEquals(
+    groundedRetryQueries(
+      guess("로컬타코야키", "서울 광진구 군자로 166 1층", "서울"),
+      "📍 로컬타코야키\n• 서울 광진구 군자로 166 1층",
+      ["로컬타코야끼 군자", "로컬타코야끼 성수"],
+    ),
+    ["로컬타코야끼 군자"],
+  );
   assertEquals(placeNamesCompatible("후루츠산도점", "후르츠산도점"), true);
 });
 
@@ -918,6 +926,53 @@ Deno.test("accepts explicit address labels on the following line", () => {
   }
 });
 
+Deno.test("keeps bullet-list addresses paired with their preceding places", () => {
+  const caption = [
+    "📍 로컬타코야키",
+    "• 서울 광진구 군자로 166 1층",
+    "📍 윤숲 후루츠산도점",
+    "• 서울 광진구 면목로7길 8 1층",
+    "📍 보난자커피",
+    "• 서울 광진구 능동로 239-1 B동 1층 보난자커피",
+  ].join("\n");
+
+  assertEquals(
+    sanitizePlaceGuesses([
+      guess("로컬타코야키", "서울 광진구 군자로 166 1층", "서울"),
+      guess("윤숲 후루츠산도점", "서울 광진구 면목로7길 8 1층", "서울"),
+      guess(
+        "보난자커피",
+        "서울 광진구 능동로 239-1 B동 1층 보난자커피",
+        "서울",
+      ),
+    ], caption),
+    [
+      guess("로컬타코야키", "서울 광진구 군자로 166 1층", "서울"),
+      guess("윤숲 후루츠산도점", "서울 광진구 면목로7길 8 1층", "서울"),
+      guess(
+        "보난자커피",
+        "서울 광진구 능동로 239-1 B동 1층 보난자커피",
+        "서울",
+      ),
+    ],
+  );
+});
+
+Deno.test("does not borrow a preceding bullet-list address when Gemini omitted that place", () => {
+  const caption = [
+    "📍 로컬타코야키",
+    "• 서울 광진구 군자로 166 1층",
+    "📍 윤숲 후루츠산도점",
+  ].join("\n");
+
+  assertEquals(
+    sanitizePlaceGuesses([
+      guess("윤숲 후루츠산도점", "서울 광진구 군자로 166 1층", "서울"),
+    ], caption),
+    [guess("윤숲 후루츠산도점", null, null)],
+  );
+});
+
 Deno.test("does not treat product or origin words as a store region", () => {
   for (
     const caption of [
@@ -994,6 +1049,42 @@ Deno.test("requires location evidence before accepting a one-character name typo
       [corrected],
     ).type,
     "AUTO_MATCH",
+  );
+});
+
+Deno.test("accepts a Kakao administrative-area suffix only at the exact caption address", () => {
+  const source = guess(
+    "로컬타코야키",
+    "서울 광진구 군자로 166 1층",
+    "서울",
+  );
+  const local = candidate(
+    "local",
+    "로컬타코야끼 군자",
+    "서울특별시 광진구 군자로 166",
+    "서울특별시 광진구 군자동 45-41",
+  );
+  assertEquals(classifyKakaoCandidates(source, [local]), {
+    type: "AUTO_MATCH",
+    place: local,
+  });
+  const localWithAdministrativeSuffix = {
+    ...local,
+    name: "로컬타코야끼 군자동",
+  };
+  assertEquals(
+    classifyKakaoCandidates(source, [localWithAdministrativeSuffix]).type,
+    "AUTO_MATCH",
+  );
+
+  const ungroundedSuffix = { ...local, name: "로컬타코야끼 성수" };
+  assertEquals(
+    classifyKakaoCandidates(source, [ungroundedSuffix]).type,
+    "NEEDS_AI_REVIEW",
+  );
+  assertEquals(
+    resolveAiSelectedKakaoPlace(source, [ungroundedSuffix], "local"),
+    { status: "REJECTED", reason: "NAME_MISMATCH" },
   );
 });
 

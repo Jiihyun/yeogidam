@@ -4,6 +4,7 @@ import type {
   PlaceGuess,
 } from "./gemini.ts";
 import type { KakaoPlace } from "./kakao.ts";
+import { sanitizePlaceGuesses } from "./matching.ts";
 import { resolvePlacesFromKakao } from "./place_resolution.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
@@ -165,6 +166,77 @@ Deno.test("batches SELECT RETRY and NONE once while preserving original place or
     "1775568752",
   ]);
   assertEquals(result.failures.map((failure) => failure.guessIndex), [4]);
+});
+
+Deno.test("resolves the 군자 bullet-list regression without weakening the final guard", async () => {
+  const caption = [
+    "📍 로컬타코야키",
+    "• 서울 광진구 군자로 166 1층",
+    "📍 윤숲 후루츠산도점",
+    "• 서울 광진구 면목로7길 8 1층",
+  ].join("\n");
+  const guesses = sanitizePlaceGuesses([
+    guess("로컬타코야키", "서울 광진구 군자로 166 1층", "서울"),
+    guess("윤숲 후루츠산도점", "서울 광진구 면목로7길 8 1층", "서울"),
+  ], caption);
+  const local: KakaoPlace = {
+    ...candidate(
+      "1372748435",
+      "로컬타코야끼 군자",
+      "서울특별시 광진구 군자로 166",
+    ),
+    address: "서울특별시 광진구 군자동 45-41",
+  };
+  const yunsoop = candidate(
+    "1775568752",
+    "윤숲 후르츠산도점",
+    "서울특별시 광진구 면목로7길 8",
+  );
+  const responses = new Map<string, KakaoPlace[]>([
+    ["로컬타코야키", []],
+    ["로컬타코야끼 군자", [local]],
+    ["윤숲 후루츠산도점", []],
+    ["윤숲 후르츠산도점", [yunsoop]],
+  ]);
+  const searchCalls: string[] = [];
+  let judgeCalls = 0;
+
+  const result = await resolvePlacesFromKakao(caption, guesses, {
+    search(query) {
+      searchCalls.push(query);
+      return Promise.resolve(responses.get(query) ?? []);
+    },
+    judge(_caption, items) {
+      judgeCalls += 1;
+      assertEquals(items.map((item) => item.guessIndex), [0, 1]);
+      return Promise.resolve([{
+        guessIndex: 0,
+        decision: "RETRY",
+        candidateId: null,
+        retryQueries: ["로컬타코야끼 군자"],
+        reason: "CANDIDATE_MISSING",
+      }, {
+        guessIndex: 1,
+        decision: "RETRY",
+        candidateId: null,
+        retryQueries: ["윤숲 후르츠산도점"],
+        reason: "CANDIDATE_MISSING",
+      }]);
+    },
+  });
+
+  assertEquals(judgeCalls, 1);
+  assertEquals(searchCalls, [
+    "로컬타코야키",
+    "윤숲 후루츠산도점",
+    "로컬타코야끼 군자",
+    "윤숲 후르츠산도점",
+  ]);
+  assertEquals(result.matches.map((match) => match.place.kakaoPlaceId), [
+    "1372748435",
+    "1775568752",
+  ]);
+  assertEquals(result.failures, []);
 });
 
 Deno.test("does not call the second Gemini when every initial candidate is safe", async () => {
