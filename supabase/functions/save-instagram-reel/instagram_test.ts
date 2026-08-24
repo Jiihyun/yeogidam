@@ -1,4 +1,8 @@
-import { fetchInstagramMeta, parseInstagramMeta } from "./instagram.ts";
+import {
+  fetchInstagramMeta,
+  parseInstagramAuthorUsername,
+  parseInstagramMeta,
+} from "./instagram.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
   if (actual !== expected) {
@@ -18,6 +22,56 @@ Deno.test("parses Instagram name description metadata", () => {
   assertEquals(
     meta.description,
     'opetion_h - August 9, 2026: "무화과 디저트와 ‘보연희’를 소개해요. 📍보연희 서울 서대문구 연희맛로 17-63 2층".',
+  );
+  assertEquals(meta.authorUsername, "opetion_h");
+});
+
+Deno.test("prefers the username in twitter title metadata", () => {
+  const meta = parseInstagramMeta(`<head>
+    <meta name="twitter:title" content="쏙 sssOK (@ssssok_app) • Instagram 사진 및 동영상">
+    <meta property="og:description" content="other_author - August 9, 2026: &quot;오늘의 카페&quot;">
+  </head>`);
+
+  assertEquals(meta.authorUsername, "ssssok_app");
+});
+
+Deno.test("falls back to og title when twitter title has no username", () => {
+  const meta = parseInstagramMeta(`<head>
+    <meta name="twitter:title" content="Instagram">
+    <meta property="og:title" content="쏙 sssOK (@ssssok_app) • Instagram 사진 및 동영상">
+  </head>`);
+
+  assertEquals(meta.authorUsername, "ssssok_app");
+});
+
+Deno.test("checks each description source for an author wrapper", () => {
+  const meta = parseInstagramMeta(`<head>
+    <meta property="og:description" content="오늘의 카페">
+    <meta name="description" content="Cafe.Owner - August 10, 2026: &quot;오늘의 카페&quot;">
+  </head>`);
+
+  assertEquals(meta.description, "오늘의 카페");
+  assertEquals(meta.authorUsername, "cafe.owner");
+});
+
+Deno.test("parses author from Instagram engagement metadata", () => {
+  const meta = parseInstagramMeta(`<head>
+    <meta property="og:description" content="1,234 likes, 1 comment - Cafe.Owner on August 10, 2026: &quot;오늘의 카페&quot;">
+  </head>`);
+
+  assertEquals(meta.authorUsername, "cafe.owner");
+});
+
+Deno.test("does not treat caption mentions as the reel author", () => {
+  assertEquals(
+    parseInstagramAuthorUsername(
+      "오늘은 @place_account에 다녀왔어요. August 9, 2026",
+    ),
+    null,
+  );
+  assertEquals(
+    parseInstagramAuthorUsername("place_account - 오늘의 카페를 소개해요"),
+    null,
   );
 });
 
@@ -72,6 +126,7 @@ Deno.test("uses reel HTML head metadata as the only caption source", async () =>
   const meta = await fetchInstagramMeta(url, request);
 
   assertEquals(meta.description, "보연희 서울 서대문구 연희맛로 17-63 2층");
+  assertEquals(meta.authorUsername, null);
   assertEquals(calls.length, 1);
   assertEquals(calls[0], url);
   assertEquals(userAgent, "Twitterbot/1.0");
@@ -91,6 +146,7 @@ Deno.test("returns empty metadata without a head caption or fallback request", a
   const meta = await fetchInstagramMeta(url, request);
 
   assertEquals(meta.description, null);
+  assertEquals(meta.authorUsername, null);
   assertEquals(calls.length, 1);
   assertEquals(calls[0], url);
 });

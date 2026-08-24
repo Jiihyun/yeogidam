@@ -2,8 +2,42 @@
 
 export interface InstagramMeta {
   description: string | null;
+  authorUsername: string | null;
   thumbnailUrl: string | null;
   canonicalUrl: string | null;
+}
+
+const INSTAGRAM_USERNAME = "[A-Za-z0-9._]{1,30}";
+const INSTAGRAM_ENGLISH_DATE =
+  "(?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{1,2},\\s+\\d{4}";
+const INSTAGRAM_ENGAGEMENT_COUNT = "\\d[\\d.,]*[KMB]?";
+const AUTHOR_PREFIX_PATTERNS = [
+  new RegExp(
+    `\\(@(${INSTAGRAM_USERNAME})\\)\\s*[•·]\\s*Instagram\\b`,
+    "i",
+  ),
+  new RegExp(
+    `^\\s*@?(${INSTAGRAM_USERNAME})\\s*-\\s*${INSTAGRAM_ENGLISH_DATE}\\s*:`,
+    "i",
+  ),
+  new RegExp(
+    `^\\s*${INSTAGRAM_ENGAGEMENT_COUNT}\\s+likes?,\\s*${INSTAGRAM_ENGAGEMENT_COUNT}\\s+comments?\\s*-\\s*@?(${INSTAGRAM_USERNAME})\\s+on\\s+${INSTAGRAM_ENGLISH_DATE}\\s*:`,
+    "i",
+  ),
+];
+
+// twitter:title의 `Name (@username) • Instagram ...`을 우선 인식하고,
+// 과거 description wrapper도 fallback으로 지원한다. 캡션 본문의 첫 @mention은
+// 장소나 협찬 계정일 수 있으므로 작성자로 추측하지 않는다.
+export function parseInstagramAuthorUsername(
+  metadataText: string | null,
+): string | null {
+  if (!metadataText) return null;
+  for (const pattern of AUTHOR_PREFIX_PATTERNS) {
+    const username = metadataText.match(pattern)?.[1];
+    if (username) return username.toLowerCase();
+  }
+  return null;
 }
 
 function decodeHtml(s: string): string {
@@ -48,12 +82,30 @@ function metaContent(
 }
 
 export function parseInstagramMeta(html: string): InstagramMeta {
+  const twitterTitle = metaContent(html, [
+    { attribute: "name", value: "twitter:title" },
+  ]);
+  const openGraphTitle = metaContent(html, [
+    { attribute: "property", value: "og:title" },
+  ]);
+  const openGraphDescription = metaContent(html, [
+    { attribute: "property", value: "og:description" },
+  ]);
+  const genericDescription = metaContent(html, [
+    { attribute: "name", value: "description" },
+  ]);
+  const twitterDescription = metaContent(html, [
+    { attribute: "name", value: "twitter:description" },
+  ]);
+  const description = openGraphDescription ?? genericDescription ??
+    twitterDescription;
   return {
-    description: metaContent(html, [
-      { attribute: "property", value: "og:description" },
-      { attribute: "name", value: "description" },
-      { attribute: "name", value: "twitter:description" },
-    ]),
+    description,
+    authorUsername: parseInstagramAuthorUsername(twitterTitle) ??
+      parseInstagramAuthorUsername(openGraphTitle) ??
+      parseInstagramAuthorUsername(openGraphDescription) ??
+      parseInstagramAuthorUsername(genericDescription) ??
+      parseInstagramAuthorUsername(twitterDescription),
     thumbnailUrl: metaContent(html, [
       { attribute: "property", value: "og:image" },
       { attribute: "name", value: "twitter:image" },

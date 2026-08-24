@@ -81,6 +81,7 @@ const PIPELINE_VERSION = 9;
 const STUB_META = {
   description:
     "서울 성동구 연무장길 12 에 있는 여기담 스텁 카페 ☕️ 분위기 좋아요",
+  authorUsername: "yeogidam_stub",
   thumbnailUrl: "https://picsum.photos/seed/yeogidam/600/600",
   canonicalUrl: null as string | null,
 };
@@ -243,7 +244,7 @@ Deno.serve(async (req) => {
     const { data: completedSource, error: sourceError } = await admin
       .from("reels")
       .select(
-        "id, place_id, instagram_description, instagram_thumbnail_url",
+        "id, place_id, instagram_description, instagram_author_username, instagram_thumbnail_url",
       )
       .eq("instagram_shortcode", reelReference.shortcode)
       .eq("processing_status", "COMPLETED")
@@ -353,6 +354,7 @@ interface CompletedSourceReel {
   id: string;
   place_id: string | null;
   instagram_description: string | null;
+  instagram_author_username: string | null;
   instagram_thumbnail_url: string | null;
 }
 
@@ -420,6 +422,7 @@ async function copyCompletedReel(
   const { error: reelError } = await admin.from("reels").update({
     place_id: placeIds[0],
     instagram_description: source.instagram_description,
+    instagram_author_username: source.instagram_author_username,
     instagram_thumbnail_url: source.instagram_thumbnail_url,
     processing_status: "COMPLETED",
     failure_reason: null,
@@ -489,6 +492,18 @@ async function processReel(
       }));
       return await fail(admin, reelId, "IG_FETCH_FAILED");
     }
+    const { error: metadataUpdateError } = await admin
+      .from("reels")
+      .update({
+        instagram_description: meta.description,
+        ...(meta.authorUsername
+          ? { instagram_author_username: meta.authorUsername }
+          : {}),
+        instagram_thumbnail_url: meta.thumbnailUrl,
+      })
+      .eq("id", reelId);
+    if (metadataUpdateError) throw metadataUpdateError;
+
     const caption = meta.description;
     if (!caption) {
       console.error(JSON.stringify({
@@ -499,14 +514,6 @@ async function processReel(
       }));
       return await fail(admin, reelId, "IG_CAPTION_NOT_FOUND");
     }
-
-    await admin
-      .from("reels")
-      .update({
-        instagram_description: meta.description,
-        instagram_thumbnail_url: meta.thumbnailUrl,
-      })
-      .eq("id", reelId);
 
     // 2. 정규식 추출은 의사결정에 쓰지 않고 커버리지 관측용으로만 남겨둔다.
     const regexAddresses = extractKoreanAddresses(caption);

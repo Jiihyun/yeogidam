@@ -1,5 +1,5 @@
 begin;
-select plan(40);
+select plan(43);
 
 -- 테이블 존재
 select has_table('public', 'profiles',      'profiles 테이블 존재');
@@ -18,6 +18,7 @@ select col_is_pk('public', 'saved_places', 'id', 'saved_places.id PK');
 select has_column('public', 'reels', 'processing_status', 'reels.processing_status 존재');
 select has_column('public', 'reels', 'instagram_url',     'reels.instagram_url 존재');
 select has_column('public', 'reels', 'instagram_shortcode', 'reels.instagram_shortcode 존재');
+select has_column('public', 'reels', 'instagram_author_username', 'reels.instagram_author_username 존재');
 select has_column('public', 'reels', 'processing_version', 'reels.processing_version 존재');
 select has_column('public', 'places', 'google_place_id',  'places.google_place_id 존재');
 select has_column('public', 'places', 'thumbnail_url',    'places.thumbnail_url 존재');
@@ -37,6 +38,7 @@ select has_column('public', 'reel_places', 'position',       'reel_places.positi
 -- NOT NULL
 select col_not_null('public', 'reels', 'instagram_url', 'reels.instagram_url NOT NULL');
 select col_not_null('public', 'reels', 'user_id',       'reels.user_id NOT NULL');
+select col_is_null('public', 'reels', 'instagram_author_username', 'reels.instagram_author_username NULL 허용');
 select col_not_null('public', 'saved_places', 'place_id','saved_places.place_id NOT NULL');
 select col_not_null('public', 'places', 'name',          'places.name NOT NULL');
 select col_not_null('public', 'reel_places', 'position', 'reel_places.position NOT NULL');
@@ -72,6 +74,12 @@ prepare bad_reason as
   insert into public.reels (user_id, instagram_url, failure_reason)
   values ('00000000-0000-0000-0000-000000000000', 'https://x', 'NOPE');
 select throws_ok('bad_reason', '23514', null, 'failure_reason 잘못된 값은 check 위반');
+
+-- reels.instagram_author_username CHECK
+prepare bad_author_username as
+  insert into public.reels (user_id, instagram_url, instagram_author_username)
+  values ('00000000-0000-0000-0000-000000000000', 'https://x', 'Invalid@Name');
+select throws_ok('bad_author_username', '23514', null, '작성자 username 형식 위반');
 
 -- places.thumbnail_source CHECK
 prepare bad_thumbnail_source as
