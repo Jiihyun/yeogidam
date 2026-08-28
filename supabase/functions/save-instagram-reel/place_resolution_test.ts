@@ -1,8 +1,8 @@
 import type {
-  GeminiCandidateJudgment,
+  AiCandidateJudgment,
   KakaoCandidateReviewItem,
   PlaceGuess,
-} from "./gemini.ts";
+} from "./ai/types.ts";
 import type { KakaoPlace } from "./kakao.ts";
 import { sanitizePlaceGuesses } from "./matching.ts";
 import { resolvePlacesFromKakao } from "./place_resolution.ts";
@@ -118,7 +118,7 @@ Deno.test("batches SELECT RETRY and NONE once while preserving original place or
         judgeCalls += 1;
         assertEquals(items.map((item) => item.guessIndex), [1, 2, 3, 4]);
         assertEquals(items[2].candidates, []);
-        const decisions: GeminiCandidateJudgment[] = [{
+        const decisions: AiCandidateJudgment[] = [{
           guessIndex: 1,
           decision: "SELECT",
           candidateId: "owood-seoul",
@@ -239,7 +239,7 @@ Deno.test("resolves the 군자 bullet-list regression without weakening the fina
   assertEquals(result.failures, []);
 });
 
-Deno.test("does not call the second Gemini when every initial candidate is safe", async () => {
+Deno.test("does not call AI review when every initial candidate is safe", async () => {
   let judgeCalls = 0;
   const result = await resolvePlacesFromKakao("보연희", [guess("보연희")], {
     search: () => Promise.resolve([candidate("direct", "보연희")]),

@@ -1,8 +1,8 @@
 import {
-  type GeminiCandidateJudgment,
+  type AiCandidateJudgment,
   type KakaoCandidateReviewItem,
   type PlaceGuess,
-} from "./gemini.ts";
+} from "./ai/types.ts";
 import type { KakaoPlace } from "./kakao.ts";
 import {
   buildKakaoQueries,
@@ -35,12 +35,12 @@ export interface PlaceResolutionDependencies {
   judge(
     caption: string,
     items: KakaoCandidateReviewItem[],
-  ): Promise<GeminiCandidateJudgment[]>;
+  ): Promise<AiCandidateJudgment[]>;
   log?: (event: string, details: Record<string, unknown>) => void;
 }
 
 function aiNoneFailureReason(
-  reason: GeminiCandidateJudgment["reason"],
+  reason: AiCandidateJudgment["reason"],
 ): PlaceMatchFailureReason {
   return reason === "AMBIGUOUS_SAME_NAME" || reason === "NAME_MISMATCH" ||
       reason === "ADDRESS_CONFLICT" || reason === "INSUFFICIENT_CONTEXT"
@@ -64,8 +64,8 @@ function orderedUniqueMatches(matches: ResolvedPlace[]): ResolvedPlace[] {
 }
 
 /**
- * 최초 Kakao 검색과 단 한 번의 Gemini 판단, 선택적 Kakao 재검색을 수행한다.
- * RETRY 결과는 결정론적으로 끝내며 세 번째 Gemini 호출은 존재하지 않는다.
+ * 최초 Kakao 검색과 단 한 번의 AI 판단, 선택적 Kakao 재검색을 수행한다.
+ * RETRY 결과는 결정론적으로 끝내며 세 번째 AI 호출은 존재하지 않는다.
  */
 export async function resolvePlacesFromKakao(
   caption: string,
@@ -147,7 +147,7 @@ export async function resolvePlacesFromKakao(
         reason: aiNoneFailureReason(judgment.reason),
         candidates: review.candidates,
       });
-      dependencies.log?.("gemini_candidate_judgment_unresolved", {
+      dependencies.log?.("ai_candidate_judgment_unresolved", {
         guessIndex: review.guessIndex,
         decision: judgment.decision,
         reason: judgment.reason,
@@ -169,7 +169,7 @@ export async function resolvePlacesFromKakao(
           status: "REJECTED" as const,
           reason: "AI_SELECTED_UNKNOWN_CANDIDATE" as const,
         };
-      dependencies.log?.("gemini_candidate_selection_guarded", {
+      dependencies.log?.("ai_candidate_selection_guarded", {
         guessIndex: review.guessIndex,
         candidateId: judgment.candidateId,
         result: resolution.status,

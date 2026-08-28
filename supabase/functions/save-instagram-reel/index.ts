@@ -1,19 +1,18 @@
 // POST /functions/v1/save-instagram-reel
 // 1) JWT 인증 → 2) IG URL/shortcode 검증 → 3) 완료 결과 재사용 또는 PROCESSING insert
-// → 4) 202 즉시 반환 → 5) waitUntil 파이프라인(IG 추출 → Gemini → Kakao → 썸네일 → DB)
+// → 4) 202 즉시 반환 → 5) waitUntil 파이프라인(IG 추출 → AI → Kakao → 썸네일 → DB)
 //
 // 로컬 검증용: 환경변수 PIPELINE_SYNC=1 이면 백그라운드 대신 동기로 처리하고
 // 최종 상태를 응답에 담아 반환한다(테스트 편의). 프로덕션 기본은 비동기(202).
 
 import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 import { createRequestId, errorResponse } from "../_shared/error_code.ts";
+import { AiConfigError, AiProvidersExhaustedError } from "./ai/errors.ts";
+import { createPlaceAiClient } from "./ai/factory.ts";
+import type { PlaceAiClient } from "./ai/provider.ts";
+import type { PlaceGuess } from "./ai/types.ts";
 import { fetchInstagramMeta } from "./instagram.ts";
 import { extractKoreanAddresses } from "./address.ts";
-import {
-  extractPlacesWithGemini,
-  judgeKakaoCandidatesWithGemini,
-  type PlaceGuess,
-} from "./gemini.ts";
 import {
   buildKakaoMapURL,
   type KakaoPlace,
@@ -72,10 +71,26 @@ type FailureReason =
   | "KAKAO_PLACE_NOT_FOUND"
   | "PLACE_NOT_FOUND"
   | "UNKNOWN";
+
+function aiFailureReason(error: AiProvidersExhaustedError): FailureReason {
+  const finalAttempt = error.attempts.at(-1);
+  if (
+    finalAttempt?.kind === "AUTH" || finalAttempt?.kind === "BAD_REQUEST"
+  ) return "PROVIDER_CONFIG_MISSING";
+  if (
+    finalAttempt?.kind === "CONTENT_BLOCKED" ||
+    finalAttempt?.kind === "CANCELLED"
+  ) {
+    // 기존 DB/iOS 계약의 비재시도 장소 분석 실패 코드를 호환용으로 쓴다.
+    return "GEMINI_PLACE_NOT_FOUND";
+  }
+  return "UNKNOWN";
+}
+
 const STALE_PROCESSING_MS = 15 * 60 * 1000;
 const PIPELINE_VERSION = 9;
 
-// 로컬 검증 전용 스텁 (STUB_PROVIDERS=1 일 때만 사용). Gemini/Kakao 키 없이
+// 로컬 검증 전용 스텁 (STUB_PROVIDERS=1 일 때만 사용). AI/Kakao 키 없이
 // 파이프라인 전체(추출→매칭→저장→썸네일)를 결정적으로 검증하기 위한 것.
 // 프로덕션에서는 이 플래그를 켜지 않는다.
 const STUB_META = {
@@ -523,10 +538,10 @@ async function processReel(
       addresses: regexAddresses,
     }));
 
-    // 3. Gemini가 전체 캡션에서 모든 장소를 구조화하고, 원문에 실제 있는 문자열만 남긴다.
+    // 3. 선택된 AI 공급자가 전체 캡션에서 모든 장소를 구조화하고,
+    // 원문에 실제 있는 문자열만 남긴다.
     const kakaoKey = Deno.env.get("KAKAO_REST_API_KEY");
-    const geminiKey = Deno.env.get("GEMINI_API_KEY");
-    if (!stub && (!kakaoKey || !geminiKey)) {
+    if (!stub && !kakaoKey) {
       return await fail(admin, reelId, "PROVIDER_CONFIG_MISSING");
     }
 
@@ -542,12 +557,35 @@ async function processReel(
         },
         place: STUB_PLACE,
       }];
-    } else if (caption) {
-      const extracted = await extractPlacesWithGemini(caption, geminiKey!);
+    } else {
+      let ai: PlaceAiClient;
+      try {
+        ai = createPlaceAiClient(Deno.env, {
+          log: (event, details) => {
+            console.info(JSON.stringify({ event, reelId, ...details }));
+          },
+        });
+      } catch (error) {
+        if (error instanceof AiConfigError) {
+          console.error(JSON.stringify({
+            event: "ai_provider_config_invalid",
+            reelId,
+            message: error.message,
+          }));
+          return await fail(admin, reelId, "PROVIDER_CONFIG_MISSING");
+        }
+        throw error;
+      }
+
+      const extraction = await ai.extractPlaces(caption);
+      const extracted = extraction.data;
       const guesses = sanitizePlaceGuesses(extracted, caption);
       console.info(JSON.stringify({
-        event: "gemini_place_guesses_sanitized",
+        event: "ai_place_guesses_sanitized",
         reelId,
+        provider: extraction.provider,
+        model: extraction.model,
+        fallbackUsed: extraction.fallbackUsed,
         extractedCount: extracted.length,
         sanitizedCount: guesses.length,
       }));
@@ -557,8 +595,8 @@ async function processReel(
 
       const resolution = await resolvePlacesFromKakao(caption, guesses, {
         search: (query) => searchKakaoPlaces(query, kakaoKey!),
-        judge: (reviewCaption, items) =>
-          judgeKakaoCandidatesWithGemini(reviewCaption, items, geminiKey!),
+        judge: async (reviewCaption, items) =>
+          (await ai.judgeKakaoCandidates(reviewCaption, items)).data,
         log: (event, details) => {
           console.info(JSON.stringify({ event, reelId, ...details }));
         },
@@ -609,6 +647,20 @@ async function processReel(
       placeIds,
     };
   } catch (error) {
+    if (error instanceof AiProvidersExhaustedError) {
+      console.error(JSON.stringify({
+        event: "ai_pipeline_failed",
+        reelId,
+        attempts: error.attempts.map((attempt) => ({
+          provider: attempt.provider,
+          operation: attempt.operation,
+          kind: attempt.kind,
+          status: attempt.status,
+          model: attempt.model,
+        })),
+      }));
+      return await fail(admin, reelId, aiFailureReason(error));
+    }
     console.error(JSON.stringify({
       event: "reel_processing_failed",
       reelId,

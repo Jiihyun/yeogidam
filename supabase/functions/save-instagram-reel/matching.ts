@@ -1,4 +1,4 @@
-import type { PlaceGuess } from "./gemini.ts";
+import type { PlaceGuess } from "./ai/types.ts";
 import type { KakaoPlace } from "./kakao.ts";
 
 function compact(value: string): string {

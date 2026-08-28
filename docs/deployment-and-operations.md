@@ -11,7 +11,7 @@
 - Apple Developer 계정과 App Group 사용 권한
 - Google Cloud Places API (New)
 - Kakao Developers 앱과 Local API REST API 키
-- Gemini API key
+- 장소 AI API key. 기본 Gemini이며 OpenAI를 primary 또는 fallback으로 선택할 수 있음
 
 ## 2. Kakao Developers 등록
 
@@ -35,8 +35,15 @@ REST API 키의 호출 허용 IP를 설정하면 보안은 강화되지만, 기�
 Edge Function에 필요한 사용자 설정 secret:
 
 ```text
-GEMINI_API_KEY
+PLACE_AI_PRIMARY_PROVIDER    선택, 기본 gemini; gemini 또는 openai
+PLACE_AI_FALLBACK_PROVIDER   선택, 미설정 시 자동 fallback 없음; primary와 달라야 함
+PLACE_AI_TIMEOUT_MS          선택, 요청당 기본 10000ms; 1000~120000
+GEMINI_API_KEY               Gemini를 primary/fallback으로 쓸 때 필수
 GEMINI_MODEL                 선택, 기본 gemini-3.5-flash-lite
+GEMINI_MATCH_MODEL           선택, 기본 GEMINI_MODEL
+OPENAI_API_KEY               OpenAI를 primary/fallback으로 쓸 때 필수
+OPENAI_MODEL                 OpenAI를 primary/fallback으로 쓸 때 필수
+OPENAI_MATCH_MODEL           선택, 기본 OPENAI_MODEL
 KAKAO_REST_API_KEY
 GOOGLE_PLACES_API_KEY
 PUBLIC_SUPABASE_URL          선택, Storage 공개 URL 기준
@@ -54,6 +61,8 @@ SUPABASE_SERVICE_ROLE_KEY
 
 ```bash
 supabase secrets set \
+  PLACE_AI_PRIMARY_PROVIDER=gemini \
+  PLACE_AI_TIMEOUT_MS=10000 \
   GEMINI_API_KEY=... \
   KAKAO_REST_API_KEY=... \
   GOOGLE_PLACES_API_KEY=... \
@@ -61,6 +70,30 @@ supabase secrets set \
 ```
 
 키 값을 문서, Git, 앱 번들에 넣지 않습니다. iOS에 포함되는 Supabase `anon` 키는 공개 클라이언트 키이며 `service_role` 키와 다릅니다.
+
+### 장소 AI 키 교체와 공급자 전환
+
+호출부는 공통 `PlaceAiClient` 계약만 사용하고 Gemini와 OpenAI 구현체가 각 API의 인증·요청·응답 형식을 담당합니다. 이미 포함된 두 구현체 사이를 전환할 때 애플리케이션 코드를 수정할 필요는 없습니다.
+
+- 같은 Gemini 계정의 키를 교체하면 `GEMINI_API_KEY`만 갱신합니다. OpenAI 키 교체도 `OPENAI_API_KEY`만 갱신합니다.
+- 같은 공급자에서 모델만 바꾸면 `GEMINI_MODEL` 또는 `OPENAI_MODEL`을 변경합니다. 후보 판단만 별도 모델로 운영하려면 각 공급자의 `*_MATCH_MODEL`을 설정합니다.
+- Gemini에서 OpenAI로 전환하려면 `PLACE_AI_PRIMARY_PROVIDER=openai`, `OPENAI_API_KEY`, `OPENAI_MODEL`을 함께 등록합니다. 반대 전환은 primary를 `gemini`로 바꾸고 `GEMINI_API_KEY`를 등록합니다.
+- 자동 대체가 필요하면 `PLACE_AI_FALLBACK_PROVIDER`에 primary와 다른 공급자를 지정하고 그 공급자의 key/model도 등록합니다. 변수가 비어 있으면 fallback은 실행되지 않습니다.
+
+fallback은 quota·HTTP 429, timeout, 네트워크 오류, 5xx, 잘못된 공급자 응답에만 실행합니다. 정상적인 빈 장소 결과, 인증 오류, 잘못된 요청, 콘텐츠 차단에는 실행하지 않습니다. 따라서 키를 잘못 등록한 상태가 보조 공급자로 가려지지 않습니다. primary와 fallback을 같은 값으로 두거나 선택한 공급자의 필수 key/model이 없으면 `PROVIDER_CONFIG_MISSING`으로 처리합니다.
+
+예를 들어 Gemini primary와 OpenAI fallback을 활성화할 때는 다음 secret을 추가합니다.
+
+```bash
+supabase secrets set \
+  PLACE_AI_PRIMARY_PROVIDER=gemini \
+  PLACE_AI_FALLBACK_PROVIDER=openai \
+  PLACE_AI_TIMEOUT_MS=10000 \
+  GEMINI_API_KEY=... \
+  OPENAI_API_KEY=... \
+  OPENAI_MODEL=... \
+  --project-ref hbbrgudsbvnwuylxqlta
+```
 
 ## 4. 로컬 Supabase
 
@@ -78,7 +111,7 @@ supabase functions serve save-instagram-reel \
   --env-file supabase/functions/.env
 ```
 
-외부 키 없이 파이프라인 구조만 검증하려면 로컬 환경에서만 `STUB_PROVIDERS=1`, 최종 상태를 응답으로 받으려면 `PIPELINE_SYNC=1`을 사용합니다. 두 값은 프로덕션 secret으로 등록하지 않습니다.
+외부 키 없이 파이프라인 구조만 검증하려면 로컬 환경에서만 `STUB_PROVIDERS=1`, 최종 상태를 응답으로 받으려면 `PIPELINE_SYNC=1`을 사용합니다. 스텁 모드에서는 장소 AI와 Kakao 설정을 읽지 않습니다. 두 값은 프로덕션 secret으로 등록하지 않습니다.
 
 ## 5. DB와 Function 배포
 
@@ -220,25 +253,26 @@ Google Maps Platform 약관은 Google Maps Content의 저장·재호스팅과 �
 | `PLACE_NOT_FOUND` | Gemini 다중 장소, 원문 검증, Kakao API status·itemCount·verifiedCount |
 | `UNKNOWN` | places upsert와 DB 제약, Function exception log |
 | 사진만 없음 | 월 예약 한도, Google quota, Storage upload, 폴백 URL |
-| `COMPLETED`인데 일부 장소가 없음 | 캡션 장소 수와 Gemini placeCount·sanitizedCount, 장소별 candidateCount·2차 판단, `reel_places.position` |
+| `COMPLETED`인데 일부 장소가 없음 | 캡션 장소 수와 AI 추출·sanitizedCount, 장소별 candidateCount·2차 판단, `reel_places.position` |
 | 같은 릴스를 다시 보내도 재처리 안 됨 | 같은 사용자 shortcode 캐시, processing version, 기존 `reel_places` 복원 여부 |
 | 알고리즘 배포 후 기존 릴스 결과가 그대로임 | `PIPELINE_VERSION`을 올렸는지 확인. 같은 버전의 완료 결과는 정상적으로 캐시됨 |
 | `FAILED/UNKNOWN`인데 일부 장소가 목록에 보임 | 다중 장소 비트랜잭션 저장 중 뒤 항목 실패 여부, 남은 `saved_places`·`reel_places` 확인 |
 | 장소 상세에 관련 릴스가 없음 | 릴스 상태 `COMPLETED`, `reel_places` 연결, 해당 릴스의 `user_id`, RLS 정책 배포 여부 |
 
-Edge Function은 Instagram fetch, Gemini 구조화, Kakao 검색·후보 검증 결과를 JSON 로그로 남깁니다. Supabase Dashboard의 Edge Function Logs와 API Gateway Logs를 함께 확인합니다.
+Edge Function은 Instagram fetch, 장소 AI 공급자·모델·fallback 여부, Kakao 검색·후보 검증 결과를 JSON 로그로 남깁니다. Supabase Dashboard의 Edge Function Logs와 API Gateway Logs를 함께 확인합니다. `ai_provider_call_failed` 뒤 `ai_provider_fallback_started`와 `ai_provider_fallback_completed`가 이어지면 보조 공급자가 해당 작업을 대신 완료한 것입니다. `ai_providers_exhausted` 또는 `ai_pipeline_failed`는 더 이상 사용할 공급자가 없음을 뜻합니다.
 
 ### 부분 저장 진단 순서
 
-1. `reels.instagram_description`의 장소 수와 `gemini_place_extraction_completed.placeCount`를 비교합니다.
-2. `gemini_place_guesses_sanitized`의 `extractedCount`와 `sanitizedCount` 차이로 원문 검증 탈락을 확인합니다.
+1. `reels.instagram_description`의 장소 수와 `ai_provider_call_completed`의 `PLACE_EXTRACTION` `resultCount`를 비교합니다.
+2. `ai_place_guesses_sanitized`의 `provider`, `model`, `fallbackUsed`, `extractedCount`, `sanitizedCount`로 실제 공급자와 원문 검증 탈락을 확인합니다.
 3. 각 `kakao_place_candidates_classified`의 `candidateCount`, `decision`을 확인합니다.
-4. 2차 Gemini의 선택 또는 `NONE` 사유를 확인합니다.
-5. 최종 `reel_places`의 `position`과 장소명을 확인합니다.
+4. 2차 AI의 호출 성공 여부와 `ai_candidate_selection_guarded`·`ai_candidate_judgment_unresolved`의 결정 및 사유를 확인합니다.
+5. `RETRY`이면 `kakao_retry_candidates_resolved`의 검색어·후보 수·최종 검증 결과를 확인합니다.
+6. 최종 `reel_places`의 `position`과 장소명을 확인합니다.
 
-애플리케이션 개수 상한은 없지만 Gemini가 원문의 모든 장소를 항상 반환한다는 보장은 없다. 캡션과 추출 로그를 비교해 모델 누락을 판단합니다.
+애플리케이션 개수 상한은 없지만 선택한 AI 모델이 원문의 모든 장소를 항상 반환한다는 보장은 없다. 캡션과 추출 로그를 비교해 모델 누락을 판단합니다.
 
-`reel_places.position`은 캡션 절대 순번이 아니라 성공한 결과의 압축 순서다. 누락 위치를 판단할 때 position만 보지 말고 캡션과 Gemini 구조화 로그를 같이 확인합니다.
+`reel_places.position`은 캡션 절대 순번이 아니라 성공한 결과의 압축 순서다. 누락 위치를 판단할 때 position만 보지 말고 캡션과 AI 구조화 로그를 같이 확인합니다.
 
 ## 11. 릴리스 체크리스트
 
@@ -246,6 +280,8 @@ Edge Function은 Instagram fetch, Gemini 구조화, Kakao 검색·후보 검증 
 - [ ] Deno 테스트·format·typecheck 통과
 - [ ] Edge Function 배포 상태 `ACTIVE`
 - [ ] Function secrets 등록 및 테스트
+- [ ] 장소 AI primary/fallback이 서로 다르고 선택한 공급자의 key/model이 모두 등록됐는지 확인
+- [ ] 키 회전은 해당 공급자 secret만 갱신하고, 공급자 전환은 `PLACE_AI_PRIMARY_PROVIDER`와 대상 key/model을 함께 변경했는지 확인
 - [ ] Kakao Local API 실제 후보의 `id`·`place_url` 확인
 - [ ] Anonymous sign-in 활성화
 - [ ] Google API key restriction과 quota 확인
