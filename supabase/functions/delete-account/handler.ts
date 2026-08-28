@@ -1,4 +1,5 @@
 import { createRequestId, errorResponse } from "../_shared/error_code.ts";
+import { ProviderUnlinkError } from "./provider_unlink.ts";
 
 export const deleteAccountCorsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -123,14 +124,23 @@ export async function handleDeleteAccount(
       authentication.account,
       body,
     );
-  } catch {
-    unlinkResult = { error: new Error("provider_unlink_failed") };
+  } catch (error) {
+    unlinkResult = { error };
   }
   if (unlinkResult.error) {
+    const providerDetails = unlinkResult.error instanceof ProviderUnlinkError
+      ? {
+        provider: unlinkResult.error.provider,
+        stage: unlinkResult.error.stage,
+        upstreamStatus: unlinkResult.error.upstreamStatus,
+        upstreamCode: unlinkResult.error.upstreamCode,
+      }
+      : {};
     dependencies.log?.({
       event: "account_deletion_provider_unlink_failed",
       requestId,
       errorCode: "USER502_001",
+      ...providerDetails,
     });
     return errorResponse(
       "ACCOUNT_DELETION_PROVIDER_UNLINK_FAILED",

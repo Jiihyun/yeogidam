@@ -2,6 +2,7 @@ import {
   type DeleteAccountDependencies,
   handleDeleteAccount,
 } from "./handler.ts";
+import { ProviderUnlinkError } from "./provider_unlink.ts";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -180,6 +181,45 @@ Deno.test("delete-account stops when OAuth provider unlink fails", async () => {
   assert(
     !deleteCalled,
     "internal account must not be deleted after unlink failure",
+  );
+});
+
+Deno.test("delete-account logs only safe Apple failure diagnostics", async () => {
+  const logs: Array<Record<string, unknown>> = [];
+  const response = await handleDeleteAccount(
+    request(
+      "DELETE",
+      JSON.stringify({
+        confirmation: "DELETE",
+        appleAuthorizationCode: "sensitive-one-time-code",
+      }),
+      "access-token",
+    ),
+    dependencies({
+      authenticate: async () => ({
+        account: {
+          userId: "user-1",
+          identities: [{ provider: "apple", providerUserId: "apple-sub" }],
+        },
+      }),
+      unlinkProviders: async () => ({
+        error: new ProviderUnlinkError(
+          "apple",
+          "token_exchange",
+          400,
+          "invalid_grant",
+        ),
+      }),
+      log: (entry) => logs.push(entry),
+    }),
+  );
+  const serializedLogs = JSON.stringify(logs);
+  assert(response.status === 502, "Apple unlink failure must return 502");
+  assert(serializedLogs.includes("token_exchange"), "stage was not logged");
+  assert(serializedLogs.includes("invalid_grant"), "safe code was not logged");
+  assert(
+    !serializedLogs.includes("sensitive-one-time-code"),
+    "authorization code must never be logged",
   );
 });
 

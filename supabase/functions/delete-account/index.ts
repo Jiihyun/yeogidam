@@ -28,7 +28,8 @@ Deno.serve(async (request) => {
           identities: (data.user.identities ?? []).map((identity) => ({
             provider: identity.provider,
             providerUserId: String(
-              identity.identity_data?.sub ?? identity.identity_data?.id ?? "",
+              identity.identity_data?.sub ?? identity.identity_data?.id ??
+                identity.id ?? "",
             ),
           })).filter((identity) => identity.providerUserId.length > 0),
         }

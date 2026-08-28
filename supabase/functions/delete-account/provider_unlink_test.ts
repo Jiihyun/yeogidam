@@ -14,6 +14,36 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+function base64URLJSON(value: Record<string, unknown>): string {
+  return btoa(JSON.stringify(value))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function appleClientSecret(
+  clientId = "com.yeogidamm.app",
+  claimOverrides: Record<string, unknown> = {},
+): string {
+  const now = Math.floor(Date.now() / 1000);
+  return [
+    base64URLJSON({ alg: "ES256", kid: "TESTKEY123" }),
+    base64URLJSON({
+      iss: "8QNP67WLL6",
+      sub: clientId,
+      aud: "https://appleid.apple.com",
+      iat: now - 60,
+      exp: now + 3600,
+      ...claimOverrides,
+    }),
+    "test-signature",
+  ].join(".");
+}
+
+function appleIDToken(subject = "apple-user"): string {
+  return `header.${base64URLJSON({ sub: subject })}.signature`;
+}
+
 Deno.test("Kakao token owner is verified before unlink", async () => {
   const calls: string[] = [];
   await unlinkOAuthProviders(
@@ -90,25 +120,27 @@ Deno.test("social identity without a fresh provider credential fails safely", as
 });
 
 Deno.test("Apple code is exchanged and its refresh token is revoked", async () => {
-  const payload = btoa(JSON.stringify({ sub: "apple-user" }))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
   const calls: string[] = [];
   await unlinkOAuthProviders(
     {
       identities: [{ provider: "apple", providerUserId: "apple-user" }],
       appleAuthorizationCode: "fresh-code",
       appleClientId: "com.yeogidamm.app",
-      appleClientSecret: "signed-client-secret",
+      appleClientSecret: appleClientSecret(),
     },
-    (input) => {
+    (input, init) => {
       const url = String(input);
       calls.push(url);
+      const body = new URLSearchParams(String(init?.body));
+      assert(init?.method === "POST", "Apple endpoints must use POST");
+      assert(
+        body.get("client_id") === "com.yeogidamm.app",
+        "Apple client id is missing",
+      );
       return Promise.resolve(
         url.endsWith("/token")
           ? jsonResponse({
-            id_token: `header.${payload}.signature`,
+            id_token: appleIDToken(),
             refresh_token: "apple-refresh-token",
           })
           : new Response(null, { status: 200 }),
@@ -117,4 +149,89 @@ Deno.test("Apple code is exchanged and its refresh token is revoked", async () =
   );
   assert(calls.length === 2, "Apple token and revoke endpoints must be called");
   assert(calls[1].endsWith("/revoke"), "Apple revoke endpoint was not called");
+});
+
+Deno.test("invalid Apple client secret is rejected before token exchange", async () => {
+  let fetchCalled = false;
+  let caught: unknown;
+  try {
+    await unlinkOAuthProviders(
+      {
+        identities: [{ provider: "apple", providerUserId: "apple-user" }],
+        appleAuthorizationCode: "fresh-code",
+        appleClientId: "com.yeogidamm.app",
+        appleClientSecret: appleClientSecret("another.client.id"),
+      },
+      () => {
+        fetchCalled = true;
+        return Promise.resolve(jsonResponse({}));
+      },
+    );
+  } catch (error) {
+    caught = error;
+  }
+  assert(caught instanceof ProviderUnlinkError, "invalid secret must fail");
+  assert(caught.stage === "configuration", "wrong failure stage");
+  assert(
+    caught.upstreamCode === "invalid_client_secret",
+    "wrong configuration code",
+  );
+  assert(!fetchCalled, "invalid secret must not be sent to Apple");
+});
+
+for (const upstreamCode of ["invalid_client", "invalid_grant"]) {
+  Deno.test(`Apple ${upstreamCode} is preserved safely`, async () => {
+    let revokeCalled = false;
+    let caught: unknown;
+    try {
+      await unlinkOAuthProviders(
+        {
+          identities: [{ provider: "apple", providerUserId: "apple-user" }],
+          appleAuthorizationCode: "fresh-code",
+          appleClientId: "com.yeogidamm.app",
+          appleClientSecret: appleClientSecret(),
+        },
+        (input) => {
+          if (String(input).endsWith("/revoke")) revokeCalled = true;
+          return Promise.resolve(jsonResponse({ error: upstreamCode }, 400));
+        },
+      );
+    } catch (error) {
+      caught = error;
+    }
+    assert(caught instanceof ProviderUnlinkError, "Apple error must fail");
+    assert(caught.stage === "token_exchange", "wrong failure stage");
+    assert(caught.upstreamStatus === 400, "upstream status was lost");
+    assert(caught.upstreamCode === upstreamCode, "upstream code was lost");
+    assert(!revokeCalled, "revoke must not run after exchange failure");
+  });
+}
+
+Deno.test("Apple revoke failure is distinguished from exchange failure", async () => {
+  let caught: unknown;
+  try {
+    await unlinkOAuthProviders(
+      {
+        identities: [{ provider: "apple", providerUserId: "apple-user" }],
+        appleAuthorizationCode: "fresh-code",
+        appleClientId: "com.yeogidamm.app",
+        appleClientSecret: appleClientSecret(),
+      },
+      (input) =>
+        Promise.resolve(
+          String(input).endsWith("/token")
+            ? jsonResponse({
+              id_token: appleIDToken(),
+              refresh_token: "apple-refresh-token",
+            })
+            : jsonResponse({ error: "invalid_client" }, 400),
+        ),
+    );
+  } catch (error) {
+    caught = error;
+  }
+  assert(caught instanceof ProviderUnlinkError, "revoke error must fail");
+  assert(caught.stage === "token_revoke", "wrong failure stage");
+  assert(caught.upstreamStatus === 400, "upstream status was lost");
+  assert(caught.upstreamCode === "invalid_client", "upstream code was lost");
 });
