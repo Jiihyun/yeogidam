@@ -17,9 +17,9 @@ final class AppState: ObservableObject {
     @Published var errorMessage: String?
 
     private let auth = SupabaseManager.client.auth
-    private let logger = Logger(subsystem: "com.yeogidamm.app", category: "Authentication")
+    private let logger = Logger(subsystem: YeogidamConfig.bundleIdentifier, category: "Authentication")
     private var currentAppleNonce: String?
-    private static let oauthRedirectURL = URL(string: "com.yeogidamm.app://auth-callback")!
+    private static let oauthRedirectURL = YeogidamConfig.oauthRedirectURL
 
     /// 익명 사용자는 로그인 화면에 머물고, Apple 계정이 연결된 사용자만 앱으로 진입한다.
     var hasPermanentSession: Bool {

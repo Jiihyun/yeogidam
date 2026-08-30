@@ -1,5 +1,5 @@
 begin;
-select plan(5);
+select plan(6);
 
 insert into auth.users (id, aud, role, email)
 values (
@@ -32,6 +32,12 @@ values (
   '66666666-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
 );
 
+insert into public.reel_reports (user_id, reel_id)
+values (
+  '66666666-6666-6666-6666-666666666666',
+  '66666666-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+);
+
 delete from auth.users
 where id = '66666666-6666-6666-6666-666666666666';
 
@@ -54,6 +60,11 @@ select is(
   (select count(*)::int from public.reel_places where reel_id = '66666666-bbbb-bbbb-bbbb-bbbbbbbbbbbb'),
   0,
   'reel 삭제 시 reel_places cascade 삭제'
+);
+select is(
+  (select count(*)::int from public.reel_reports where user_id = '66666666-6666-6666-6666-666666666666'),
+  0,
+  'auth user 삭제 시 reel_reports cascade 삭제'
 );
 select is(
   (select count(*)::int from public.places where id = '66666666-aaaa-aaaa-aaaa-aaaaaaaaaaaa'),

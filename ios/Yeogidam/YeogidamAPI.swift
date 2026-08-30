@@ -26,7 +26,7 @@ struct YeogidamAPI {
     }()
 
     func saveInstagramReel(_ instagramURL: String) async throws -> SaveInstagramReelResponse {
-        var request = URLRequest(url: YeogidamConfig.supabaseURL.appendingPathComponent("functions/v1/save-instagram-reel"))
+        var request = URLRequest(url: YeogidamConfig.saveInstagramReelFunctionURL)
         request.httpMethod = "POST"
         applyAuthHeaders(to: &request)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")

@@ -32,11 +32,13 @@ import {
   rehostThumbnail,
   scrapePageImage,
 } from "./thumbnail.ts";
+import { completedProcessingVersion, parseInstagramReelURL } from "./reel.ts";
 import {
-  completedProcessingVersion,
-  parseInstagramReelURL,
-  shouldRetryReel,
-} from "./reel.ts";
+  AUTO_SAVE,
+  isReelSaveMode,
+  type ReelSaveMode,
+  responseForSaveMode,
+} from "./workflow.ts";
 
 // Supabase Edge Runtime 전역 (백그라운드 처리)
 declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void };
@@ -123,7 +125,16 @@ const STUB_THUMBNAIL = {
   attribution: "Google Places stub",
 };
 
-Deno.serve(async (req) => {
+export function createSaveInstagramReelHandler(
+  requestedSaveMode: ReelSaveMode,
+): (req: Request) => Promise<Response> {
+  return (req) => handleSaveInstagramReel(req, requestedSaveMode);
+}
+
+async function handleSaveInstagramReel(
+  req: Request,
+  requestedSaveMode: ReelSaveMode,
+): Promise<Response> {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   const requestId = createRequestId();
   try {
@@ -184,81 +195,22 @@ Deno.serve(async (req) => {
     const admin = createClient(SUPABASE_URL, SERVICE);
     const { data: existing, error: existingError } = await admin
       .from("reels")
-      .select(
-        "id, place_id, processing_status, failure_reason, processing_version, updated_at",
-      )
+      .select("id")
       .eq("user_id", userId)
       .eq("instagram_shortcode", reelReference.shortcode)
       .maybeSingle();
     if (existingError) return databaseErrorResponse(requestId, existingError);
 
-    if (
-      existing && !shouldRetryReel(
-        {
-          processingStatus: existing.processing_status,
-          processingVersion: existing.processing_version,
-          updatedAt: existing.updated_at,
-        },
-        PIPELINE_VERSION,
-        STALE_PROCESSING_MS,
-      )
-    ) {
-      return await cachedReelResponse(admin, existing, userId, true);
-    }
-
-    // FAILED 또는 오래 멈춘 작업은 같은 행을 원자적으로 비우고 재시도한다.
     if (existing) {
-      const { data: retryReel, error: retryError } = await admin
-        .from("reels")
-        .update({
-          instagram_url: instagramUrl,
-          source,
-          place_id: null,
-          processing_version: PIPELINE_VERSION,
-          processing_status: "PROCESSING",
-          failure_reason: null,
-        })
-        .eq("id", existing.id)
-        .eq("updated_at", existing.updated_at)
-        .select("id")
-        .maybeSingle();
-      if (retryError) return databaseErrorResponse(requestId, retryError);
-      if (retryReel) {
-        const { error: cleanupError } = await admin.from("reel_places").delete()
-          .eq("reel_id", retryReel.id);
-        const { error: failureCleanupError } = await admin
-          .from("reel_place_match_failures")
-          .delete()
-          .eq("reel_id", retryReel.id);
-        if (cleanupError || failureCleanupError) {
-          await admin.from("reels").update({
-            processing_status: "FAILED",
-            failure_reason: "UNKNOWN",
-          }).eq("id", retryReel.id);
-          return databaseErrorResponse(
-            requestId,
-            cleanupError ?? failureCleanupError,
-          );
-        }
-        return scheduleOrProcess(
-          admin,
-          retryReel.id,
-          userId,
-          instagramUrl,
-          false,
-        );
-      }
-
-      const { data: raced } = await admin
-        .from("reels")
-        .select(
-          "id, place_id, processing_status, failure_reason, processing_version, updated_at",
-        )
-        .eq("id", existing.id)
-        .single();
-      return raced
-        ? await cachedReelResponse(admin, raced, userId, true)
-        : databaseErrorResponse(requestId);
+      return await existingReelResponse(
+        admin,
+        existing.id,
+        userId,
+        instagramUrl,
+        source,
+        requestedSaveMode,
+        requestId,
+      );
     }
 
     // 다른 사용자가 이미 완료한 동일 릴스가 있으면 외부 API 결과를 재사용한다.
@@ -285,21 +237,27 @@ Deno.serve(async (req) => {
         processing_version: PIPELINE_VERSION,
         source,
         processing_status: "PROCESSING",
+        save_mode: requestedSaveMode,
       })
-      .select("id")
+      .select("id, save_mode, processing_token")
       .single();
     if (insErr?.code === "23505") {
       const { data: raced } = await admin
         .from("reels")
-        .select(
-          "id, place_id, processing_status, failure_reason, processing_version, updated_at",
-        )
+        .select("id")
         .eq("user_id", userId)
         .eq("instagram_shortcode", reelReference.shortcode)
         .single();
-      return raced
-        ? await cachedReelResponse(admin, raced, userId, true)
-        : databaseErrorResponse(requestId);
+      if (!raced) return databaseErrorResponse(requestId);
+      return await existingReelResponse(
+        admin,
+        raced.id,
+        userId,
+        instagramUrl,
+        source,
+        requestedSaveMode,
+        requestId,
+      );
     }
     if (insErr || !reel) {
       return databaseErrorResponse(requestId, insErr);
@@ -311,10 +269,20 @@ Deno.serve(async (req) => {
           admin,
           completedSource,
           reel.id,
-          userId,
+          reel.processing_token,
         );
         if (reused) {
-          return json({ reelId: reel.id, ...reused, reused: true }, 200);
+          const actualMode = requestedSaveMode === AUTO_SAVE
+            ? AUTO_SAVE
+            : await reelSaveMode(admin, reel.id);
+          return json(
+            responseForSaveMode(
+              { reelId: reel.id, ...reused, reused: true },
+              requestedSaveMode,
+              actualMode,
+            ),
+            200,
+          );
         }
       } catch (error) {
         console.error(JSON.stringify({
@@ -323,11 +291,30 @@ Deno.serve(async (req) => {
           sourceReelId: completedSource.id,
           message: error instanceof Error ? error.message : String(error),
         }));
-        await admin.from("reel_places").delete().eq("reel_id", reel.id);
+        const { error: cleanupError } = await resetPendingReelResults(
+          admin,
+          reel.id,
+          reel.processing_token,
+        );
+        if (cleanupError) {
+          console.error(JSON.stringify({
+            event: "reel_cache_reuse_cleanup_failed",
+            reelId: reel.id,
+            message: cleanupError.message,
+          }));
+        }
       }
     }
 
-    return scheduleOrProcess(admin, reel.id, userId, instagramUrl, false);
+    return scheduleOrProcess(
+      admin,
+      reel.id,
+      instagramUrl,
+      false,
+      requestedSaveMode,
+      reel.save_mode,
+      reel.processing_token,
+    );
   } catch (error) {
     console.error(JSON.stringify({
       event: "api_error",
@@ -337,22 +324,48 @@ Deno.serve(async (req) => {
     }));
     return errorResponse("INTERNAL_ERROR", requestId, { headers: cors });
   }
-});
+}
+
+if (import.meta.main) {
+  Deno.serve(createSaveInstagramReelHandler(AUTO_SAVE));
+}
 
 async function scheduleOrProcess(
   admin: SupabaseClient,
   reelId: string,
-  userId: string,
   instagramUrl: string,
   reused: boolean,
+  requestedSaveMode: ReelSaveMode,
+  initialSaveMode: ReelSaveMode,
+  processingToken: string,
 ): Promise<Response> {
-  const work = processReel(admin, reelId, userId, instagramUrl);
+  const work = processReel(admin, reelId, processingToken, instagramUrl);
   if (Deno.env.get("PIPELINE_SYNC") === "1") {
     const result = await work;
-    return json({ reelId, ...result, reused }, 200);
+    const actualMode = requestedSaveMode === AUTO_SAVE
+      ? AUTO_SAVE
+      : await reelSaveMode(admin, reelId);
+    return json(
+      responseForSaveMode(
+        { reelId, ...result, reused },
+        requestedSaveMode,
+        actualMode,
+      ),
+      200,
+    );
   }
   EdgeRuntime.waitUntil(work);
-  return json({ reelId, status: "PROCESSING", reused }, 202);
+  const actualMode = requestedSaveMode === AUTO_SAVE
+    ? initialSaveMode
+    : await reelSaveMode(admin, reelId);
+  return json(
+    responseForSaveMode(
+      { reelId, status: "PROCESSING", reused },
+      requestedSaveMode,
+      actualMode,
+    ),
+    202,
+  );
 }
 
 interface ProcessResult {
@@ -369,6 +382,12 @@ interface CachedReel {
   failure_reason: FailureReason | null;
   processing_version: number;
   updated_at: string;
+  save_mode: ReelSaveMode;
+}
+
+interface ClaimedReel extends CachedReel {
+  processing_token: string;
+  should_process: boolean;
 }
 
 interface CompletedSourceReel {
@@ -398,57 +417,175 @@ async function reelPlaceIds(
     : [];
 }
 
+async function claimExistingReelRequest(
+  admin: SupabaseClient,
+  reelId: string,
+  userId: string,
+  instagramUrl: string,
+  source: "instagram_share" | "url_input",
+  requestedSaveMode: ReelSaveMode,
+): Promise<{ reel: ClaimedReel | null; error?: unknown }> {
+  const staleBefore = new Date(Date.now() - STALE_PROCESSING_MS).toISOString();
+  const { data, error } = await admin.rpc("claim_reel_request", {
+    p_reel_id: reelId,
+    p_user_id: userId,
+    p_requested_mode: requestedSaveMode,
+    p_pipeline_version: PIPELINE_VERSION,
+    p_stale_before: staleBefore,
+    p_instagram_url: instagramUrl,
+    p_source: source,
+  });
+  const candidate = data as Partial<ClaimedReel> | null;
+  if (
+    error || !candidate || typeof candidate.id !== "string" ||
+    !isReelSaveMode(candidate.save_mode) ||
+    typeof candidate.processing_token !== "string" ||
+    typeof candidate.processing_status !== "string" ||
+    typeof candidate.processing_version !== "number" ||
+    typeof candidate.updated_at !== "string" ||
+    typeof candidate.should_process !== "boolean"
+  ) {
+    return {
+      reel: null,
+      error: error ?? new Error("invalid_claimed_reel_request"),
+    };
+  }
+  return { reel: candidate as ClaimedReel };
+}
+
+async function existingReelResponse(
+  admin: SupabaseClient,
+  reelId: string,
+  userId: string,
+  instagramUrl: string,
+  source: "instagram_share" | "url_input",
+  requestedSaveMode: ReelSaveMode,
+  requestId: string,
+): Promise<Response> {
+  const claimed = await claimExistingReelRequest(
+    admin,
+    reelId,
+    userId,
+    instagramUrl,
+    source,
+    requestedSaveMode,
+  );
+  if (claimed.error || !claimed.reel) {
+    return databaseErrorResponse(requestId, claimed.error);
+  }
+
+  if (!claimed.reel.should_process) {
+    return await cachedReelResponse(
+      admin,
+      claimed.reel,
+      requestedSaveMode,
+      true,
+    );
+  }
+
+  return scheduleOrProcess(
+    admin,
+    claimed.reel.id,
+    instagramUrl,
+    false,
+    requestedSaveMode,
+    claimed.reel.save_mode,
+    claimed.reel.processing_token,
+  );
+}
+
+async function reelSaveMode(
+  admin: SupabaseClient,
+  reelId: string,
+): Promise<ReelSaveMode> {
+  const { data, error } = await admin.from("reels")
+    .select("save_mode")
+    .eq("id", reelId)
+    .single();
+  if (error || !isReelSaveMode(data?.save_mode)) {
+    throw error ?? new Error("invalid_reel_save_mode");
+  }
+  return data.save_mode;
+}
+
+async function resetPendingReelResults(
+  admin: SupabaseClient,
+  reelId: string,
+  processingToken: string,
+): Promise<{ error: { message: string } | null }> {
+  const { error } = await admin.rpc("reset_pending_reel_results", {
+    p_reel_id: reelId,
+    p_processing_token: processingToken,
+  });
+  return { error };
+}
+
 async function cachedReelResponse(
   admin: SupabaseClient,
   reel: CachedReel,
-  userId: string,
+  requestedSaveMode: ReelSaveMode,
   reused: boolean,
 ): Promise<Response> {
   const placeIds = reel.processing_status === "COMPLETED"
     ? await reelPlaceIds(admin, reel.id, reel.place_id)
     : [];
-  if (placeIds.length > 0) {
-    await savePlacesForUser(admin, userId, placeIds);
+  if (reel.save_mode === AUTO_SAVE) {
+    for (const [position, placeId] of placeIds.entries()) {
+      await persistReelPlaceResult(admin, reel.id, placeId, position, null);
+    }
   }
   const status = reel.processing_status;
-  return json({
-    reelId: reel.id,
-    status,
-    ...(reel.failure_reason ? { failureReason: reel.failure_reason } : {}),
-    ...(placeIds[0] ? { placeId: placeIds[0], placeIds } : {}),
-    reused,
-  }, status === "PENDING" || status === "PROCESSING" ? 202 : 200);
+  return json(
+    responseForSaveMode(
+      {
+        reelId: reel.id,
+        status,
+        ...(reel.failure_reason ? { failureReason: reel.failure_reason } : {}),
+        ...(placeIds[0] ? { placeId: placeIds[0], placeIds } : {}),
+        reused,
+      },
+      requestedSaveMode,
+      reel.save_mode,
+    ),
+    status === "PENDING" || status === "PROCESSING" ? 202 : 200,
+  );
 }
 
 async function copyCompletedReel(
   admin: SupabaseClient,
   source: CompletedSourceReel,
   targetReelId: string,
-  userId: string,
+  processingToken: string,
 ): Promise<ProcessResult | null> {
   const placeIds = await reelPlaceIds(admin, source.id, source.place_id);
   if (placeIds.length === 0) return null;
 
-  await savePlacesForUser(admin, userId, placeIds);
-
-  const { error: linksError } = await admin.from("reel_places").insert(
-    placeIds.map((placeId, position) => ({
-      reel_id: targetReelId,
-      place_id: placeId,
+  for (const [position, placeId] of placeIds.entries()) {
+    await persistReelPlaceResult(
+      admin,
+      targetReelId,
+      placeId,
       position,
-    })),
-  );
-  if (linksError) throw linksError;
+      null,
+      processingToken,
+    );
+  }
 
-  const { error: reelError } = await admin.from("reels").update({
-    place_id: placeIds[0],
-    instagram_description: source.instagram_description,
-    instagram_author_username: source.instagram_author_username,
-    instagram_thumbnail_url: source.instagram_thumbnail_url,
-    processing_status: "COMPLETED",
-    failure_reason: null,
-  }).eq("id", targetReelId);
+  const { data: completedReel, error: reelError } = await admin.from("reels")
+    .update({
+      place_id: placeIds[0],
+      instagram_description: source.instagram_description,
+      instagram_author_username: source.instagram_author_username,
+      instagram_thumbnail_url: source.instagram_thumbnail_url,
+      processing_status: "COMPLETED",
+      failure_reason: null,
+    })
+    .eq("id", targetReelId)
+    .eq("processing_token", processingToken)
+    .select("id")
+    .maybeSingle();
   if (reelError) throw reelError;
+  if (!completedReel) throw new Error("stale_reel_processing_attempt");
 
   console.info(JSON.stringify({
     event: "completed_reel_reused",
@@ -463,31 +600,6 @@ async function copyCompletedReel(
   };
 }
 
-async function savePlacesForUser(
-  admin: SupabaseClient,
-  userId: string,
-  placeIds: string[],
-): Promise<void> {
-  const { data: places, error: placesError } = await admin
-    .from("places")
-    .select("id, thumbnail_url")
-    .in("id", placeIds);
-  if (placesError) throw placesError;
-  const thumbnails = new Map(
-    (places ?? []).map((place) => [place.id as string, place.thumbnail_url]),
-  );
-
-  const { error: savedError } = await admin.from("saved_places").upsert(
-    placeIds.map((placeId) => ({
-      user_id: userId,
-      place_id: placeId,
-      thumbnail_url: thumbnails.get(placeId) ?? null,
-    })),
-    { onConflict: "user_id,place_id", ignoreDuplicates: true },
-  );
-  if (savedError) throw savedError;
-}
-
 interface MatchedPlace {
   guess: PlaceGuess;
   place: KakaoPlace;
@@ -496,7 +608,7 @@ interface MatchedPlace {
 async function processReel(
   admin: SupabaseClient,
   reelId: string,
-  userId: string,
+  processingToken: string,
   instagramUrl: string,
 ): Promise<ProcessResult> {
   const stub = Deno.env.get("STUB_PROVIDERS") === "1";
@@ -511,7 +623,7 @@ async function processReel(
         reelId,
         message: error instanceof Error ? error.message : String(error),
       }));
-      return await fail(admin, reelId, "IG_FETCH_FAILED");
+      return await fail(admin, reelId, processingToken, "IG_FETCH_FAILED");
     }
     // 사진 게시물(/p/)의 og:image 는 정사각으로 잘려 있어 embed 의 원본 비율 주소를 우선 쓴다.
     let thumbnailSource = meta.thumbnailUrl;
@@ -530,7 +642,7 @@ async function processReel(
       ? (await rehostThumbnail(admin, `reels/${reelId}`, thumbnailSource)) ??
         thumbnailSource
       : null;
-    const { error: metadataUpdateError } = await admin
+    const { data: metadataReel, error: metadataUpdateError } = await admin
       .from("reels")
       .update({
         instagram_description: meta.description,
@@ -539,8 +651,12 @@ async function processReel(
           : {}),
         instagram_thumbnail_url: reelThumbnailUrl,
       })
-      .eq("id", reelId);
+      .eq("id", reelId)
+      .eq("processing_token", processingToken)
+      .select("id")
+      .maybeSingle();
     if (metadataUpdateError) throw metadataUpdateError;
+    if (!metadataReel) throw new Error("stale_reel_processing_attempt");
 
     const caption = meta.description;
     if (!caption) {
@@ -550,7 +666,12 @@ async function processReel(
         hasThumbnail: Boolean(meta.thumbnailUrl),
         hasCanonicalUrl: Boolean(meta.canonicalUrl),
       }));
-      return await fail(admin, reelId, "IG_CAPTION_NOT_FOUND");
+      return await fail(
+        admin,
+        reelId,
+        processingToken,
+        "IG_CAPTION_NOT_FOUND",
+      );
     }
 
     // 2. 정규식으로 찾은 도로명·지번 주소는 관측하고, 아래에서 AI가 주소를
@@ -566,7 +687,12 @@ async function processReel(
     // 원문에 실제 있는 문자열만 남긴다.
     const kakaoKey = Deno.env.get("KAKAO_REST_API_KEY");
     if (!stub && !kakaoKey) {
-      return await fail(admin, reelId, "PROVIDER_CONFIG_MISSING");
+      return await fail(
+        admin,
+        reelId,
+        processingToken,
+        "PROVIDER_CONFIG_MISSING",
+      );
     }
 
     let matchedPlaces: MatchedPlace[] = [];
@@ -596,7 +722,12 @@ async function processReel(
             reelId,
             message: error.message,
           }));
-          return await fail(admin, reelId, "PROVIDER_CONFIG_MISSING");
+          return await fail(
+            admin,
+            reelId,
+            processingToken,
+            "PROVIDER_CONFIG_MISSING",
+          );
         }
         throw error;
       }
@@ -622,7 +753,12 @@ async function processReel(
         ).length,
       }));
       if (extracted.length === 0 || guesses.length === 0) {
-        return await fail(admin, reelId, "GEMINI_PLACE_NOT_FOUND");
+        return await fail(
+          admin,
+          reelId,
+          processingToken,
+          "GEMINI_PLACE_NOT_FOUND",
+        );
       }
 
       const resolution = await resolvePlacesFromKakao(caption, guesses, {
@@ -640,9 +776,19 @@ async function processReel(
       matchedPlaces = resolution.matches;
       matchFailures.push(...resolution.failures);
     }
-    await persistPlaceMatchFailures(admin, reelId, matchFailures);
+    await persistPlaceMatchFailures(
+      admin,
+      reelId,
+      processingToken,
+      matchFailures,
+    );
     if (matchedPlaces.length === 0) {
-      return await fail(admin, reelId, "KAKAO_PLACE_NOT_FOUND");
+      return await fail(
+        admin,
+        reelId,
+        processingToken,
+        "KAKAO_PLACE_NOT_FOUND",
+      );
     }
 
     // 4. 선택된 모든 장소를 places/saved_places/reel_places에 순서대로 저장한다.
@@ -651,7 +797,7 @@ async function processReel(
       const placeId = await persistMatchedPlace(
         admin,
         reelId,
-        userId,
+        processingToken,
         position,
         match,
         // 장소 썸네일의 인스타 폴백에도 정사각(og:image) 대신 원본 비율 주소를 쓴다.
@@ -662,7 +808,7 @@ async function processReel(
     }
 
     // 5. 기존 앱 호환을 위해 reels.place_id는 첫 번째 장소를 가리킨다.
-    const { error: reelUpdateError } = await admin
+    const { data: completedReel, error: reelUpdateError } = await admin
       .from("reels")
       .update({
         place_id: placeIds[0],
@@ -675,8 +821,12 @@ async function processReel(
         processing_status: "COMPLETED",
         failure_reason: null,
       })
-      .eq("id", reelId);
+      .eq("id", reelId)
+      .eq("processing_token", processingToken)
+      .select("id")
+      .maybeSingle();
     if (reelUpdateError) throw reelUpdateError;
+    if (!completedReel) throw new Error("stale_reel_processing_attempt");
 
     return {
       status: "COMPLETED",
@@ -696,26 +846,35 @@ async function processReel(
           model: attempt.model,
         })),
       }));
-      return await fail(admin, reelId, aiFailureReason(error));
+      return await fail(
+        admin,
+        reelId,
+        processingToken,
+        aiFailureReason(error),
+      );
     }
     console.error(JSON.stringify({
       event: "reel_processing_failed",
       reelId,
       message: error instanceof Error ? error.message : String(error),
     }));
-    return await fail(admin, reelId, "UNKNOWN");
+    return await fail(admin, reelId, processingToken, "UNKNOWN");
   }
 }
 
 async function persistPlaceMatchFailures(
   admin: SupabaseClient,
   reelId: string,
+  processingToken: string,
   failures: PlaceMatchFailure[],
 ): Promise<void> {
   if (failures.length === 0) return;
 
   const { error } = await admin.from("reel_place_match_failures").upsert(
-    failures.map((failure) => placeMatchFailureRow(reelId, failure)),
+    failures.map((failure) => ({
+      ...placeMatchFailureRow(reelId, failure),
+      processing_token: processingToken,
+    })),
     { onConflict: "reel_id,guess_index" },
   );
   if (error) throw error;
@@ -724,7 +883,7 @@ async function persistPlaceMatchFailures(
 async function persistMatchedPlace(
   admin: SupabaseClient,
   reelId: string,
-  userId: string,
+  processingToken: string,
   position: number,
   { guess, place }: MatchedPlace,
   instagramThumbnailUrl: string | null,
@@ -779,27 +938,37 @@ async function persistMatchedPlace(
     if (error) throw error;
   }
 
-  const { error: savedPlaceError } = await admin
-    .from("saved_places")
-    .upsert(
-      {
-        user_id: userId,
-        place_id: placeRow.id,
-        thumbnail_url: thumbnail.url,
-      },
-      { onConflict: "user_id,place_id", ignoreDuplicates: true },
-    );
-  if (savedPlaceError) throw savedPlaceError;
-
-  const { error: reelPlaceError } = await admin
-    .from("reel_places")
-    .upsert(
-      { reel_id: reelId, place_id: placeRow.id, position },
-      { onConflict: "reel_id,place_id" },
-    );
-  if (reelPlaceError) throw reelPlaceError;
+  await persistReelPlaceResult(
+    admin,
+    reelId,
+    placeRow.id as string,
+    position,
+    thumbnail.url,
+    processingToken,
+  );
 
   return placeRow.id as string;
+}
+
+async function persistReelPlaceResult(
+  admin: SupabaseClient,
+  reelId: string,
+  placeId: string,
+  position: number,
+  thumbnailUrl: string | null,
+  processingToken: string | null = null,
+): Promise<string> {
+  const { data, error } = await admin.rpc("persist_reel_place_result", {
+    p_reel_id: reelId,
+    p_place_id: placeId,
+    p_position: position,
+    p_thumbnail_url: thumbnailUrl,
+    p_processing_token: processingToken,
+  });
+  if (error || typeof data !== "string") {
+    throw error ?? new Error("reel_place_result_missing");
+  }
+  return data;
 }
 
 interface ThumbnailResult {
@@ -943,11 +1112,13 @@ async function resolveThumbnail(
 async function fail(
   admin: SupabaseClient,
   reelId: string,
+  processingToken: string,
   reason: FailureReason,
 ): Promise<ProcessResult> {
   await admin
     .from("reels")
     .update({ processing_status: "FAILED", failure_reason: reason })
-    .eq("id", reelId);
+    .eq("id", reelId)
+    .eq("processing_token", processingToken);
   return { status: "FAILED", failureReason: reason };
 }

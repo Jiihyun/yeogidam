@@ -15,8 +15,11 @@ settings:
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
     SWIFT_VERSION: "5.0"
+    APP_DISPLAY_NAME: "여기담"
+    APP_GROUP_IDENTIFIER: group.com.yeogidam
     SUPABASE_URL: "https://hbbrgudsbvnwuylxqlta.supabase.co"
     SUPABASE_ANON_KEY: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhiYnJndWRzYnZud3V5bHhxbHRhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYxNzY3MTYsImV4cCI6MjEwMTc1MjcxNn0.cn1Kyqmpj9G0Q2znAI0BDaMus6wkhwvnkJhSS1sOIUo"
+    SAVE_INSTAGRAM_REEL_FUNCTION_SLUG: save-instagram-reel
 targets:
   Yeogidam:
     type: application
@@ -41,12 +44,12 @@ targets:
     info:
       path: Yeogidam/Info.plist
       properties:
-        CFBundleDisplayName: 여기담
+        CFBundleDisplayName: $(APP_DISPLAY_NAME)
         CFBundleURLTypes:
           - CFBundleTypeRole: Editor
-            CFBundleURLName: com.yeogidamm.app.auth
+            CFBundleURLName: $(PRODUCT_BUNDLE_IDENTIFIER).auth
             CFBundleURLSchemes:
-              - com.yeogidamm.app
+              - $(PRODUCT_BUNDLE_IDENTIFIER)
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -58,6 +61,31 @@ targets:
               NSIncludesSubdomains: true
         SUPABASE_URL: $(SUPABASE_URL)
         SUPABASE_ANON_KEY: $(SUPABASE_ANON_KEY)
+        APP_GROUP_IDENTIFIER: $(APP_GROUP_IDENTIFIER)
+        SAVE_INSTAGRAM_REEL_FUNCTION_SLUG: $(SAVE_INSTAGRAM_REEL_FUNCTION_SLUG)
+  YeogidamLocal:
+    type: application
+    platform: iOS
+    sources:
+      - Yeogidam
+    dependencies:
+      - package: Supabase
+        product: Supabase
+      - target: ShareExtensionLocal
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.jihyun.yeogidam
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_ENTITLEMENTS: Yeogidam/YeogidamLocal.entitlements
+        INFOPLIST_FILE: Yeogidam/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        APP_DISPLAY_NAME: "여기담 로컬"
+        APP_GROUP_IDENTIFIER: group.com.jihyun.yeogidam
+        SUPABASE_URL: "https://vowmaqcmwocrocfymyux.supabase.co"
+        SUPABASE_ANON_KEY: "sb_publishable_Zc-QlAbyxo3TzFJCnoFEqQ_8ssdrcBW"
+        SAVE_INSTAGRAM_REEL_FUNCTION_SLUG: save-instagram-reel-v2
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) LOCAL_BUILD"
   ShareExtension:
     type: app-extension
     platform: iOS
@@ -71,7 +99,7 @@ targets:
     info:
       path: ShareExtension/Info.plist
       properties:
-        CFBundleDisplayName: 여기담
+        CFBundleDisplayName: $(APP_DISPLAY_NAME)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.share-services
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
@@ -80,3 +108,31 @@ targets:
               NSExtensionActivationSupportsWebURLWithMaxCount: 1
         SUPABASE_URL: $(SUPABASE_URL)
         SUPABASE_ANON_KEY: $(SUPABASE_ANON_KEY)
+        APP_GROUP_IDENTIFIER: $(APP_GROUP_IDENTIFIER)
+        SAVE_INSTAGRAM_REEL_FUNCTION_SLUG: $(SAVE_INSTAGRAM_REEL_FUNCTION_SLUG)
+  ShareExtensionLocal:
+    type: app-extension
+    platform: iOS
+    sources:
+      - ShareExtension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.jihyun.yeogidam.ShareExtension
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_ENTITLEMENTS: ShareExtension/ShareExtensionLocal.entitlements
+        INFOPLIST_FILE: ShareExtension/Info.plist
+        APP_DISPLAY_NAME: "여기담 로컬"
+        APP_GROUP_IDENTIFIER: group.com.jihyun.yeogidam
+        SUPABASE_URL: "https://vowmaqcmwocrocfymyux.supabase.co"
+        SUPABASE_ANON_KEY: "sb_publishable_Zc-QlAbyxo3TzFJCnoFEqQ_8ssdrcBW"
+        SAVE_INSTAGRAM_REEL_FUNCTION_SLUG: save-instagram-reel-v2
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) LOCAL_BUILD"
+schemes:
+  YeogidamLocal:
+    build:
+      targets:
+        YeogidamLocal: all
+    run:
+      config: Debug
+    analyze:
+      config: Debug

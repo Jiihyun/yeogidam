@@ -1,7 +1,14 @@
 # 배포 및 운영 가이드
 
-- 기준일: 2026-08-11
+- 기준일: 2026-08-30
 - 대상: Supabase Cloud + iOS/Xcode
+
+Supabase 프로젝트는 다음과 같이 분리한다.
+
+| 환경 | 프로젝트 | Project ref | 기본 릴스 저장 Function |
+|---|---|---|---|
+| 개발·QA | `yeogidam develop` | `vowmaqcmwocrocfymyux` | `save-instagram-reel-v2` |
+| 운영 | `yeogidam demo` | `hbbrgudsbvnwuylxqlta` | `save-instagram-reel` |
 
 ## 1. 사전 요구 사항
 
@@ -107,26 +114,84 @@ Edge Function 로컬 실행:
 
 ```bash
 cp supabase/functions/.env.example supabase/functions/.env
-supabase functions serve save-instagram-reel \
-  --env-file supabase/functions/.env
+supabase functions serve --env-file supabase/functions/.env
 ```
+
+현재 CLI는 등록된 Function을 함께 serve하므로 v1과 v2를 각각 positional
+argument로 넘기지 않는다.
 
 외부 키 없이 파이프라인 구조만 검증하려면 로컬 환경에서만 `STUB_PROVIDERS=1`, 최종 상태를 응답으로 받으려면 `PIPELINE_SYNC=1`을 사용합니다. 스텁 모드에서는 장소 AI와 Kakao 설정을 읽지 않습니다. 두 값은 프로덕션 secret으로 등록하지 않습니다.
 
 ## 5. DB와 Function 배포
+
+대기함 API는 기존 앱의 자동 저장 계약을 유지하는 v1과 새 대기함 계약을 쓰는
+v2를 별도 slug로 운영한다.
+
+- v1: `/functions/v1/save-instagram-reel`
+- v2: `/functions/v1/save-instagram-reel-v2`
+
+`/functions/v1`의 `v1`은 Supabase Edge Function gateway 경로이고, API 버전은
+함수 이름의 `-v2`로 구분한다.
+
+배포 순서는 반드시 **DB migration → 업데이트된 v1 → v2**로 고정한다. DB보다
+Function을 먼저 배포하거나 v1보다 v2를 먼저 배포하면 전환 구간의 구버전 앱과
+v1/v2 경합 처리가 새 스키마 계약을 보장하지 못한다. 각 Function을 이름으로
+배포하고 `--prune`은 사용하지 않아 기존 `delete-account`와
+`gemini-quota-discord`를 삭제하지 않는다.
+
+개발·QA 프로젝트 배포:
+
+```bash
+supabase link --project-ref vowmaqcmwocrocfymyux
+supabase db push
+supabase functions deploy save-instagram-reel \
+  --project-ref vowmaqcmwocrocfymyux
+supabase functions deploy save-instagram-reel-v2 \
+  --project-ref vowmaqcmwocrocfymyux
+supabase functions deploy gemini-quota-discord \
+  --no-verify-jwt \
+  --project-ref vowmaqcmwocrocfymyux
+```
+
+`gemini-quota-discord`는 환경 간 Function 구성을 맞추기 위해 개발 프로젝트에도
+배포 상태를 유지한다. 단, 개발 프로젝트에는
+`DISCORD_GEMINI_ALERT_WEBHOOK_URL`, `MONITORING_WEBHOOK_USERNAME`,
+`MONITORING_WEBHOOK_PASSWORD`를 등록하지 않고, Google Cloud Monitoring 알림
+채널도 개발 URL에 연결하지 않으며, 개발 Discord 알림 시험 호출도 하지 않는다.
+실제 알림 설정과 호출은 운영 프로젝트에만 둔다.
+
+프론트와 백엔드가 함께 검증된 뒤 운영 프로젝트에 승격할 때도 같은 순서를
+사용한다.
 
 ```bash
 supabase link --project-ref hbbrgudsbvnwuylxqlta
 supabase db push
 supabase functions deploy save-instagram-reel \
   --project-ref hbbrgudsbvnwuylxqlta
+supabase functions deploy save-instagram-reel-v2 \
+  --project-ref hbbrgudsbvnwuylxqlta
 ```
 
-배포 후 확인:
+개발·QA 배포 후 확인:
 
 ```bash
 supabase migration list
-supabase functions list --project-ref hbbrgudsbvnwuylxqlta
+supabase functions list --project-ref vowmaqcmwocrocfymyux
+```
+
+Function 목록에서 `save-instagram-reel`, `save-instagram-reel-v2`,
+`gemini-quota-discord`가 모두 `ACTIVE`인지 확인한다. QA 앱과 Share Extension은
+다음 v2 경로를 사용해 저장 요청과 대기함 반영을 확인한다.
+
+```text
+https://vowmaqcmwocrocfymyux.supabase.co/functions/v1/save-instagram-reel-v2
+```
+
+동시에 v1 경로로 요청한 기존 앱 계약이 자동 저장을 계속 유지하는지 회귀
+검증한다.
+
+```text
+https://vowmaqcmwocrocfymyux.supabase.co/functions/v1/save-instagram-reel
 ```
 
 Supabase Dashboard에서 Anonymous sign-ins가 활성화되어 있어야 합니다.
@@ -155,9 +220,12 @@ open Yeogidam.xcodeproj
 ### Edge Function
 
 ```bash
-npx -y deno@2 fmt --check supabase/functions/save-instagram-reel
+npx -y deno@2 fmt --check \
+  supabase/functions/save-instagram-reel \
+  supabase/functions/save-instagram-reel-v2
 npx -y deno@2 test supabase/functions/save-instagram-reel/*_test.ts
 npx -y deno@2 check supabase/functions/save-instagram-reel/index.ts
+npx -y deno@2 check supabase/functions/save-instagram-reel-v2/index.ts
 ```
 
 ### DB
@@ -278,8 +346,10 @@ Edge Function은 Instagram fetch, 장소 AI 공급자·모델·fallback 여부, 
 
 - [ ] DB migration과 pgTAP 통과
 - [ ] Deno 테스트·format·typecheck 통과
-- [ ] Edge Function 배포 상태 `ACTIVE`
-- [ ] Function secrets 등록 및 테스트
+- [ ] DB migration → 업데이트된 v1 → v2 순서로 배포
+- [ ] `save-instagram-reel`, `save-instagram-reel-v2`, `gemini-quota-discord` 배포 상태 `ACTIVE`
+- [ ] 개발 프로젝트의 `gemini-quota-discord`는 배포만 유지하고 Discord secret·Monitoring 연결·시험 호출은 하지 않았는지 확인
+- [ ] 릴스 처리 Function secrets 등록 및 테스트 (개발 Discord secret 제외)
 - [ ] 장소 AI primary/fallback이 서로 다르고 선택한 공급자의 key/model이 모두 등록됐는지 확인
 - [ ] 키 회전은 해당 공급자 secret만 갱신하고, 공급자 전환은 `PLACE_AI_PRIMARY_PROVIDER`와 대상 key/model을 함께 변경했는지 확인
 - [ ] Kakao Local API 실제 후보의 `id`·`place_url` 확인
