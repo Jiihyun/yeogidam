@@ -2,7 +2,7 @@ import SwiftUI
 
 struct AddByURLSheet: View {
     let accessToken: String
-    let onSaved: () async -> Void
+    let onSaved: (SaveInstagramReelResponse) async -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var instagramURL = ""
@@ -26,7 +26,11 @@ struct AddByURLSheet: View {
                     }
                 }
             }
+            #if LOCAL_BUILD
+            .navigationTitle("릴스 분석")
+            #else
             .navigationTitle("릴스 저장")
+            #endif
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("취소") { dismiss() }
@@ -39,7 +43,11 @@ struct AddByURLSheet: View {
                         if isSaving {
                             ProgressView()
                         } else {
+                            #if LOCAL_BUILD
+                            Text("분석")
+                            #else
                             Text("저장")
+                            #endif
                         }
                     }
                     .disabled(isSaving || instagramURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -60,9 +68,17 @@ struct AddByURLSheet: View {
         defer { isSaving = false }
 
         do {
-            _ = try await YeogidamAPI(accessToken: accessToken).saveInstagramReel(url)
-            await onSaved()
+            let response = try await YeogidamAPI(accessToken: accessToken).saveInstagramReel(url)
+            #if LOCAL_BUILD
             dismiss()
+            Task {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                await onSaved(response)
+            }
+            #else
+            await onSaved(response)
+            dismiss()
+            #endif
         } catch {
             errorMessage = error.localizedDescription
         }

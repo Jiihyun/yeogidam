@@ -39,6 +39,73 @@ struct YeogidamAPI {
         return try decoder.decode(SaveInstagramReelResponse.self, from: data)
     }
 
+    #if LOCAL_BUILD
+    func fetchWaitingQueue() async throws -> [QueueReelRow] {
+        var components = restComponents(path: "reels")
+        components.queryItems = [
+            URLQueryItem(
+                name: "select",
+                value: "id,instagram_title,instagram_description,instagram_author_username,instagram_thumbnail_url,reel_places!inner(id,position,review_status,reviewed_at,place:places(id,name,category,source_address,road_address,address,latitude,longitude,kakao_place_url,thumbnail_url,photo_attribution))"
+            ),
+            URLQueryItem(name: "processing_status", value: "eq.COMPLETED"),
+            URLQueryItem(name: "save_mode", value: "eq.REVIEW_QUEUE"),
+            URLQueryItem(name: "reel_places.review_status", value: "eq.PENDING"),
+            URLQueryItem(name: "order", value: "created_at.desc"),
+            URLQueryItem(name: "reel_places.order", value: "position.asc"),
+        ]
+        let reels: [QueueReelRow] = try await get(components)
+        return reels.filter { !$0.pendingPlaces.isEmpty }
+    }
+
+    func fetchProcessingQueueReelIDs() async throws -> [UUID] {
+        var components = restComponents(path: "reels")
+        components.queryItems = [
+            URLQueryItem(name: "select", value: "id"),
+            URLQueryItem(name: "save_mode", value: "eq.REVIEW_QUEUE"),
+            URLQueryItem(name: "processing_status", value: "in.(PENDING,PROCESSING)"),
+        ]
+        let reels: [QueueProcessingRow] = try await get(components)
+        return reels.map(\.id)
+    }
+
+    func fetchQueueReelStates(ids: [UUID]) async throws -> [QueueReelStateRow] {
+        guard !ids.isEmpty else { return [] }
+
+        var components = restComponents(path: "reels")
+        components.queryItems = [
+            URLQueryItem(
+                name: "select",
+                value: "id,processing_status,failure_reason,save_mode"
+            ),
+            URLQueryItem(
+                name: "id",
+                value: "in.(\(ids.map(\.uuidString).joined(separator: ",")))"
+            ),
+        ]
+        return try await get(components)
+    }
+
+    func resolveQueueItems(ids: [UUID], action: QueueAction) async throws {
+        guard !ids.isEmpty else { return }
+
+        let url = YeogidamConfig.supabaseURL
+            .appendingPathComponent("rest/v1/rpc/resolve_queue_items")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyAuthHeaders(to: &request)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "p_reel_place_ids": ids.map(\.uuidString),
+            "p_action": action.rawValue,
+        ])
+        _ = try await data(
+            for: request,
+            acceptedStatusCodes: 200..<300,
+            mapsQueueErrors: true
+        )
+    }
+    #endif
+
     func fetchSnapshot() async throws -> SavedPlacesSnapshot {
         async let savedPlaces: [SavedPlaceRow] = fetchSavedPlaces()
         async let activeReels: [ReelRow] = fetchActiveReels()
@@ -115,13 +182,53 @@ struct YeogidamAPI {
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
     }
 
-    private func data(for request: URLRequest, acceptedStatusCodes: Range<Int>) async throws -> Data {
+    private func data(
+        for request: URLRequest,
+        acceptedStatusCodes: Range<Int>,
+        mapsQueueErrors: Bool = false
+    ) async throws -> Data {
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw YeogidamAPIError.invalidResponse }
         guard acceptedStatusCodes.contains(http.statusCode) else {
+            #if LOCAL_BUILD
+            if mapsQueueErrors {
+                let message = (try? decoder.decode(APIErrorResponse.self, from: data).message)
+                    ?? "요청이 실패했어요."
+                throw YeogidamAPIError.server(queueMessage(for: message))
+            }
+            #endif
             let message = String(data: data, encoding: .utf8) ?? "요청이 실패했어요."
             throw YeogidamAPIError.server(message)
         }
         return data
     }
+
+    #if LOCAL_BUILD
+    private func queueMessage(for message: String) -> String {
+        switch message {
+        case "queue_items_not_available", "queue_items_changed_during_request":
+            return "이미 처리된 장소가 있어요. 새로고침 후 다시 선택해주세요."
+        case "queue_selection_required":
+            return "저장하거나 삭제할 장소를 선택해주세요."
+        case "queue_selection_contains_duplicates_or_nulls":
+            return "선택한 장소 목록이 올바르지 않아요. 새로고침 후 다시 선택해주세요."
+        case "invalid_queue_action":
+            return "지원하지 않는 대기함 작업이에요."
+        case "authentication_required":
+            return "로그인이 필요해요."
+        default:
+            return message
+        }
+    }
+    #endif
 }
+
+#if LOCAL_BUILD
+private struct QueueProcessingRow: Decodable {
+    let id: UUID
+}
+
+private struct APIErrorResponse: Decodable {
+    let message: String
+}
+#endif

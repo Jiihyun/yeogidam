@@ -9,6 +9,10 @@ enum ProcessingStatus: String, Decodable {
 
 enum FailureReason: String, Decodable {
     case instagramFetchFailed = "IG_FETCH_FAILED"
+    case instagramCaptionNotFound = "IG_CAPTION_NOT_FOUND"
+    case providerConfigMissing = "PROVIDER_CONFIG_MISSING"
+    case geminiPlaceNotFound = "GEMINI_PLACE_NOT_FOUND"
+    case kakaoPlaceNotFound = "KAKAO_PLACE_NOT_FOUND"
     case placeNotFound = "PLACE_NOT_FOUND"
     case unknown = "UNKNOWN"
 
@@ -16,6 +20,14 @@ enum FailureReason: String, Decodable {
         switch self {
         case .instagramFetchFailed:
             return "릴스 정보를 가져오지 못했어요"
+        case .instagramCaptionNotFound:
+            return "릴스 캡션을 읽지 못했어요"
+        case .providerConfigMissing:
+            return "장소 분석 설정이 누락됐어요"
+        case .geminiPlaceNotFound:
+            return "캡션에서 장소 후보를 찾지 못했어요"
+        case .kakaoPlaceNotFound:
+            return "지도에서 일치하는 장소를 찾지 못했어요"
         case .placeNotFound:
             return "장소를 찾지 못했어요"
         case .unknown:
@@ -106,4 +118,121 @@ struct SavedPlacesSnapshot {
 struct SaveInstagramReelResponse: Decodable {
     let reelId: UUID
     let status: String?
+    #if LOCAL_BUILD
+    let saveMode: ReelSaveMode?
+    #endif
 }
+
+#if LOCAL_BUILD
+enum ReelSaveMode: String, Decodable {
+    case autoSave = "AUTO_SAVE"
+    case reviewQueue = "REVIEW_QUEUE"
+}
+
+enum QueueReviewStatus: String, Decodable {
+    case pending = "PENDING"
+    case saved = "SAVED"
+    case discarded = "DISCARDED"
+}
+
+enum QueueAction: String {
+    case save = "SAVE"
+    case discard = "DISCARD"
+
+    func confirmationTitle(count: Int) -> String {
+        switch self {
+        case .save:
+            return "\(count)개의 장소를 저장할까요?"
+        case .discard:
+            return "선택한 \(count)개의 장소를 삭제할까요?"
+        }
+    }
+}
+
+struct QueueReelPlaceRow: Identifiable, Decodable {
+    let id: UUID
+    let position: Int
+    let reviewStatus: QueueReviewStatus
+    let reviewedAt: String?
+    let place: PlaceRow
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case position
+        case reviewStatus = "review_status"
+        case reviewedAt = "reviewed_at"
+        case place
+    }
+}
+
+struct QueueReelRow: Identifiable, Decodable {
+    let id: UUID
+    let instagramTitle: String?
+    let instagramDescription: String?
+    let instagramAuthorUsername: String?
+    let instagramThumbnailURL: String?
+    let reelPlaces: [QueueReelPlaceRow]
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case instagramTitle = "instagram_title"
+        case instagramDescription = "instagram_description"
+        case instagramAuthorUsername = "instagram_author_username"
+        case instagramThumbnailURL = "instagram_thumbnail_url"
+        case reelPlaces = "reel_places"
+    }
+
+    var caption: String {
+        instagramDescription?.queueNonEmpty
+            ?? instagramTitle?.queueNonEmpty
+            ?? "캡션 없음"
+    }
+
+    var author: String {
+        guard let username = instagramAuthorUsername?.queueNonEmpty else {
+            return "작성자 정보 없음"
+        }
+        return username.hasPrefix("@") ? username : "@\(username)"
+    }
+
+    var pendingPlaces: [QueueReelPlaceRow] {
+        reelPlaces
+            .filter { $0.reviewStatus == .pending }
+            .sorted { $0.position < $1.position }
+    }
+}
+
+struct QueueReelStateRow: Identifiable, Decodable {
+    let id: UUID
+    let processingStatus: ProcessingStatus
+    let failureReason: FailureReason?
+    let saveMode: ReelSaveMode
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case processingStatus = "processing_status"
+        case failureReason = "failure_reason"
+        case saveMode = "save_mode"
+    }
+}
+
+extension PlaceRow {
+    var queueDisplayAddress: String {
+        sourceAddress?.queueNonEmpty
+            ?? roadAddress?.queueNonEmpty
+            ?? address?.queueNonEmpty
+            ?? "주소 정보 없음"
+    }
+
+    var queueDisplayCategory: String {
+        category?.queueNonEmpty ?? "카테고리 미분류"
+    }
+}
+
+private extension String {
+    var queueNonEmpty: String? {
+        let value = trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+}
+#endif
