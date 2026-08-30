@@ -216,6 +216,81 @@ struct QueueReelStateRow: Identifiable, Decodable {
     }
 }
 
+struct HistoryReelRow: Identifiable, Decodable {
+    let id: UUID
+    let instagramURL: String
+    let instagramTitle: String?
+    let instagramDescription: String?
+    let instagramAuthorUsername: String?
+    let instagramThumbnailURL: String?
+    let processingStatus: ProcessingStatus
+    let failureReason: FailureReason?
+    let saveMode: ReelSaveMode
+    let createdAt: String
+    /// History list requests omit this relationship. Detail requests include it,
+    /// including an empty array when analysis completed without a matched place.
+    let reelPlaces: [QueueReelPlaceRow]?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case instagramURL = "instagram_url"
+        case instagramTitle = "instagram_title"
+        case instagramDescription = "instagram_description"
+        case instagramAuthorUsername = "instagram_author_username"
+        case instagramThumbnailURL = "instagram_thumbnail_url"
+        case processingStatus = "processing_status"
+        case failureReason = "failure_reason"
+        case saveMode = "save_mode"
+        case createdAt = "created_at"
+        case reelPlaces = "reel_places"
+    }
+
+    var historyTitle: String {
+        if let title = instagramTitle?.queueNonEmpty {
+            return title
+        }
+
+        if let firstLine = instagramDescription?
+            .split(whereSeparator: { $0.isNewline })
+            .lazy
+            .map({ String($0).trimmingCharacters(in: .whitespacesAndNewlines) })
+            .first(where: { !$0.isEmpty }) {
+            return firstLine
+        }
+
+        return "Instagram 릴스"
+    }
+
+    var author: String {
+        guard let username = instagramAuthorUsername?.queueNonEmpty else {
+            return "작성자 정보 없음"
+        }
+        return username.hasPrefix("@") ? username : "@\(username)"
+    }
+
+    var orderedPlaces: [QueueReelPlaceRow] {
+        (reelPlaces ?? []).sorted { $0.position < $1.position }
+    }
+
+    var createdDate: Date? {
+        LocalHistoryDateParser.date(from: createdAt)
+    }
+
+    var historyCursor: HistoryCursor {
+        HistoryCursor(createdAt: createdAt, id: id)
+    }
+}
+
+struct HistoryCursor: Equatable {
+    let createdAt: String
+    let id: UUID
+}
+
+struct HistoryPage {
+    let reels: [HistoryReelRow]
+    let nextCursor: HistoryCursor?
+}
+
 extension PlaceRow {
     var queueDisplayAddress: String {
         sourceAddress?.queueNonEmpty
@@ -233,6 +308,20 @@ private extension String {
     var queueNonEmpty: String? {
         let value = trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : value
+    }
+}
+
+private enum LocalHistoryDateParser {
+    private static let fractionalFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let formatter = ISO8601DateFormatter()
+
+    static func date(from value: String) -> Date? {
+        fractionalFormatter.date(from: value) ?? formatter.date(from: value)
     }
 }
 #endif

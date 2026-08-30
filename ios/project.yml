@@ -68,6 +68,7 @@ targets:
     platform: iOS
     sources:
       - Yeogidam
+      - YeogidamLocalAssets.xcassets
     dependencies:
       - package: Supabase
         product: Supabase

@@ -31,7 +31,14 @@ struct WaitingQueueView: View {
             }
             .navigationTitle("대기함")
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    NavigationLink {
+                        HistoryView()
+                    } label: {
+                        Image(systemName: "clock.arrow.circlepath")
+                    }
+                    .accessibilityLabel("분석 히스토리")
+
                     Button {
                         showsAddSheet = true
                     } label: {
