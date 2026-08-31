@@ -9,7 +9,9 @@ import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 import { createRequestId, errorResponse } from "../_shared/error_code.ts";
 import { AiConfigError, AiProvidersExhaustedError } from "./ai/errors.ts";
 import { createPlaceAiClient } from "./ai/factory.ts";
-import type { PlaceAiClient } from "./ai/provider.ts";
+import { sanitizeAiRuntimeLogDetails } from "./ai/log_sanitizer.ts";
+import type { AiLog, PlaceAiClient } from "./ai/provider.ts";
+import { sendGeminiRuntimeDiscordAlert } from "./ai/runtime_alerts.ts";
 import type { PlaceGuess } from "./ai/types.ts";
 import { fetchInstagramMeta } from "./instagram.ts";
 import { extractKoreanAddresses } from "./address.ts";
@@ -97,6 +99,43 @@ function aiFailureReason(error: AiProvidersExhaustedError): FailureReason {
 
 const STALE_PROCESSING_MS = 15 * 60 * 1000;
 const PIPELINE_VERSION = 9;
+
+function createAiRuntimeLog(reelId: string): AiLog {
+  return (event, details) => {
+    console.info(JSON.stringify({
+      event,
+      reelId,
+      ...sanitizeAiRuntimeLogDetails(details),
+    }));
+    const delivery = sendGeminiRuntimeDiscordAlert(event, details, {
+      webhookUrl: Deno.env.get("DISCORD_GEMINI_ALERT_WEBHOOK_URL"),
+      log: (alertEvent, alertDetails) => {
+        console.info(JSON.stringify({
+          event: alertEvent,
+          reelId,
+          ...alertDetails,
+        }));
+      },
+    }).catch((error) => {
+      console.error(JSON.stringify({
+        event: "ai_runtime_discord_alert_unexpected_failure",
+        reelId,
+        sourceEvent: event,
+        errorName: error instanceof Error ? error.name : "unknown",
+      }));
+    });
+    try {
+      EdgeRuntime.waitUntil(delivery);
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "ai_runtime_discord_alert_scheduling_failed",
+        reelId,
+        sourceEvent: event,
+        errorName: error instanceof Error ? error.name : "unknown",
+      }));
+    }
+  };
+}
 
 // 로컬 검증 전용 스텁 (STUB_PROVIDERS=1 일 때만 사용). AI/Kakao 키 없이
 // 파이프라인 전체(추출→매칭→저장→썸네일)를 결정적으로 검증하기 위한 것.
@@ -711,9 +750,7 @@ async function processReel(
       let ai: PlaceAiClient;
       try {
         ai = createPlaceAiClient(Deno.env, {
-          log: (event, details) => {
-            console.info(JSON.stringify({ event, reelId, ...details }));
-          },
+          log: createAiRuntimeLog(reelId),
         });
       } catch (error) {
         if (error instanceof AiConfigError) {

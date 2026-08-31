@@ -12,6 +12,7 @@ export interface EnvReader {
 interface ProviderConfig {
   name: AiProviderName;
   apiKey: string;
+  fallbackApiKeys?: string[];
   extractionModel: string;
   judgmentModel: string;
   timeoutMs: number;
@@ -29,6 +30,12 @@ export interface PlaceAiFactoryDependencies {
 
 function value(env: EnvReader, name: string): string | null {
   return env.get(name)?.trim() || null;
+}
+
+function values(env: EnvReader, name: string): string[] {
+  const raw = env.get(name);
+  if (!raw) return [];
+  return raw.split(",").map((item) => item.trim()).filter(Boolean);
 }
 
 function providerName(
@@ -58,11 +65,20 @@ function loadProvider(
   if (name === "gemini") {
     const apiKey = value(env, "GEMINI_API_KEY");
     if (!apiKey) throw new AiConfigError("GEMINI_API_KEY is required");
+    const fallbackApiKeys = values(env, "GEMINI_API_KEY_FALLBACKS");
+    if (
+      new Set([apiKey, ...fallbackApiKeys]).size !== fallbackApiKeys.length + 1
+    ) {
+      throw new AiConfigError(
+        "GEMINI_API_KEY_FALLBACKS must contain unique keys",
+      );
+    }
     const extractionModel = value(env, "GEMINI_MODEL") ??
       "gemini-3.5-flash-lite";
     return {
       name,
       apiKey,
+      ...(fallbackApiKeys.length > 0 ? { fallbackApiKeys } : {}),
       extractionModel,
       judgmentModel: value(env, "GEMINI_MATCH_MODEL") ?? extractionModel,
       timeoutMs: requestTimeoutMs,
@@ -112,7 +128,13 @@ function createProvider(
     timeoutMs: config.timeoutMs,
   };
   return config.name === "gemini"
-    ? createGeminiProvider(providerConfig, { fetch: dependencies.fetch })
+    ? createGeminiProvider(
+      {
+        ...providerConfig,
+        fallbackApiKeys: config.fallbackApiKeys,
+      },
+      { fetch: dependencies.fetch, log: dependencies.log },
+    )
     : createOpenAiProvider(providerConfig, { fetch: dependencies.fetch });
 }
 
