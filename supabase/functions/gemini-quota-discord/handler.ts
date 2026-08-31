@@ -1,6 +1,20 @@
 type JsonRecord = Record<string, unknown>;
 
 export type QuotaKind = "RPM" | "RPD" | "TPM";
+export type ProjectRole = "primary" | "fallback";
+export type AlertSeverity = "WARNING";
+
+export type RpdAlertPolicy = {
+  quotaKind: "RPD";
+  projectRole: ProjectRole;
+  thresholdPercent: number;
+  severity: AlertSeverity;
+};
+
+export interface CloudIncidentDedupeStore {
+  claim(key: string): boolean;
+  release(key: string): void;
+}
 
 export type GeminiQuotaDiscordDependencies = {
   webhookUsername?: string;
@@ -12,6 +26,7 @@ export type GeminiQuotaDiscordDependencies = {
   ) => Promise<Response>;
   now?: () => Date;
   log?: (entry: Record<string, unknown>) => void;
+  dedupe?: CloudIncidentDedupeStore;
 };
 
 type Incident = JsonRecord & {
@@ -35,11 +50,48 @@ type AlertPayload = JsonRecord & {
 
 const QUOTA_DETAILS: Record<QuotaKind, string> = {
   RPM: "최근 1분 요청 수",
-  RPD: "오늘 누적 요청 수",
+  RPD: "최근 23시간 요청 수 (일일 한도 근사)",
   TPM: "최근 1분 입력 토큰 수",
 };
 
+const PROJECT_ROLE_NAMES: Record<ProjectRole, string> = {
+  primary: "Primary",
+  fallback: "Fallback",
+};
+
+const PROJECT_IDS: Record<ProjectRole, string> = {
+  primary: "gen-lang-client-0666690473",
+  fallback: "yeogidam",
+};
+
+const SUPPORTED_RPD_THRESHOLD_PERCENT = 80;
+const SUPPORTED_RPD_SEVERITY: AlertSeverity = "WARNING";
+
 const jsonHeaders = { "Content-Type": "application/json; charset=utf-8" };
+
+class InMemoryCloudIncidentDedupe implements CloudIncidentDedupeStore {
+  readonly #claimed = new Set<string>();
+
+  claim(key: string): boolean {
+    if (this.#claimed.has(key)) return false;
+    if (this.#claimed.size >= 1_000) {
+      const oldest = this.#claimed.values().next().value;
+      if (typeof oldest === "string") this.#claimed.delete(oldest);
+    }
+    this.#claimed.add(key);
+    return true;
+  }
+
+  release(key: string): void {
+    this.#claimed.delete(key);
+  }
+}
+
+const sharedIncidentDedupe = new InMemoryCloudIncidentDedupe();
+
+export function createInMemoryCloudIncidentDedupe(): CloudIncidentDedupeStore {
+  return new InMemoryCloudIncidentDedupe();
+}
 
 function jsonResponse(
   status: number,
@@ -65,10 +117,12 @@ function stringValue(value: unknown): string | null {
 }
 
 function numberValue(value: unknown): number | null {
-  const number = typeof value === "number"
-    ? value
-    : typeof value === "string"
-    ? Number(value)
+  const normalized = typeof value === "string" ? value.trim() : value;
+  if (normalized === "") return null;
+  const number = typeof normalized === "number"
+    ? normalized
+    : typeof normalized === "string"
+    ? Number(normalized)
     : Number.NaN;
   return Number.isFinite(number) ? number : null;
 }
@@ -124,18 +178,46 @@ export function quotaKindFromIncident(incident: Incident): QuotaKind | null {
   if (labeledKind === "RPM" || labeledKind === "RPD" || labeledKind === "TPM") {
     return labeledKind;
   }
-
-  const searchable = [
-    stringValue(incident.condition_name),
-    stringValue(incident.policy_name),
-  ].filter(Boolean).join(" ").toUpperCase();
-
-  for (const kind of ["RPM", "RPD", "TPM"] as const) {
-    if (new RegExp(`(?:^|[^A-Z])${kind}(?:$|[^A-Z])`).test(searchable)) {
-      return kind;
-    }
-  }
   return null;
+}
+
+function projectRoleFromIncident(incident: Incident): ProjectRole | null {
+  const role = firstString(
+    recordValue(incident.policy_user_labels, "project_role"),
+    recordValue(incident.policy_user_labels, "project-role"),
+  )?.toLowerCase();
+  return role === "primary" || role === "fallback" ? role : null;
+}
+
+function thresholdPercentFromIncident(incident: Incident): number | null {
+  const rawThreshold = firstString(
+    recordValue(incident.policy_user_labels, "threshold_percent"),
+    recordValue(incident.policy_user_labels, "threshold-percent"),
+  );
+  if (!rawThreshold) return null;
+
+  const threshold = numberValue(rawThreshold.replace(/%$/, ""));
+  return threshold !== null && threshold > 0 && threshold <= 100
+    ? threshold
+    : null;
+}
+
+function severityFromIncident(incident: Incident): AlertSeverity | null {
+  const severity = firstString(
+    recordValue(incident.policy_user_labels, "severity"),
+    recordValue(incident.policy_user_labels, "alert_severity"),
+  )?.toUpperCase();
+  return severity === SUPPORTED_RPD_SEVERITY ? severity : null;
+}
+
+function sourceProjectIdFromIncident(incident: Incident): string | null {
+  const metricLabels = asRecord(asRecord(incident.metric)?.labels);
+  const resourceLabels = asRecord(asRecord(incident.resource)?.labels);
+  return firstString(
+    resourceLabels?.resource_container,
+    resourceLabels?.project_id,
+    metricLabels?.resource_container,
+  );
 }
 
 function kstTimestamp(date: Date): string {
@@ -155,9 +237,14 @@ function kstTimestamp(date: Date): string {
   } KST`;
 }
 
-function formatPercent(ratio: number | null): string {
-  if (ratio === null || ratio < 0) return "80% 이상";
+function formatObservedPercent(ratio: number | null): string {
+  if (ratio === null || ratio < 0) return "사용률 정보 없음";
   const percent = ratio * 100;
+  const digits = Number.isInteger(percent) ? 0 : 1;
+  return `${percent.toFixed(digits)}%`;
+}
+
+function formatThresholdPercent(percent: number): string {
   const digits = Number.isInteger(percent) ? 0 : 1;
   return `${percent.toFixed(digits)}%`;
 }
@@ -170,7 +257,7 @@ function truncate(value: string, maxLength: number): string {
 
 export function discordPayloadForIncident(
   incident: Incident,
-  quotaKind: QuotaKind,
+  policy: RpdAlertPolicy,
   fallbackDate: Date,
 ): Record<string, unknown> {
   const metric = asRecord(incident.metric);
@@ -181,22 +268,37 @@ export function discordPayloadForIncident(
   const detectedAt = startedAt !== null
     ? new Date(startedAt * 1_000)
     : fallbackDate;
-  const percentage = formatPercent(numberValue(incident.observed_value));
+  const observedPercentage = formatObservedPercent(
+    numberValue(incident.observed_value),
+  );
+  const thresholdPercentage = formatThresholdPercent(policy.thresholdPercent);
+  const projectRole = PROJECT_ROLE_NAMES[policy.projectRole];
   const model = firstString(
     metricLabels?.model,
     resourceLabels?.model,
   ) ?? "모델 정보 없음";
   const project = firstString(
+    sourceProjectIdFromIncident(incident),
     incident.scoping_project_id,
-    resourceLabels?.project_id,
   ) ?? "프로젝트 정보 없음";
   const limitName = firstString(metricLabels?.limit_name);
   const incidentUrl = stringValue(incident.url);
   const detectedAtText = kstTimestamp(detectedAt);
 
   const fields: Array<Record<string, unknown>> = [
-    { name: "사용량 기준", value: QUOTA_DETAILS[quotaKind], inline: true },
-    { name: "현재 사용률", value: percentage, inline: true },
+    { name: "프로젝트 역할", value: projectRole, inline: true },
+    { name: "알림 등급", value: policy.severity, inline: true },
+    {
+      name: "설정 임계치",
+      value: thresholdPercentage,
+      inline: true,
+    },
+    {
+      name: "사용량 기준",
+      value: QUOTA_DETAILS[policy.quotaKind],
+      inline: true,
+    },
+    { name: "현재 사용률", value: observedPercentage, inline: true },
     { name: "감지 시각", value: detectedAtText, inline: false },
     { name: "모델", value: truncate(model, 1_024), inline: true },
     {
@@ -216,15 +318,16 @@ export function discordPayloadForIncident(
   return {
     username: "여기담 Gemini 모니터링",
     content: truncate(
-      `⚠️ Gemini ${quotaKind} 사용량이 ${percentage}에 도달했습니다 · ${detectedAtText}`,
+      `⚠️ ${policy.severity} · Gemini ${projectRole} RPD 사용량이 ${observedPercentage}에 도달했습니다 (경고선 ${thresholdPercentage}) · ${detectedAtText}`,
       2_000,
     ),
     allowed_mentions: { parse: [] },
     embeds: [{
-      title: `Gemini ${quotaKind} 80% 이상`,
-      description: `${
-        QUOTA_DETAILS[quotaKind]
-      }가 설정한 경고선에 도달했습니다.`,
+      title:
+        `[WARN][${projectRole.toUpperCase()}] Gemini RPD ${thresholdPercentage}`,
+      description: `${projectRole} 프로젝트의 ${
+        QUOTA_DETAILS[policy.quotaKind]
+      }가 ${thresholdPercentage} 경고선에 도달했습니다.`,
       color: 0xF59E0B,
       ...(incidentUrl ? { url: incidentUrl } : {}),
       fields,
@@ -286,12 +389,48 @@ export async function handleGeminiQuotaDiscord(
 
   const quotaKind = quotaKindFromIncident(incident);
   if (!quotaKind) return ignored("unknown_quota_kind");
+  if (quotaKind !== "RPD") return ignored("unsupported_quota_kind");
+
+  const projectRole = projectRoleFromIncident(incident);
+  if (!projectRole) return ignored("unknown_project_role");
+
+  const sourceProjectId = sourceProjectIdFromIncident(incident);
+  if (!sourceProjectId) return ignored("missing_source_project");
+  if (sourceProjectId !== PROJECT_IDS[projectRole]) {
+    return ignored("project_role_mismatch");
+  }
+
+  const thresholdPercent = thresholdPercentFromIncident(incident);
+  if (thresholdPercent === null) return ignored("invalid_threshold");
+  if (thresholdPercent !== SUPPORTED_RPD_THRESHOLD_PERCENT) {
+    return ignored("unsupported_threshold");
+  }
+
+  const severity = severityFromIncident(incident);
+  if (!severity) return ignored("unsupported_severity");
+
+  const policy: RpdAlertPolicy = {
+    quotaKind,
+    projectRole,
+    thresholdPercent,
+    severity,
+  };
 
   const discordPayload = discordPayloadForIncident(
     incident,
-    quotaKind,
+    policy,
     (dependencies.now ?? (() => new Date()))(),
   );
+
+  const incidentId = stringValue(incident.incident_id);
+  const dedupeKey = [
+    incidentId ?? stringValue(incident.policy_name) ?? "missing-id",
+    projectRole,
+    sourceProjectId,
+    numberValue(incident.started_at)?.toString() ?? "missing-start",
+  ].join(":");
+  const dedupe = dependencies.dedupe ?? sharedIncidentDedupe;
+  if (!dedupe.claim(dedupeKey)) return ignored("duplicate_incident");
 
   let discordResponse: Response;
   try {
@@ -301,20 +440,28 @@ export async function handleGeminiQuotaDiscord(
       body: JSON.stringify(discordPayload),
     });
   } catch (error) {
+    dedupe.release(dedupeKey);
     dependencies.log?.({
       event: "gemini_quota_discord_delivery_failed",
       incidentId: stringValue(incident.incident_id),
       quotaKind,
+      projectRole,
+      thresholdPercent,
+      severity,
       errorName: error instanceof Error ? error.name : "unknown",
     });
     return jsonResponse(502, { ok: false, error: "discord_unavailable" });
   }
 
   if (!discordResponse.ok) {
+    dedupe.release(dedupeKey);
     dependencies.log?.({
       event: "gemini_quota_discord_delivery_rejected",
       incidentId: stringValue(incident.incident_id),
       quotaKind,
+      projectRole,
+      thresholdPercent,
+      severity,
       upstreamStatus: discordResponse.status,
     });
     return jsonResponse(502, { ok: false, error: "discord_rejected" });
@@ -324,6 +471,9 @@ export async function handleGeminiQuotaDiscord(
     event: "gemini_quota_discord_delivered",
     incidentId: stringValue(incident.incident_id),
     quotaKind,
+    projectRole,
+    thresholdPercent,
+    severity,
   });
   return new Response(null, { status: 204 });
 }

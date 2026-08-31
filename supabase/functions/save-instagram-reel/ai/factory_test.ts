@@ -47,6 +47,25 @@ Deno.test("loads backward-compatible Gemini defaults", () => {
   });
 });
 
+Deno.test("loads ordered Gemini fallback API keys", () => {
+  assertEquals(
+    loadPlaceAiConfig(env({
+      GEMINI_API_KEY: " primary-key ",
+      GEMINI_API_KEY_FALLBACKS: " fallback-one, , fallback-two ",
+    })),
+    {
+      primary: {
+        name: "gemini",
+        apiKey: "primary-key",
+        fallbackApiKeys: ["fallback-one", "fallback-two"],
+        extractionModel: "gemini-3.5-flash-lite",
+        judgmentModel: "gemini-3.5-flash-lite",
+        timeoutMs: 10_000,
+      },
+    },
+  );
+});
+
 Deno.test("loads distinct primary and fallback provider models", () => {
   assertEquals(
     loadPlaceAiConfig(env({
@@ -101,6 +120,14 @@ Deno.test("rejects invalid provider configuration", () => {
       })),
     "PLACE_AI_TIMEOUT_MS must be 1000-120000",
   );
+  assertConfigError(
+    () =>
+      loadPlaceAiConfig(env({
+        GEMINI_API_KEY: "same-key",
+        GEMINI_API_KEY_FALLBACKS: "fallback-key, same-key, fallback-key",
+      })),
+    "GEMINI_API_KEY_FALLBACKS must contain unique keys",
+  );
 });
 
 Deno.test("factory wires the configured primary through injected fetch", async () => {
@@ -131,3 +158,39 @@ Deno.test("factory wires the configured primary through injected fetch", async (
     fallbackUsed: false,
   });
 });
+
+Deno.test(
+  "factory exhausts Gemini API keys before using provider fallback",
+  async () => {
+    const geminiKeys: Array<string | null> = [];
+    const request = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("generativelanguage.googleapis.com")) {
+        geminiKeys.push(new Headers(init?.headers).get("x-goog-api-key"));
+        return Promise.resolve(
+          new Response("sensitive upstream body", { status: 429 }),
+        );
+      }
+      return Promise.resolve(Response.json({
+        output_text: JSON.stringify({ places: [] }),
+      }));
+    }) as typeof fetch;
+    const client = createPlaceAiClient(
+      env({
+        PLACE_AI_PRIMARY_PROVIDER: "gemini",
+        PLACE_AI_FALLBACK_PROVIDER: "openai",
+        GEMINI_API_KEY: "gemini-primary",
+        GEMINI_API_KEY_FALLBACKS: "gemini-secondary",
+        OPENAI_API_KEY: "openai-key",
+        OPENAI_MODEL: "gpt-test",
+      }),
+      { fetch: request },
+    );
+
+    const result = await client.extractPlaces("장소가 없는 캡션");
+
+    assertEquals(geminiKeys, ["gemini-primary", "gemini-secondary"]);
+    assertEquals(result.provider, "openai");
+    assertEquals(result.fallbackUsed, true);
+  },
+);
