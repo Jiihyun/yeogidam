@@ -654,7 +654,8 @@ async function processReel(
         userId,
         position,
         match,
-        meta.thumbnailUrl,
+        // 장소 썸네일의 인스타 폴백에도 정사각(og:image) 대신 원본 비율 주소를 쓴다.
+        thumbnailSource,
         stub,
       );
       placeIds.push(placeId);
