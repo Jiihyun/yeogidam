@@ -5,7 +5,9 @@
 // 이를 내려받아 리사이즈(긴 변 640px, JPEG q78)한 뒤 스토리지의 같은 경로에 덮어쓴다.
 // DB 의 썸네일 주소는 이미 스토리지 공개 URL 이라 건드리지 않는다.
 //
-// embed 에서 원본을 못 찾은 행은 건너뛰므로(현상 유지) 여러 번 실행해도 안전하다.
+// 캐시 무효화를 위해 기존 경로에 덮어쓰지 않고 새 경로("reels/{id}-v2.jpg")로 올린 뒤
+// DB 주소를 교체한다(주소가 바뀌어야 클라이언트가 캐시를 버리고 새로 받아간다).
+// 이미 -v2 주소인 행과 embed 에서 원본을 못 찾은 행은 건너뛰므로 여러 번 실행해도 안전하다.
 // 같은 게시물을 여러 사용자가 저장한 경우 embed 요청은 한 번만 보낸다.
 //
 // 사용법:
@@ -67,10 +69,15 @@ console.log(`사진 게시물 ${reels.length}건 처리 시작`);
 const displayUrlCache = new Map();
 let done = 0;
 let noOriginal = 0;
+let skipped = 0;
 let failed = 0;
 
 for (const reel of reels) {
   try {
+    if (reel.instagram_thumbnail_url.includes("-v2.jpg")) {
+      skipped += 1;
+      continue; // 이미 교체된 행
+    }
     let freshUrl;
     if (displayUrlCache.has(reel.instagram_url)) {
       freshUrl = displayUrlCache.get(reel.instagram_url);
@@ -108,7 +115,7 @@ for (const reel of reels) {
       // 디코딩 실패 시 원본 그대로 올린다.
     }
 
-    const path = `reels/${reel.id}.jpg`;
+    const path = `reels/${reel.id}-v2.jpg`;
     const { error: upError } = await supabase.storage
       .from(BUCKET)
       .upload(path, after, {
@@ -118,6 +125,13 @@ for (const reel of reels) {
       });
     if (upError) throw new Error(`업로드 실패 - ${upError.message}`);
 
+    const publicUrl = `${url.replace(/\/$/, "")}/storage/v1/object/public/${BUCKET}/${path}`;
+    const { error: dbError } = await supabase
+      .from("reels")
+      .update({ instagram_thumbnail_url: publicUrl })
+      .eq("id", reel.id);
+    if (dbError) throw new Error(`DB 갱신 실패 - ${dbError.message}`);
+
     done += 1;
     console.log(`${reel.id}: ${width}x${height} 원본 비율로 교체 완료`);
   } catch (e) {
@@ -126,4 +140,4 @@ for (const reel of reels) {
   }
 }
 
-console.log(`\n교체 ${done}건, 원본 못 찾음 ${noOriginal}건, 실패 ${failed}건`);
+console.log(`\n교체 ${done}건, 원본 못 찾음 ${noOriginal}건, 건너뜀 ${skipped}건, 실패 ${failed}건`);
