@@ -29,6 +29,10 @@ Deno.test("extracts basement, building, and unit address details", () => {
     extractKoreanAddress("경기 성남시 판교역로 12 101동 202호"),
     "경기 성남시 판교역로 12 101동 202호",
   );
+  assertEquals(
+    extractKoreanAddress("서울 강남구 도산대로23길 17 1, 2F"),
+    "서울 강남구 도산대로23길 17 1, 2F",
+  );
 });
 
 Deno.test("does not depend on a place marker or emoji", () => {
@@ -42,7 +46,7 @@ Deno.test("does not depend on a place marker or emoji", () => {
   );
 });
 
-Deno.test("extracts every distinct road address in caption order", () => {
+Deno.test("extracts every distinct address in caption order", () => {
   const caption = `
     서울 서대문구 연희맛로 17-63 2층
     광주 동구 제봉로110번길 17 1층
@@ -52,5 +56,19 @@ Deno.test("extracts every distinct road address in caption order", () => {
   assertEquals(extractKoreanAddresses(caption), [
     "서울 서대문구 연희맛로 17-63 2층",
     "광주 동구 제봉로110번길 17 1층",
+  ]);
+});
+
+Deno.test("extracts ordinary and numbered-ga jibun addresses", () => {
+  const caption = [
+    "쉘터 전남광주 동구 금남로5가 1-27",
+    "손정보쌈 서울 금천구 가산동 371-6",
+    "외식365 부산 동래구 명륜동 680-16",
+  ].join("\n");
+
+  assertEquals(extractKoreanAddresses(caption), [
+    "광주 동구 금남로5가 1-27",
+    "서울 금천구 가산동 371-6",
+    "부산 동래구 명륜동 680-16",
   ]);
 });

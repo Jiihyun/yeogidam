@@ -5,9 +5,17 @@ const SIDO =
 
 const ROAD_ADDRESS =
   `(?:${SIDO})\\s*[가-힣]{1,10}(?:시|군|구)\\s*[가-힣0-9]{1,20}(?:로|길)\\s*\\d+(?:-\\d+)?`;
+const JIBUN_AREA = `(?:[가-힣]{1,20}(?:동|읍|면|리)|[가-힣]{1,20}\\d+가)`;
+const JIBUN_ADDRESS =
+  `(?:${SIDO})\\s*[가-힣]{1,10}(?:시|군|구)\\s*${JIBUN_AREA}\\s*(?:산\\s*)?\\d+(?:-\\d+)?`;
 const ADDRESS_DETAIL =
-  `(?:\\s+(?:(?:지하\\s*)?\\d+\\s*층|B\\d+\\s*층|\\d+\\s*동|\\d+\\s*호))*`;
-const ADDRESS_RE = new RegExp(`${ROAD_ADDRESS}${ADDRESS_DETAIL}`, "gi");
+  `(?:\\s+(?:(?:지하\\s*)?\\d+\\s*층|B\\d+\\s*층|\\d+(?:\\s*,\\s*\\d+)*\\s*F|\\d+\\s*동|\\d+\\s*호))*`;
+const ADDRESS_RE = new RegExp(
+  // 금남로5가처럼 "로+숫자+가"인 법정동을 도로명+건물번호로 먼저
+  // 잘라 먹지 않도록 지번 주소를 먼저 시도한다.
+  `(?:${JIBUN_ADDRESS}|${ROAD_ADDRESS})${ADDRESS_DETAIL}`,
+  "gi",
+);
 
 export function extractKoreanAddresses(
   text: string | null | undefined,

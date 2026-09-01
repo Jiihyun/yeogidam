@@ -1,8 +1,11 @@
 import {
   buildKakaoMapURL,
   KakaoPlaceSearchError,
+  parseKakaoAddressCoordinates,
   parseKakaoPlaces,
+  searchKakaoAddressCoordinates,
   searchKakaoPlaces,
+  searchKakaoPlacesNearAddress,
 } from "./kakao.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
@@ -16,10 +19,12 @@ function assertEquals(actual: unknown, expected: unknown): void {
 async function rejectedSearch(
   result: number | Error | Response,
 ): Promise<KakaoPlaceSearchError> {
-  const request = (async () => {
-    if (result instanceof Error) throw result;
-    if (result instanceof Response) return result;
-    return new Response("upstream failure", { status: result });
+  const request = (() => {
+    if (result instanceof Error) return Promise.reject(result);
+    if (result instanceof Response) return Promise.resolve(result);
+    return Promise.resolve(
+      new Response("upstream failure", { status: result }),
+    );
   }) as typeof fetch;
 
   try {
@@ -80,12 +85,11 @@ Deno.test("drops malformed Kakao documents and invalid coordinates", () => {
 Deno.test("returns an empty list only for a successful empty Kakao response", async () => {
   let requestedUrl = "";
   let authorization = "";
-  const request =
-    (async (input: string | URL | Request, init?: RequestInit) => {
-      requestedUrl = String(input);
-      authorization = new Headers(init?.headers).get("Authorization") ?? "";
-      return Response.json({ documents: [] });
-    }) as typeof fetch;
+  const request = ((input: string | URL | Request, init?: RequestInit) => {
+    requestedUrl = String(input);
+    authorization = new Headers(init?.headers).get("Authorization") ?? "";
+    return Promise.resolve(Response.json({ documents: [] }));
+  }) as typeof fetch;
 
   const places = await searchKakaoPlaces("오우드", "test-key", request);
   const url = new URL(requestedUrl);
@@ -159,4 +163,137 @@ Deno.test("does not treat a malformed successful Kakao response as zero candidat
     new Response("not-json", { status: 200 }),
   );
   assertEquals(malformedJson.kind, "INVALID_RESPONSE");
+});
+
+Deno.test("geocodes a detailed address with the Kakao address endpoint", async () => {
+  const payload = {
+    documents: [{
+      address_name: "서울 강남구 역삼동 825-20",
+      address_type: "ROAD_ADDR",
+      x: "127.027621",
+      y: "37.497942",
+      address: { address_name: "서울 강남구 역삼동 825-20" },
+      road_address: { address_name: "서울 강남구 테헤란로1길 20" },
+    }],
+  };
+  assertEquals(parseKakaoAddressCoordinates(payload), [{
+    latitude: 37.497942,
+    longitude: 127.027621,
+    roadAddress: "서울 강남구 테헤란로1길 20",
+    address: "서울 강남구 역삼동 825-20",
+  }]);
+
+  let requestedUrl = "";
+  let authorization = "";
+  const request = ((
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    requestedUrl = String(input);
+    authorization = new Headers(init?.headers).get("Authorization") ?? "";
+    return Promise.resolve(Response.json(payload));
+  }) as typeof fetch;
+
+  const coordinates = await searchKakaoAddressCoordinates(
+    "서울 강남구 테헤란로1길 20 2층",
+    "test-key",
+    request,
+  );
+  const url = new URL(requestedUrl);
+  assertEquals(coordinates, [{
+    latitude: 37.497942,
+    longitude: 127.027621,
+    roadAddress: "서울 강남구 테헤란로1길 20",
+    address: "서울 강남구 역삼동 825-20",
+  }]);
+  assertEquals(url.pathname, "/v2/local/search/address.json");
+  assertEquals(url.searchParams.get("query"), "서울 강남구 테헤란로1길 20");
+  assertEquals(url.searchParams.get("analyze_type"), "exact");
+  assertEquals(authorization, "KakaoAK test-key");
+
+  await searchKakaoAddressCoordinates(
+    "서울 강남구 도산대로23길 17 1, 2F",
+    "test-key",
+    request,
+  );
+  assertEquals(
+    new URL(requestedUrl).searchParams.get("query"),
+    "서울 강남구 도산대로23길 17",
+  );
+});
+
+Deno.test("returns an empty list only for a valid empty address search", async () => {
+  const empty =
+    (() => Promise.resolve(Response.json({ documents: [] }))) as typeof fetch;
+  assertEquals(
+    await searchKakaoAddressCoordinates("서울 강남구 없는로 1", "key", empty),
+    [],
+  );
+
+  const malformed = (() =>
+    Promise.resolve(Response.json({
+      documents: [{ x: "invalid", y: "37.5" }],
+    }))) as typeof fetch;
+  try {
+    await searchKakaoAddressCoordinates(
+      "서울 강남구 잘못된로 1",
+      "key",
+      malformed,
+    );
+  } catch (error) {
+    assertEquals(error instanceof KakaoPlaceSearchError, true);
+    assertEquals((error as KakaoPlaceSearchError).kind, "INVALID_RESPONSE");
+    return;
+  }
+  throw new Error("Expected malformed address coordinates to reject");
+});
+
+Deno.test("searches a place name near an address coordinate by distance", async () => {
+  let requestedUrl = "";
+  const request = ((input: string | URL | Request) => {
+    requestedUrl = String(input);
+    return Promise.resolve(Response.json({
+      documents: [{
+        id: "312908843",
+        place_name: "동두천솥뚜껑삼겹살 강남역점",
+        address_name: "서울 강남구 역삼동 825-20",
+        road_address_name: "서울 강남구 테헤란로1길 20",
+        x: "127.027621",
+        y: "37.497942",
+      }],
+    }));
+  }) as typeof fetch;
+
+  const places = await searchKakaoPlacesNearAddress(
+    "동두천솥뚜껑삼겹살",
+    { latitude: 37.497942, longitude: 127.027621 },
+    "test-key",
+    request,
+  );
+  const url = new URL(requestedUrl);
+  assertEquals(places.map((place) => place.kakaoPlaceId), ["312908843"]);
+  assertEquals(url.pathname, "/v2/local/search/keyword.json");
+  assertEquals(url.searchParams.get("query"), "동두천솥뚜껑삼겹살");
+  assertEquals(url.searchParams.get("x"), "127.027621");
+  assertEquals(url.searchParams.get("y"), "37.497942");
+  assertEquals(url.searchParams.get("radius"), "300");
+  assertEquals(url.searchParams.get("sort"), "distance");
+  assertEquals(url.searchParams.get("size"), "15");
+});
+
+Deno.test("caps an address-nearby search radius at 500 meters", async () => {
+  let requestedUrl = "";
+  const request = ((input: string | URL | Request) => {
+    requestedUrl = String(input);
+    return Promise.resolve(Response.json({ documents: [] }));
+  }) as typeof fetch;
+
+  await searchKakaoPlacesNearAddress(
+    "춘식당",
+    { latitude: 37.52, longitude: 127.03 },
+    "key",
+    request,
+    5000,
+  );
+  assertEquals(new URL(requestedUrl).searchParams.get("radius"), "500");
 });

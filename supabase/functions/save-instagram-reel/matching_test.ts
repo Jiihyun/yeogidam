@@ -1,4 +1,5 @@
 import type { PlaceGuess } from "./ai/types.ts";
+import { extractKoreanAddresses } from "./address.ts";
 import {
   buildKakaoQueries,
   classifyKakaoCandidates,
@@ -10,6 +11,8 @@ import {
   resolveAiSelectedKakaoPlace,
   resolveRetriedKakaoPlace,
   sanitizePlaceGuesses,
+  validateKakaoCandidate,
+  withCaptionAddresses,
   withCaptionRegionHints,
 } from "./matching.ts";
 import type { KakaoPlace } from "./kakao.ts";
@@ -30,7 +33,13 @@ function guess(
   return {
     placeName,
     address,
-    addressType: address?.includes("로 ") ? "ROAD" : address ? "JIBUN" : "NONE",
+    addressType: address &&
+        !/[가-힣]\d+가\s*(?:산\s*)?\d/.test(address) &&
+        /(?:대로|로|길)\s*\d/.test(address)
+      ? "ROAD"
+      : address
+      ? "JIBUN"
+      : "NONE",
     region,
   };
 }
@@ -662,6 +671,518 @@ Deno.test("keeps extracted location evidence with its nearest place", () => {
   ], "미쁘동 다녀왔어요");
   assertEquals(storeNameAsAddress[0].address, null);
   assertEquals(storeNameAsAddress[0].region, null);
+});
+
+Deno.test("adds a regex caption address only to its nearest place", () => {
+  const caption = [
+    "동두천솥뚜껑삼겹살",
+    "서울 강남구 테헤란로1길 20 2층",
+  ].join("\n");
+  const source = guess("동두천솥뚜껑삼겹살", null, null);
+
+  assertEquals(
+    withCaptionAddresses(
+      [source],
+      caption,
+      ["서울 강남구 테헤란로1길 20 2층"],
+    ),
+    [guess(
+      "동두천솥뚜껑삼겹살",
+      "서울 강남구 테헤란로1길 20 2층",
+      null,
+    )],
+  );
+});
+
+Deno.test("keeps regex addresses paired in a multi-place caption", () => {
+  const caption = [
+    "📍 로컬타코야키",
+    "• 서울 광진구 군자로 166 1층",
+    "📍 윤숲 후루츠산도점",
+    "• 서울 광진구 면목로7길 8 1층",
+  ].join("\n");
+  const sources = [
+    guess("로컬타코야키", null, null),
+    guess("윤숲 후루츠산도점", null, null),
+  ];
+
+  assertEquals(
+    withCaptionAddresses(sources, caption, [
+      "서울 광진구 군자로 166 1층",
+      "서울 광진구 면목로7길 8 1층",
+    ]),
+    [
+      guess("로컬타코야키", "서울 광진구 군자로 166 1층", null),
+      guess("윤숲 후루츠산도점", "서울 광진구 면목로7길 8 1층", null),
+    ],
+  );
+});
+
+Deno.test("adds a nearby regex jibun address with its correct type", () => {
+  const caption = "손정보쌈\n서울 금천구 가산동 371-6";
+  assertEquals(
+    withCaptionAddresses(
+      [guess("손정보쌈", null, null)],
+      caption,
+      ["서울 금천구 가산동 371-6"],
+    ),
+    [{
+      placeName: "손정보쌈",
+      address: "서울 금천구 가산동 371-6",
+      addressType: "JIBUN",
+      region: null,
+    }],
+  );
+});
+
+Deno.test("adds production caption addresses across presentation metadata", () => {
+  const cases = [{
+    placeName: "쉘터",
+    caption: "📍 쉘터 🌀10:30-20:00 (연중무휴) ✅ 전남광주 동구 금남로5가 1-27",
+    address: "광주 동구 금남로5가 1-27",
+    addressType: "JIBUN",
+  }, {
+    placeName: "춘식당",
+    caption: "#춘식당 📍 서울 강남구 도산대로23길 17 1, 2F",
+    address: "서울 강남구 도산대로23길 17 1, 2F",
+    addressType: "ROAD",
+  }, {
+    placeName: "손정보쌈",
+    caption: "📍손정보쌈 - 서울 금천구 가산동 371-6 - 매일 11:00-22:00",
+    address: "서울 금천구 가산동 371-6",
+    addressType: "JIBUN",
+  }, {
+    placeName: "춘식당",
+    caption: "#춘식당 \n📍 서울 강남구 도산대로23길 17 1, 2F",
+    address: "서울 강남구 도산대로23길 17 1, 2F",
+    addressType: "ROAD",
+  }, {
+    placeName: "동두천솥뚜껑삼겹살",
+    caption:
+      "#동두천솥뚜껑삼겹살 \n서울 강남구 테헤란로1길 20 2층(강남역 11번 출구)",
+    address: "서울 강남구 테헤란로1길 20 2층",
+    addressType: "ROAD",
+  }, {
+    placeName: "동두천솥뚜껑삼겹살",
+    caption:
+      "#동두천솥뚜껑삼겹살 \n서울 강남구 테헤란로1길 20 2층(강남역11번출구에서 264m)",
+    address: "서울 강남구 테헤란로1길 20 2층",
+    addressType: "ROAD",
+  }, {
+    placeName: "손정보쌈",
+    caption: "📍손정보쌈\n- 서울 금천구 가산동 371-6\n- 매일 11:00-22:00",
+    address: "서울 금천구 가산동 371-6",
+    addressType: "JIBUN",
+  }, {
+    placeName: "쉘터",
+    caption:
+      "📍 쉘터\n🌀10:30-20:00 (연중무휴)\n✅ 전남광주 동구 금남로5가 1-27",
+    address: "광주 동구 금남로5가 1-27",
+    addressType: "JIBUN",
+  }] as const;
+
+  for (const item of cases) {
+    const addresses = extractKoreanAddresses(item.caption);
+    assertEquals(addresses, [item.address]);
+    assertEquals(
+      withCaptionAddresses(
+        [guess(item.placeName, null, null)],
+        item.caption,
+        addresses,
+      ),
+      [{
+        placeName: item.placeName,
+        address: item.address,
+        addressType: item.addressType,
+        region: null,
+      }],
+    );
+  }
+});
+
+Deno.test("matches numbered-ga jibun addresses without confusing nearby ga", () => {
+  const source = guess(
+    "쉘터",
+    "광주 동구 금남로5가 1-27",
+    "광주",
+  );
+  const exact = candidate(
+    "exact-ga",
+    "쉘터",
+    "광주광역시 동구 구성로 164",
+    "광주광역시 동구 금남로5가 1-27",
+  );
+  const sameNumberDifferentGa = candidate(
+    "wrong-ga",
+    "쉘터",
+    "광주광역시 동구 중앙로 160",
+    "광주광역시 동구 금남로4가 1-27",
+  );
+
+  assertEquals(
+    locationMatchedKakaoPlaces(source, [sameNumberDifferentGa, exact]),
+    [exact],
+  );
+  assertEquals(
+    classifyKakaoCandidates(source, [sameNumberDifferentGa, exact]),
+    { type: "AUTO_MATCH", place: exact },
+  );
+  assertEquals(
+    resolveAiSelectedKakaoPlace(
+      source,
+      [sameNumberDifferentGa],
+      "wrong-ga",
+    ),
+    { status: "REJECTED", reason: "ADDRESS_CONFLICT" },
+  );
+});
+
+Deno.test("matches only the exact integrated Gwangju official region alias", () => {
+  const source = guess(
+    "쉘터",
+    "광주 동구 금남로5가 1-27",
+    "광주",
+  );
+  const jeonnamSource = guess(
+    "쉘터",
+    "전남 동구 금남로5가 1-27",
+    "전남",
+  );
+  const exact = candidate(
+    "integrated-exact",
+    "쉘터",
+    "전남광주통합특별시 동구 구성로 164",
+    "전남광주통합특별시 동구 금남로5가 1-27",
+  );
+  const wrongDistrict = candidate(
+    "integrated-wrong-district",
+    "쉘터",
+    "전남광주통합특별시 서구 구성로 164",
+    "전남광주통합특별시 서구 금남로5가 1-27",
+  );
+  const merelyContainsGwangju = candidate(
+    "contains-gwangju",
+    "쉘터",
+    "가짜광주통합특별시 동구 구성로 164",
+    "가짜광주통합특별시 동구 금남로5가 1-27",
+  );
+
+  assertEquals(classifyKakaoCandidates(source, [exact]), {
+    type: "AUTO_MATCH",
+    place: exact,
+  });
+  assertEquals(
+    resolveAiSelectedKakaoPlace(source, [exact], exact.kakaoPlaceId),
+    {
+      status: "ACCEPTED",
+      place: exact,
+    },
+  );
+  assertEquals(
+    resolveAiSelectedKakaoPlace(
+      source,
+      [wrongDistrict],
+      wrongDistrict.kakaoPlaceId,
+    ),
+    { status: "REJECTED", reason: "ADDRESS_CONFLICT" },
+  );
+  assertEquals(
+    resolveAiSelectedKakaoPlace(
+      source,
+      [merelyContainsGwangju],
+      merelyContainsGwangju.kakaoPlaceId,
+    ),
+    { status: "REJECTED", reason: "ADDRESS_CONFLICT" },
+  );
+  assertEquals(
+    resolveAiSelectedKakaoPlace(
+      jeonnamSource,
+      [exact],
+      exact.kakaoPlaceId,
+    ),
+    { status: "REJECTED", reason: "ADDRESS_CONFLICT" },
+  );
+});
+
+Deno.test("accepts only an exact-address local-prefix head-office name", () => {
+  const source = guess(
+    "고향집",
+    "서울 동대문구 청량리동 769-1",
+    "서울 동대문구",
+  );
+  const exact = candidate(
+    "hometown-exact",
+    "청량리고향집 본점",
+    "서울특별시 동대문구 왕산로 200",
+    "서울특별시 동대문구 청량리동 769-1",
+  );
+
+  assertEquals(validateKakaoCandidate(source, exact), { status: "ACCEPTED" });
+  assertEquals(classifyKakaoCandidates(source, [exact]), {
+    type: "AUTO_MATCH",
+    place: exact,
+  });
+  assertEquals(
+    resolveAiSelectedKakaoPlace(source, [exact], exact.kakaoPlaceId),
+    { status: "ACCEPTED", place: exact },
+  );
+
+  for (
+    const [id, name] of [
+      ["wrong-hoegi", "회기고향집 본점"],
+      ["wrong-seoul", "서울고향집 본점"],
+      ["wrong-dongdaemun", "동대문고향집 본점"],
+      ["full-local-token", "청량리동고향집 본점"],
+      ["extra-middle", "청량리원조고향집 본점"],
+      ["wrong-suffix", "청량리고향집 직영점"],
+      ["no-suffix", "청량리고향집"],
+    ]
+  ) {
+    const wrongName = candidate(
+      id,
+      name,
+      exact.roadAddress,
+      exact.address,
+    );
+    assertEquals(validateKakaoCandidate(source, wrongName), {
+      status: "REJECTED",
+      reason: "NAME_MISMATCH",
+    });
+  }
+
+  const wrongJibun = candidate(
+    "wrong-jibun",
+    exact.name,
+    exact.roadAddress,
+    "서울특별시 동대문구 청량리동 769-2",
+  );
+  assertEquals(validateKakaoCandidate(source, wrongJibun), {
+    status: "REJECTED",
+    reason: "NAME_MISMATCH",
+  });
+
+  const noDetailedAddress = guess("고향집", null, "청량리동");
+  assertEquals(validateKakaoCandidate(noDetailedAddress, exact), {
+    status: "REJECTED",
+    reason: "NAME_MISMATCH",
+  });
+
+  const roadOnlySource = guess(
+    "고향집",
+    "서울 동대문구 왕산로 200",
+    "서울 동대문구",
+  );
+  assertEquals(validateKakaoCandidate(roadOnlySource, exact), {
+    status: "REJECTED",
+    reason: "NAME_MISMATCH",
+  });
+
+  const shortSource = guess(
+    "집",
+    source.address,
+    source.region,
+  );
+  const shortSourceCandidate = candidate(
+    "short-source",
+    "청량리집 본점",
+    exact.roadAddress,
+    exact.address,
+  );
+  assertEquals(validateKakaoCandidate(shortSource, shortSourceCandidate), {
+    status: "REJECTED",
+    reason: "NAME_MISMATCH",
+  });
+
+  const explicitBranchSource = guess(
+    "고향집 본점",
+    source.address,
+    source.region,
+  );
+  const explicitBranchCandidate = candidate(
+    "explicit-branch",
+    "청량리고향집본점 본점",
+    exact.roadAddress,
+    exact.address,
+  );
+  assertEquals(
+    validateKakaoCandidate(explicitBranchSource, explicitBranchCandidate),
+    { status: "REJECTED", reason: "NAME_MISMATCH" },
+  );
+
+  const twoLocalSource = guess(
+    "고향집",
+    "경기 가평군 청평면 대성리 100-1",
+    "경기 가평군",
+  );
+  const twoLocalCandidate = candidate(
+    "two-local-stems",
+    "대성고향집 본점",
+    null,
+    "경기도 가평군 청평면 대성리 100-1",
+  );
+  assertEquals(validateKakaoCandidate(twoLocalSource, twoLocalCandidate), {
+    status: "REJECTED",
+    reason: "NAME_MISMATCH",
+  });
+
+  const duplicateLocation = candidate(
+    "hometown-second",
+    exact.name,
+    exact.roadAddress,
+    exact.address,
+  );
+  assertEquals(classifyKakaoCandidates(source, [exact, duplicateLocation]), {
+    type: "NEEDS_AI_REVIEW",
+    candidates: [exact, duplicateLocation],
+  });
+});
+
+Deno.test("does not attach an ambiguous or another item's regex address", () => {
+  assertEquals(
+    withCaptionAddresses(
+      [guess("우직", null, null), guess("오우드", null, null)],
+      "우직 서울 성동구 연무장길 12 오우드",
+      ["서울 성동구 연무장길 12"],
+    ),
+    [guess("우직", null, null), guess("오우드", null, null)],
+  );
+
+  const omittedPlaceCaption = [
+    "📍 로컬타코야키",
+    "• 서울 광진구 군자로 166 1층",
+    "📍 윤숲 후루츠산도점",
+  ].join("\n");
+  assertEquals(
+    withCaptionAddresses(
+      [guess("윤숲 후루츠산도점", null, null)],
+      omittedPlaceCaption,
+      ["서울 광진구 군자로 166 1층"],
+    ),
+    [guess("윤숲 후루츠산도점", null, null)],
+  );
+
+  assertEquals(
+    withCaptionAddresses(
+      [guess("윤숲 후루츠산도점", null, null)],
+      "윤숲 후루츠산도점 소개 📍 로컬타코야키 서울 광진구 군자로 166 1층",
+      ["서울 광진구 군자로 166 1층"],
+    ),
+    [guess("윤숲 후루츠산도점", null, null)],
+  );
+
+  assertEquals(
+    withCaptionAddresses(
+      [guess("우직", null, null)],
+      "우직은 서울 성동구 연무장길 12에서 공수한 재료를 사용해요",
+      ["서울 성동구 연무장길 12"],
+    ),
+    [guess("우직", null, null)],
+  );
+
+  assertEquals(
+    withCaptionAddresses(
+      [guess("우직", null, null)],
+      "우직 📍 #미쁘동 서울 성동구 연무장길 12",
+      ["서울 성동구 연무장길 12"],
+    ),
+    [guess("우직", null, null)],
+  );
+
+  assertEquals(
+    withCaptionAddresses(
+      [guess("우직", null, null)],
+      "우직 부산 카페 서울 성동구 연무장길 12",
+      ["서울 성동구 연무장길 12"],
+    ),
+    [guess("우직", null, null)],
+  );
+
+  assertEquals(
+    withCaptionAddresses(
+      [guess("우직", null, null)],
+      "우직 맛집, 우직서울 서울 강남구 테헤란로 1",
+      ["서울 강남구 테헤란로 1"],
+    ),
+    [guess("우직", null, null)],
+  );
+
+  assertEquals(
+    withCaptionAddresses(
+      [guess("우직", null, null)],
+      "우직은 서울 성동구 연무장길 12로 배달합니다",
+      ["서울 성동구 연무장길 12"],
+    ),
+    [guess("우직", null, null)],
+  );
+
+  assertEquals(
+    withCaptionAddresses(
+      [guess("우직", null, null)],
+      "우직 🌀10:30-20:00\n서울 성동구 연무장길 12",
+      ["서울 성동구 연무장길 12"],
+    ),
+    [guess("우직", null, null)],
+  );
+
+  assertEquals(
+    withCaptionAddresses(
+      [guess("우직", null, null)],
+      "우직\n\n서울 성동구 연무장길 12",
+      ["서울 성동구 연무장길 12"],
+    ),
+    [guess("우직", null, null)],
+  );
+
+  assertEquals(
+    withCaptionAddresses(
+      [guess("쉘터", null, null)],
+      "쉘터\n매일 10:30-20:00\n\n✅ 광주 동구 금남로5가 1-27",
+      ["광주 동구 금남로5가 1-27"],
+    ),
+    [guess("쉘터", null, null)],
+  );
+
+  assertEquals(
+    withCaptionAddresses(
+      [guess("우직", null, null)],
+      "우직\n서울 성동구 연무장길 12 오우드",
+      ["서울 성동구 연무장길 12"],
+    ),
+    [guess("우직", null, null)],
+  );
+});
+
+Deno.test("accepts an unspecified branch only at the regex caption address", () => {
+  const source = withCaptionAddresses(
+    [guess("동두천솥뚜껑삼겹살", null, null)],
+    "동두천솥뚜껑삼겹살\n서울 강남구 테헤란로1길 20 2층",
+    ["서울 강남구 테헤란로1길 20 2층"],
+  )[0];
+  const exact = candidate(
+    "gangnam",
+    "동두천솥뚜껑삼겹살 강남역점",
+    "서울특별시 강남구 테헤란로1길 20",
+    null,
+  );
+  const wrongBranch = candidate(
+    "other",
+    "동두천솥뚜껑삼겹살 역삼점",
+    "서울특별시 강남구 테헤란로 123",
+    null,
+  );
+
+  assertEquals(resolveAiSelectedKakaoPlace(source, [exact], "gangnam"), {
+    status: "ACCEPTED",
+    place: exact,
+  });
+  assertEquals(classifyKakaoCandidates(source, [exact]), {
+    type: "AUTO_MATCH",
+    place: exact,
+  });
+  assertEquals(
+    resolveAiSelectedKakaoPlace(source, [wrongBranch], "other"),
+    { status: "REJECTED", reason: "ADDRESS_CONFLICT" },
+  );
 });
 
 Deno.test("rejects invented chain branches in SELECT and RETRY", () => {

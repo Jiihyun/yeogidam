@@ -16,9 +16,11 @@ import { extractKoreanAddresses } from "./address.ts";
 import {
   buildKakaoMapURL,
   type KakaoPlace,
+  searchKakaoAddressCoordinates,
   searchKakaoPlaces,
+  searchKakaoPlacesNearAddress,
 } from "./kakao.ts";
-import { sanitizePlaceGuesses } from "./matching.ts";
+import { sanitizePlaceGuesses, withCaptionAddresses } from "./matching.ts";
 import {
   type PlaceMatchFailure,
   placeMatchFailureRow,
@@ -551,7 +553,8 @@ async function processReel(
       return await fail(admin, reelId, "IG_CAPTION_NOT_FOUND");
     }
 
-    // 2. 정규식 추출은 의사결정에 쓰지 않고 커버리지 관측용으로만 남겨둔다.
+    // 2. 정규식으로 찾은 도로명·지번 주소는 관측하고, 아래에서 AI가 주소를
+    // 빠뜨린 장소에 한해 가까운 문맥이 명확할 때만 보강한다.
     const regexAddresses = extractKoreanAddresses(caption);
     console.info(JSON.stringify({
       event: "regex_addresses_shadow",
@@ -600,7 +603,12 @@ async function processReel(
 
       const extraction = await ai.extractPlaces(caption);
       const extracted = extraction.data;
-      const guesses = sanitizePlaceGuesses(extracted, caption);
+      const sanitizedGuesses = sanitizePlaceGuesses(extracted, caption);
+      const guesses = withCaptionAddresses(
+        sanitizedGuesses,
+        caption,
+        regexAddresses,
+      );
       console.info(JSON.stringify({
         event: "ai_place_guesses_sanitized",
         reelId,
@@ -609,6 +617,9 @@ async function processReel(
         fallbackUsed: extraction.fallbackUsed,
         extractedCount: extracted.length,
         sanitizedCount: guesses.length,
+        regexAddressAppliedCount: guesses.filter((guess, index) =>
+          !sanitizedGuesses[index]?.address && Boolean(guess.address)
+        ).length,
       }));
       if (extracted.length === 0 || guesses.length === 0) {
         return await fail(admin, reelId, "GEMINI_PLACE_NOT_FOUND");
@@ -616,6 +627,10 @@ async function processReel(
 
       const resolution = await resolvePlacesFromKakao(caption, guesses, {
         search: (query) => searchKakaoPlaces(query, kakaoKey!),
+        geocodeAddress: (address) =>
+          searchKakaoAddressCoordinates(address, kakaoKey!),
+        searchNearby: (query, center) =>
+          searchKakaoPlacesNearAddress(query, center, kakaoKey!),
         judge: async (reviewCaption, items) =>
           (await ai.judgeKakaoCandidates(reviewCaption, items)).data,
         log: (event, details) => {

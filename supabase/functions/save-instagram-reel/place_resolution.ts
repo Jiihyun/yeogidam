@@ -3,15 +3,24 @@ import {
   type KakaoCandidateReviewItem,
   type PlaceGuess,
 } from "./ai/types.ts";
-import type { KakaoPlace } from "./kakao.ts";
 import {
+  type KakaoAddressCoordinate,
+  type KakaoCoordinate,
+  type KakaoPlace,
+  KakaoPlaceSearchError,
+} from "./kakao.ts";
+import {
+  addressMatches,
   buildKakaoQueries,
   captionContextsForPlaceName,
   classifyKakaoCandidates,
   deduplicateKakaoPlaces,
   groundedRetryQueries,
+  hasDetailedAddressEvidence,
+  locationMatchedKakaoPlaces,
   resolveAiSelectedKakaoPlace,
   resolveRetriedKakaoPlace,
+  validateKakaoCandidate,
   withCaptionRegionHints,
 } from "./matching.ts";
 import type {
@@ -32,6 +41,11 @@ export interface PlaceResolutionResult {
 
 export interface PlaceResolutionDependencies {
   search(query: string): Promise<KakaoPlace[]>;
+  geocodeAddress?(address: string): Promise<KakaoAddressCoordinate[]>;
+  searchNearby?(
+    query: string,
+    center: KakaoCoordinate,
+  ): Promise<KakaoPlace[]>;
   judge(
     caption: string,
     items: KakaoCandidateReviewItem[],
@@ -63,6 +77,99 @@ function orderedUniqueMatches(matches: ResolvedPlace[]): ResolvedPlace[] {
     });
 }
 
+async function addAddressNearbyCandidates(
+  guessIndex: number,
+  guess: PlaceGuess,
+  queries: string[],
+  initialCandidates: KakaoPlace[],
+  dependencies: PlaceResolutionDependencies,
+  geocodeCache: Map<string, Promise<KakaoAddressCoordinate[]>>,
+): Promise<KakaoPlace[]> {
+  if (
+    !guess.address || !hasDetailedAddressEvidence(guess) ||
+    initialCandidates.some((candidate) =>
+      validateKakaoCandidate(guess, candidate).status === "ACCEPTED"
+    ) ||
+    !dependencies.geocodeAddress || !dependencies.searchNearby
+  ) {
+    return initialCandidates;
+  }
+
+  try {
+    const geocodeKey = searchKey(guess.address);
+    let geocodedPromise = geocodeCache.get(geocodeKey);
+    if (!geocodedPromise) {
+      geocodedPromise = dependencies.geocodeAddress(guess.address);
+      geocodeCache.set(geocodeKey, geocodedPromise);
+    }
+    const geocoded = await geocodedPromise;
+    const matchingCoordinates = geocoded.filter((coordinate) =>
+      [coordinate.roadAddress, coordinate.address].some((candidateAddress) =>
+        Boolean(
+          candidateAddress &&
+            addressMatches(
+              guess.address!,
+              candidateAddress,
+              guess.region,
+            ),
+        )
+      )
+    );
+    if (matchingCoordinates.length !== 1) {
+      dependencies.log?.("kakao_address_coordinate_unresolved", {
+        guessIndex,
+        geocodedCount: geocoded.length,
+        matchingCoordinateCount: matchingCoordinates.length,
+      });
+      return initialCandidates;
+    }
+    const center = matchingCoordinates[0];
+
+    const nearbyCandidates: KakaoPlace[] = [];
+    for (const query of queries) {
+      nearbyCandidates.push(...await dependencies.searchNearby(query, center));
+    }
+    const exactNearbyCandidates = locationMatchedKakaoPlaces(
+      guess,
+      nearbyCandidates,
+    ).filter((candidate) =>
+      validateKakaoCandidate(guess, candidate).status === "ACCEPTED"
+    );
+    if (exactNearbyCandidates.length === 0) {
+      dependencies.log?.("kakao_address_nearby_exact_candidate_not_found", {
+        guessIndex,
+        nearbyCandidateCount: nearbyCandidates.length,
+      });
+      return initialCandidates;
+    }
+    // 정확주소 주변 결과를 먼저 두어 AI 검토의 15개 제한에도 해당 후보가
+    // 포함되게 하되, 자동 확정은 아래 기존 주소·이름 분류기만 수행한다.
+    const merged = deduplicateKakaoPlaces([
+      ...exactNearbyCandidates,
+      ...initialCandidates,
+    ]);
+    dependencies.log?.("kakao_address_nearby_candidates_merged", {
+      guessIndex,
+      initialCandidateCount: initialCandidates.length,
+      nearbyCandidateCount: nearbyCandidates.length,
+      exactNearbyCandidateCount: exactNearbyCandidates.length,
+      mergedCandidateCount: merged.length,
+      exactAddressCandidateCount: locationMatchedKakaoPlaces(guess, merged)
+        .length,
+    });
+    return merged;
+  } catch (error) {
+    // 보조 검색 장애는 기존 키워드 후보와 AI 판단 경로를 그대로 유지한다.
+    if (!(error instanceof KakaoPlaceSearchError)) throw error;
+    dependencies.log?.("kakao_address_nearby_search_skipped", {
+      guessIndex,
+      kind: error.kind,
+      status: error.status,
+    });
+    return initialCandidates;
+  }
+}
+
 /**
  * 최초 Kakao 검색과 단 한 번의 AI 판단, 선택적 Kakao 재검색을 수행한다.
  * RETRY 결과는 결정론적으로 끝내며 세 번째 AI 호출은 존재하지 않는다.
@@ -76,6 +183,10 @@ export async function resolvePlacesFromKakao(
   const failures: PlaceMatchFailure[] = [];
   const pendingReviews: KakaoCandidateReviewItem[] = [];
   const validationGuesses = new Map<number, PlaceGuess>();
+  const geocodeCache = new Map<
+    string,
+    Promise<KakaoAddressCoordinate[]>
+  >();
   const allPlaceNames = guesses.map((guess) => guess.placeName);
 
   for (const [guessIndex, guess] of guesses.entries()) {
@@ -85,11 +196,20 @@ export async function resolvePlacesFromKakao(
       allPlaceNames,
     );
     validationGuesses.set(guessIndex, validationGuess);
+    const queries = buildKakaoQueries(guess);
     const searchedCandidates: KakaoPlace[] = [];
-    for (const query of buildKakaoQueries(guess)) {
+    for (const query of queries) {
       searchedCandidates.push(...await dependencies.search(query));
     }
-    const candidates = deduplicateKakaoPlaces(searchedCandidates);
+    const initialCandidates = deduplicateKakaoPlaces(searchedCandidates);
+    const candidates = await addAddressNearbyCandidates(
+      guessIndex,
+      validationGuess,
+      queries,
+      initialCandidates,
+      dependencies,
+      geocodeCache,
+    );
     const decision = classifyKakaoCandidates(validationGuess, candidates);
     dependencies.log?.("kakao_place_candidates_classified", {
       guessIndex,

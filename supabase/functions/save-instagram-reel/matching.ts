@@ -345,6 +345,7 @@ function lineLooksLocationOnly(line: string): boolean {
       hardRegionTokens(token).length > 0 ||
       /^[가-힣][가-힣0-9.·-]*(?:대로|로|길|번길)$/.test(token) ||
       /^(?:산)?\d+(?:-\d+)?(?:번지|층|호)?$/.test(token) ||
+      /^\d+F$/i.test(token) ||
       /^[A-Za-z]\d*(?:동|관)$/.test(token)
     );
 }
@@ -442,7 +443,7 @@ function hasNonLocationContinuation(
   fieldEnd: number,
 ): boolean {
   const after = caption.slice(fieldEnd, fieldEnd + 40);
-  return /^(?:에서|으로부터|의)?\s*(?:공수|태어|출신|배송|가져|생산|재배|수입|사\s*온|구매)/u
+  return /^(?:에서|으로부터|의|로)?\s*(?:공수|태어|출신|배송|배달|가져|생산|재배|수입|사\s*온|구매)/u
     .test(after);
 }
 
@@ -529,6 +530,7 @@ function fieldGroundedToPlace(
     const bridge = nearestBridge;
     if (bridgeCrossesAnotherItem(bridge)) continue;
     if (bridge.includes("\n")) {
+      if ((bridge.match(/\n/g) ?? []).length !== 1) continue;
       const lineStart = normalizedCaption.lastIndexOf("\n", fieldIndex) + 1;
       const nextBreak = normalizedCaption.indexOf("\n", fieldEnd);
       const lineEnd = nextBreak < 0 ? normalizedCaption.length : nextBreak;
@@ -540,8 +542,7 @@ function fieldGroundedToPlace(
         /(?:주소|위치|도로명|지번|지역)(?:은|는|이|가)?\s*[:：]?/.test(
           fieldLine,
         );
-      const hasDetailedAddress = roadToken(fieldLine) !== null &&
-        comparableBuildingNumber(fieldLine) !== null;
+      const hasDetailedAddress = hasDetailedAddressValue(fieldLine);
       if (
         !lineLooksLocationOnly(fieldLine) ||
         (!hasExplicitLabel && !hasDetailedAddress)
@@ -560,6 +561,160 @@ function fieldGroundedToPlace(
     if (
       fieldIndex >= placeEnd &&
       hasNonLocationContinuation(normalizedCaption, fieldEnd)
+    ) continue;
+    return true;
+  }
+  return false;
+}
+
+const SINGLE_PLACE_METADATA_WORDS = new Set([
+  "연중무휴",
+  "매일",
+  "영업",
+  "영업시간",
+  "운영",
+  "운영시간",
+  "오픈",
+  "마감",
+  "휴무",
+]);
+
+function singlePlaceMetadataBridgeOnly(bridge: string): boolean {
+  const normalized = bridge.normalize("NFKC");
+  const attachedRegion = normalized.match(/([가-힣]{1,8})\s*$/);
+  const metadataBridge = attachedRegion &&
+      (METRO_ALIASES.has(attachedRegion[1]) ||
+        PROVINCE_NAMES.has(attachedRegion[1]))
+    // `전남광주`처럼 추출 주소 시작점에 바로 붙은 시·도 한 개만 예외로
+    // 걷어낸다. bridge 중간의 지역명은 다른 장소 문맥일 수 있어 허용하지 않는다.
+    ? normalized.slice(0, attachedRegion.index)
+    : normalized;
+  const tokens = metadataBridge
+    .replace(/\d{1,2}:\d{2}/g, " ")
+    .split(/[^\p{L}\p{N}]+/gu).filter(Boolean);
+  return tokens.every((token) =>
+    /^\d+$/.test(token) ||
+    LOCATION_BRIDGE_WORDS.has(token) ||
+    SINGLE_PLACE_METADATA_WORDS.has(token)
+  );
+}
+
+function singlePlaceAddressBridgeAllowed(
+  caption: string,
+  addressIndex: number,
+  bridge: string,
+): boolean {
+  if (!bridge.includes("\n")) return singlePlaceMetadataBridgeOnly(bridge);
+
+  // 메타데이터 사이에 빈 줄이 끼면 같은 항목이라는 근거가 끊긴다.
+  // 영숫자 metadata가 있는 분기에서도 이 경계를 먼저 적용한다.
+  if (/\n[^\S\n]*\n/u.test(bridge)) return false;
+
+  // 바로 다음 줄처럼 사이가 공백·목록 기호뿐이면 허용한다. 시간·영업정보
+  // 같은 문자가 한 줄 이상 끼면 주소가 있는 마지막 줄에 명시적 위치 마커가
+  // 있어야 하고, 그 사이의 문자도 기존 metadata allowlist를 통과해야 한다.
+  if (!/[\p{L}\p{N}]/u.test(bridge)) {
+    return (bridge.match(/\n/g) ?? []).length === 1;
+  }
+  const addressLineStart = caption.lastIndexOf("\n", addressIndex) + 1;
+  const addressLinePrefix = caption.slice(addressLineStart, addressIndex);
+  return /[✅📍📌]/u.test(addressLinePrefix) &&
+    singlePlaceMetadataBridgeOnly(bridge);
+}
+
+function singlePlaceAddressLineSuffixAllowed(
+  caption: string,
+  addressEnd: number,
+): boolean {
+  const nextBreak = caption.indexOf("\n", addressEnd);
+  const lineEnd = nextBreak < 0 ? caption.length : nextBreak;
+  const suffix = caption.slice(addressEnd, lineEnd).trim();
+  if (!suffix) return true;
+
+  // 실제 캡션의 `(강남역 11번 출구)`처럼 주소를 설명하는 역·출구 정보만
+  // 허용한다. 임의 상호명이 주소 뒤에 이어지면 누락된 다른 장소일 수 있다.
+  return /^\(\s*[가-힣a-z0-9·.-]+역(?:\s*\d+(?:-\d+)?번\s*출구)?(?:에서\s*\d+(?:\.\d+)?\s*(?:m|미터))?(?:\s+(?:도보\s*)?\d+\s*분)?\s*\)$/iu
+    .test(suffix);
+}
+
+/**
+ * 장소 하나와 상세주소 하나뿐인 캡션에서 시간·영업정보·표시용 기호 때문에
+ * 일반 문맥 규칙이 끊긴 경우만 보완한다. 주소는 장소 뒤에 있어야 하고,
+ * 사이에 다른 상호로 볼 수 있는 단어가 있으면 허용하지 않는다.
+ */
+function singlePlaceDetailedAddressGrounded(
+  caption: string,
+  placeName: string,
+  address: string,
+): boolean {
+  if (!hasDetailedAddressValue(address)) return false;
+  const normalizedCaption = caption.normalize("NFKC").toLocaleLowerCase(
+    "ko-KR",
+  );
+  const normalizedPlace = placeName.normalize("NFKC").trim()
+    .toLocaleLowerCase("ko-KR");
+  const normalizedAddress = address.normalize("NFKC").trim()
+    .toLocaleLowerCase("ko-KR");
+  if (!normalizedPlace || !normalizedAddress) return false;
+
+  const placeIndices = occurrenceIndices(normalizedCaption, normalizedPlace)
+    .filter((placeIndex) =>
+      fieldOccurrenceIsBounded(
+        normalizedCaption,
+        placeIndex,
+        normalizedPlace.length,
+        false,
+      )
+    );
+  const addressIndices = occurrenceIndices(normalizedCaption, normalizedAddress)
+    .filter((addressIndex) =>
+      fieldOccurrenceIsBounded(
+        normalizedCaption,
+        addressIndex,
+        normalizedAddress.length,
+        false,
+      ) ||
+      // `전남광주 동구 ...`처럼 광역시 앞에 다른 시·도 표기가 붙은
+      // 실제 캡션은 추출 주소가 `광주 ...`에서 시작한다. 단일 장소
+      // fallback에서 바로 앞 덩어리가 지역명일 때만 이 경계를 허용한다.
+      (() => {
+        const prefix = normalizedCaption.slice(0, addressIndex).match(
+          /([가-힣]{1,8})$/,
+        )?.[1];
+        return Boolean(prefix && hardRegionTokens(prefix).length > 0);
+      })()
+    );
+  for (const addressIndex of addressIndices) {
+    const nearestPrecedingPlace = placeIndices
+      .map((placeIndex) => ({
+        placeIndex,
+        distance: addressIndex - (placeIndex + normalizedPlace.length),
+      }))
+      .filter(({ distance }) => distance >= 0 && distance <= 240)
+      .sort((left, right) => left.distance - right.distance)[0];
+    if (!nearestPrecedingPlace) continue;
+
+    const placeEnd = nearestPrecedingPlace.placeIndex + normalizedPlace.length;
+    const bridge = normalizedCaption.slice(placeEnd, addressIndex);
+    if (
+      !singlePlaceAddressBridgeAllowed(
+        normalizedCaption,
+        addressIndex,
+        bridge,
+      )
+    ) continue;
+    if (
+      bridge.includes("\n") &&
+      !singlePlaceAddressLineSuffixAllowed(
+        normalizedCaption,
+        addressIndex + normalizedAddress.length,
+      )
+    ) continue;
+    if (
+      hasNonLocationContinuation(
+        normalizedCaption,
+        addressIndex + normalizedAddress.length,
+      )
     ) continue;
     return true;
   }
@@ -615,6 +770,65 @@ export function sanitizePlaceGuesses(
     sanitized.push(item);
   }
   return sanitized;
+}
+
+/**
+ * AI가 장소명은 찾았지만 주소를 빠뜨린 경우, 캡션에서 정규식으로 찾은
+ * 도로명·지번 주소를 같은 장소 항목에만 보강한다. 한 주소가 여러 장소에
+ * 귀속되거나 한 장소 주변에 여러 주소가 있어 모호하면 아무것도 붙이지
+ * 않는다.
+ */
+export function withCaptionAddresses(
+  guesses: PlaceGuess[],
+  caption: string,
+  captionAddresses: string[],
+): PlaceGuess[] {
+  const addresses = [
+    ...new Set(
+      captionAddresses.map((address) => address.trim()).filter(Boolean),
+    ),
+  ];
+  if (guesses.length === 0 || addresses.length === 0) return guesses;
+
+  const allPlaceNames = guesses.map((guess) => guess.placeName);
+  const allowSinglePlaceFallback = guesses.length === 1 &&
+    addresses.length === 1;
+  const addressesByGuess = new Map<number, string[]>();
+  for (const address of addresses) {
+    const owners = guesses.map((guess, guessIndex) => ({ guess, guessIndex }))
+      .filter(({ guess }) =>
+        fieldGroundedToPlace(
+          caption,
+          guess.placeName,
+          address,
+          allPlaceNames,
+        ) ||
+        (allowSinglePlaceFallback &&
+          singlePlaceDetailedAddressGrounded(
+            caption,
+            guess.placeName,
+            address,
+          ))
+      );
+    if (owners.length !== 1) continue;
+
+    const { guess, guessIndex } = owners[0];
+    if (guess.address) continue;
+    const owned = addressesByGuess.get(guessIndex) ?? [];
+    owned.push(address);
+    addressesByGuess.set(guessIndex, owned);
+  }
+
+  return guesses.map((guess, guessIndex) => {
+    if (guess.address) return guess;
+    const owned = addressesByGuess.get(guessIndex) ?? [];
+    if (owned.length !== 1) return guess;
+    return {
+      ...guess,
+      address: owned[0],
+      addressType: roadToken(owned[0]) ? "ROAD" : "JIBUN",
+    };
+  });
 }
 
 /**
@@ -681,6 +895,7 @@ function hardRegionTokens(value: string | null): string[] {
       tokens.filter((token) =>
         METRO_ALIASES.has(token) ||
         PROVINCE_NAMES.has(token) ||
+        /^[가-힣]{1,}\d+가$/.test(token) ||
         /^[가-힣]{1,}(?:특별시|광역시|특별자치시|특별자치도|시|군|구|동|읍|면|리)$/
           .test(token)
       ).map(compact),
@@ -791,6 +1006,7 @@ function regionAliases(token: string): string[] {
     대구광역시: "대구",
     인천광역시: "인천",
     광주광역시: "광주",
+    전남광주통합특별시: "광주",
     대전광역시: "대전",
     울산광역시: "울산",
     세종특별자치시: "세종",
@@ -826,7 +1042,13 @@ function hasRegionToken(location: string, token: string): boolean {
 }
 
 function roadToken(value: string): string | null {
-  const token = value.normalize("NFKC").match(
+  const normalized = value.normalize("NFKC");
+  // 금남로5가처럼 도로명처럼 보이는 법정동은 뒤의 숫자가 건물번호가
+  // 아니라 동 이름의 일부이므로 도로명으로 해석하지 않는다.
+  if (
+    /(?:^|\s)[가-힣]{1,}\d+가(?=\s*(?:산\s*)?\d)/.test(normalized)
+  ) return null;
+  const token = normalized.match(
     /(?:^|\s)([가-힣][가-힣0-9.·-]*(?:대로|로|길))(?=\s*(?:산\s*)?\d|\s|$|,|\))/,
   )?.[1];
   return token ? compact(token) : null;
@@ -848,7 +1070,7 @@ function candidateLocation(place: KakaoPlace): string {
   return [place.roadAddress, place.address].filter(Boolean).join(" ");
 }
 
-function addressMatches(
+export function addressMatches(
   source: string,
   candidate: string,
   supplementalRegion: string | null,
@@ -875,6 +1097,62 @@ function addressMatches(
   return regionTokens.length > 0 || sourceRoad !== null;
 }
 
+function detailedAddressMatchesCandidate(
+  guess: PlaceGuess,
+  candidate: KakaoPlace,
+): boolean {
+  if (!guess.address || !hasDetailedAddressEvidence(guess)) return false;
+  const candidateAddress = roadToken(guess.address) !== null
+    ? candidate.roadAddress
+    : candidate.address ?? candidate.roadAddress;
+  return Boolean(
+    candidateAddress &&
+      addressMatches(
+        guess.address,
+        candidateAddress,
+        placeRegionTokens(guess).join(" ") || null,
+      ),
+  );
+}
+
+function localAdministrativeStems(address: string): Set<string> {
+  return new Set(
+    hardRegionTokens(address).filter((token) => /(?:동|읍|면|리)$/u.test(token))
+      .map((token) => token.replace(/(?:동|읍|면|리)$/u, ""))
+      .filter((stem) => Array.from(stem).length >= 2),
+  );
+}
+
+/**
+ * Kakao가 정확한 지번 후보를 `청량리고향집 본점`처럼 최하위 행정동을
+ * 상호 앞에 붙여 표기하는 좁은 경우만 허용한다. 주소 양쪽의 동·읍·면·리
+ * stem이 같고 후보명이 그 stem + 원 상호 + `본점`과 완전히 같아야 한다.
+ */
+function nameMatchesCandidateWithExactAddressLocalPrefix(
+  guess: PlaceGuess,
+  candidate: KakaoPlace,
+  detailedAddressMatches: boolean,
+): boolean {
+  if (!detailedAddressMatches || !guess.address) {
+    return false;
+  }
+  const sourceName = compactPlaceName(guess.placeName);
+  if (Array.from(sourceName).length < 3 || /점$/u.test(sourceName)) {
+    return false;
+  }
+  const sourceStems = localAdministrativeStems(guess.address);
+  const candidateStems = localAdministrativeStems(
+    candidateLocation(candidate),
+  );
+  const sharedStems = [...sourceStems].filter((stem) =>
+    candidateStems.has(stem)
+  );
+  if (sharedStems.length !== 1) return false;
+  const [sourceStem] = sharedStems;
+  return compactPlaceName(candidate.name) ===
+    `${sourceStem}${sourceName}본점`;
+}
+
 type CandidateValidationReason = "NAME_MISMATCH" | "ADDRESS_CONFLICT";
 
 export type CandidateValidation =
@@ -897,18 +1175,21 @@ export function validateKakaoCandidate(
       ? candidate.roadAddress
       : candidate.address ?? candidate.roadAddress
     : null;
-  const detailedAddressMatches = Boolean(
-    guess.address && candidateAddress && hasDetailedAddressEvidence(guess) &&
-      addressMatches(
-        guess.address,
-        candidateAddress,
-        placeRegionTokens(guess).join(" ") || null,
-      ),
+  const detailedAddressMatches = detailedAddressMatchesCandidate(
+    guess,
+    candidate,
   );
+  const exactAddressLocalPrefixNameMatches =
+    nameMatchesCandidateWithExactAddressLocalPrefix(
+      guess,
+      candidate,
+      detailedAddressMatches,
+    );
   if (candidateOmitsSpecifiedBranch(guess, candidate)) {
     return { status: "REJECTED", reason: "NAME_MISMATCH" };
   }
   if (
+    !exactAddressLocalPrefixNameMatches &&
     !names.some((name) =>
       namesCompatibleWithoutTypo(name, candidate.name) ||
       (hardLocationEvidence &&
@@ -1182,7 +1463,9 @@ function addsUnspecifiedBranch(
 ): boolean {
   const suffix = addedBranchSuffix(guess.placeName, candidate.name);
   if (!suffix) return false;
-  if (hasDetailedAddressEvidence(guess)) return false;
+  // 캡션의 상세주소가 이 후보 주소와 실제로 일치할 때만 지점명 생략을
+  // 허용한다. 상세주소가 있다는 사실만으로 다른 지점을 통과시키지 않는다.
+  if (detailedAddressMatchesCandidate(guess, candidate)) return false;
 
   const branchToken = suffix.match(/^([\p{L}\p{N}]{1,10})점$/u)?.[1] ?? null;
   if (!branchToken || branchToken === "본" || branchToken === "직영") {
@@ -1222,10 +1505,14 @@ function candidateOmitsSpecifiedBranch(
  * Kakao 검색 fallback과는 무관하다.
  */
 export function hasDetailedAddressEvidence(guess: PlaceGuess): boolean {
-  if (!guess.address || !comparableBuildingNumber(guess.address)) return false;
-  return roadToken(guess.address) !== null ||
-    hardRegionTokens(guess.address).some((token) =>
-      /(?:동|읍|면|리)$/.test(token)
+  return Boolean(guess.address && hasDetailedAddressValue(guess.address));
+}
+
+function hasDetailedAddressValue(value: string): boolean {
+  if (!comparableBuildingNumber(value)) return false;
+  return roadToken(value) !== null ||
+    hardRegionTokens(value).some((token) =>
+      /(?:동|읍|면|리|\d+가)$/.test(token)
     );
 }
 
