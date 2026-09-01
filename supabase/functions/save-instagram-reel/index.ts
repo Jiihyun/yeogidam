@@ -507,6 +507,12 @@ async function processReel(
       }));
       return await fail(admin, reelId, "IG_FETCH_FAILED");
     }
+    // 인스타 이미지 직링크는 서명이 1~2주 뒤 만료되어 깨진다.
+    // 저장 시점에 스토리지로 복사해 우리 주소를 저장하고, 복사 실패 시에만 직링크를 남긴다.
+    const reelThumbnailUrl = meta.thumbnailUrl
+      ? (await rehostThumbnail(admin, `reels/${reelId}`, meta.thumbnailUrl)) ??
+        meta.thumbnailUrl
+      : null;
     const { error: metadataUpdateError } = await admin
       .from("reels")
       .update({
@@ -514,7 +520,7 @@ async function processReel(
         ...(meta.authorUsername
           ? { instagram_author_username: meta.authorUsername }
           : {}),
-        instagram_thumbnail_url: meta.thumbnailUrl,
+        instagram_thumbnail_url: reelThumbnailUrl,
       })
       .eq("id", reelId);
     if (metadataUpdateError) throw metadataUpdateError;
