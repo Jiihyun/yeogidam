@@ -27,6 +27,38 @@ async function shrinkImage(buf: Uint8Array): Promise<Uint8Array | null> {
   }
 }
 
+const MOBILE_UA =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+
+// 사진 게시물(/p/)의 og:image 는 인스타가 정사각으로 잘라서 준다.
+// embed 페이지(외부 사이트 삽입용, 로그인 불필요)의 display_url 에는 원본 비율
+// 이미지 주소가 들어 있어 이를 우선 시도한다. 실패하면 null(호출부가 og:image 로 폴백).
+export async function fetchEmbedDisplayUrl(
+  postUrl: string,
+): Promise<string | null> {
+  try {
+    const base = postUrl.split(/[?#]/)[0].replace(/\/$/, "");
+    const res = await fetch(`${base}/embed/`, {
+      headers: { "User-Agent": MOBILE_UA },
+      redirect: "follow",
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    // 이중 이스케이프된 JSON 안의 \"display_url\":\"...\" 을 찾는다.
+    const m = html.match(/display_url\\+"\s*:\s*\\+"(.+?)\\+"/);
+    if (!m) return null;
+    let url = m[1]
+      .replace(
+        /\\+u([0-9a-fA-F]{4})/g,
+        (_, hex: string) => String.fromCharCode(parseInt(hex, 16)),
+      )
+      .replace(/\\+\//g, "/");
+    return url.startsWith("https://") ? url : null;
+  } catch {
+    return null;
+  }
+}
+
 function publicStorageUrl(path: string): string {
   const configured = Deno.env.get("PUBLIC_SUPABASE_URL") ??
     Deno.env.get("SUPABASE_URL");

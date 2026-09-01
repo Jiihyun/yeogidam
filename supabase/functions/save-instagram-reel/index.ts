@@ -25,7 +25,11 @@ import {
 } from "./match_failure.ts";
 import { resolvePlacesFromKakao } from "./place_resolution.ts";
 import { findGooglePlacePhoto } from "./google.ts";
-import { rehostThumbnail, scrapePageImage } from "./thumbnail.ts";
+import {
+  fetchEmbedDisplayUrl,
+  rehostThumbnail,
+  scrapePageImage,
+} from "./thumbnail.ts";
 import {
   completedProcessingVersion,
   parseInstagramReelURL,
@@ -507,11 +511,22 @@ async function processReel(
       }));
       return await fail(admin, reelId, "IG_FETCH_FAILED");
     }
+    // 사진 게시물(/p/)의 og:image 는 정사각으로 잘려 있어 embed 의 원본 비율 주소를 우선 쓴다.
+    let thumbnailSource = meta.thumbnailUrl;
+    if (thumbnailSource && instagramUrl.includes("/p/")) {
+      const original = await fetchEmbedDisplayUrl(instagramUrl);
+      console.info(JSON.stringify({
+        event: "thumbnail_embed_original",
+        reelId,
+        found: Boolean(original),
+      }));
+      if (original) thumbnailSource = original;
+    }
     // 인스타 이미지 직링크는 서명이 1~2주 뒤 만료되어 깨진다.
     // 저장 시점에 스토리지로 복사해 우리 주소를 저장하고, 복사 실패 시에만 직링크를 남긴다.
-    const reelThumbnailUrl = meta.thumbnailUrl
-      ? (await rehostThumbnail(admin, `reels/${reelId}`, meta.thumbnailUrl)) ??
-        meta.thumbnailUrl
+    const reelThumbnailUrl = thumbnailSource
+      ? (await rehostThumbnail(admin, `reels/${reelId}`, thumbnailSource)) ??
+        thumbnailSource
       : null;
     const { error: metadataUpdateError } = await admin
       .from("reels")
