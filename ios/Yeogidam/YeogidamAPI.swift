@@ -25,14 +25,15 @@ struct YeogidamAPI {
         return decoder
     }()
 
-    func saveInstagramReel(_ instagramURL: String) async throws -> SaveInstagramReelResponse {
+    func saveInstagramReel(_ submission: ReelSubmission) async throws -> SaveInstagramReelResponse {
         var request = URLRequest(url: YeogidamConfig.saveInstagramReelFunctionURL)
         request.httpMethod = "POST"
         applyAuthHeaders(to: &request)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "instagramUrl": instagramURL,
+            "instagramUrl": submission.instagramURL,
             "source": "url_input",
+            "clientRequestId": submission.clientRequestID.uuidString,
         ])
 
         let data = try await data(for: request, acceptedStatusCodes: 200..<300)
@@ -41,17 +42,16 @@ struct YeogidamAPI {
 
     #if LOCAL_BUILD
     func fetchWaitingQueue() async throws -> [QueueReelRow] {
-        var components = restComponents(path: "reels")
+        var components = restComponents(path: "reel_queue_batches")
         components.queryItems = [
             URLQueryItem(
                 name: "select",
-                value: "id,instagram_title,instagram_description,instagram_author_username,instagram_thumbnail_url,reel_places!inner(id,position,review_status,reviewed_at,place:places(id,name,category,source_address,road_address,address,latitude,longitude,kakao_place_url,thumbnail_url,photo_attribution))"
+                value: "id,last_queued_at,extraction:reel_extractions(instagram_title,instagram_description,instagram_author_username,instagram_thumbnail_url),queue_items:reel_queue_items!inner(id,position,review_status,reviewed_at,place:places(id,name,category,source_address,road_address,address,latitude,longitude,kakao_place_url,thumbnail_url,photo_attribution))"
             ),
-            URLQueryItem(name: "processing_status", value: "eq.COMPLETED"),
-            URLQueryItem(name: "save_mode", value: "eq.REVIEW_QUEUE"),
-            URLQueryItem(name: "reel_places.review_status", value: "eq.PENDING"),
-            URLQueryItem(name: "order", value: "created_at.desc"),
-            URLQueryItem(name: "reel_places.order", value: "position.asc"),
+            URLQueryItem(name: "resolved_at", value: "is.null"),
+            URLQueryItem(name: "queue_items.review_status", value: "eq.PENDING"),
+            URLQueryItem(name: "order", value: "last_queued_at.desc,id.desc"),
+            URLQueryItem(name: "queue_items.order", value: "position.asc"),
         ]
         let reels: [QueueReelRow] = try await get(components)
         return reels.filter { !$0.pendingPlaces.isEmpty }
@@ -124,7 +124,6 @@ struct YeogidamAPI {
         components.queryItems = [
             URLQueryItem(name: "select", value: historyDetailSelect),
             URLQueryItem(name: "id", value: "eq.\(id.uuidString)"),
-            URLQueryItem(name: "reel_places.order", value: "position.asc"),
             URLQueryItem(name: "limit", value: "1"),
         ]
         let reels: [HistoryReelRow] = try await get(components)
@@ -179,7 +178,7 @@ struct YeogidamAPI {
 
     private var historyDetailSelect: String {
         historySummarySelect
-            + ",reel_places(id,position,review_status,reviewed_at,place:places(id,name,category,source_address,road_address,address,latitude,longitude,kakao_place_url,thumbnail_url,photo_attribution))"
+            + ",extraction:reel_extractions!reels_extraction_id_fkey(extraction_places:reel_extraction_places(id,position,place:places(id,name,category,source_address,road_address,address,latitude,longitude,kakao_place_url,thumbnail_url,photo_attribution)))"
     }
     #endif
 
@@ -202,15 +201,14 @@ struct YeogidamAPI {
     }
 
     func fetchRelatedReels(placeID: UUID) async throws -> [RelatedReelRow] {
-        var components = restComponents(path: "reels")
+        var components = restComponents(path: "user_related_reels")
         components.queryItems = [
             URLQueryItem(
                 name: "select",
-                value: "id,instagram_url,instagram_thumbnail_url,created_at,reel_places!inner(place_id)"
+                value: "id,instagram_url,instagram_thumbnail_url,created_at"
             ),
-            URLQueryItem(name: "processing_status", value: "eq.COMPLETED"),
-            URLQueryItem(name: "reel_places.place_id", value: "eq.\(placeID.uuidString)"),
-            URLQueryItem(name: "order", value: "created_at.desc"),
+            URLQueryItem(name: "place_id", value: "eq.\(placeID.uuidString)"),
+            URLQueryItem(name: "order", value: "created_at.desc,id.desc"),
         ]
         return try await get(components)
     }
@@ -220,9 +218,9 @@ struct YeogidamAPI {
         components.queryItems = [
             URLQueryItem(
                 name: "select",
-                value: "id,thumbnail_url,created_at,place:places(id,name,category,source_address,road_address,address,latitude,longitude,kakao_place_url,thumbnail_url,photo_attribution)"
+                value: "id,thumbnail_url,created_at,last_saved_at,place:places(id,name,category,source_address,road_address,address,latitude,longitude,kakao_place_url,thumbnail_url,photo_attribution)"
             ),
-            URLQueryItem(name: "order", value: "created_at.desc"),
+            URLQueryItem(name: "order", value: "last_saved_at.desc,id.desc"),
         ]
         return try await get(components)
     }

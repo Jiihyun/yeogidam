@@ -61,7 +61,11 @@ final class ShareViewController: UIViewController {
             guard let token = UserDefaults(suiteName: appGroupIdentifier)?.string(forKey: "supabase.accessToken") else {
                 throw ShareError.missingSession
             }
-            try await save(url: url.absoluteString, accessToken: token)
+            try await save(
+                url: url.absoluteString,
+                accessToken: token,
+                clientRequestID: UUID()
+            )
             complete("저장 요청을 보냈어요.")
         } catch {
             complete(error.localizedDescription)
@@ -92,7 +96,11 @@ final class ShareViewController: UIViewController {
         return nil
     }
 
-    private func save(url instagramURL: String, accessToken: String) async throws {
+    private func save(
+        url instagramURL: String,
+        accessToken: String,
+        clientRequestID: UUID
+    ) async throws {
         var request = URLRequest(url: saveInstagramReelFunctionURL)
         request.httpMethod = "POST"
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
@@ -101,6 +109,7 @@ final class ShareViewController: UIViewController {
         request.httpBody = try JSONSerialization.data(withJSONObject: [
             "instagramUrl": instagramURL,
             "source": "instagram_share",
+            "clientRequestId": clientRequestID.uuidString,
         ])
 
         let (data, response) = try await URLSession.shared.data(for: request)

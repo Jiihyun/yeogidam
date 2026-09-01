@@ -8,6 +8,7 @@ struct AddByURLSheet: View {
     @State private var instagramURL = ""
     @State private var isSaving = false
     @State private var errorMessage: String?
+    @State private var pendingSubmission: ReelSubmission?
 
     var body: some View {
         NavigationStack {
@@ -68,7 +69,17 @@ struct AddByURLSheet: View {
         defer { isSaving = false }
 
         do {
-            let response = try await YeogidamAPI(accessToken: accessToken).saveInstagramReel(url)
+            let submission: ReelSubmission
+            if let pendingSubmission, pendingSubmission.instagramURL == url {
+                submission = pendingSubmission
+            } else {
+                submission = ReelSubmission(instagramURL: url)
+                pendingSubmission = submission
+            }
+
+            let response = try await YeogidamAPI(accessToken: accessToken)
+                .saveInstagramReel(submission)
+            pendingSubmission = nil
             #if LOCAL_BUILD
             dismiss()
             Task {

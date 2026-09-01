@@ -40,12 +40,14 @@ struct SavedPlaceRow: Identifiable, Decodable {
     let id: UUID
     let thumbnailURL: String?
     let createdAt: String
+    let lastSavedAt: String
     let place: PlaceRow
 
     enum CodingKeys: String, CodingKey {
         case id
         case thumbnailURL = "thumbnail_url"
         case createdAt = "created_at"
+        case lastSavedAt = "last_saved_at"
         case place
     }
 }
@@ -115,6 +117,16 @@ struct SavedPlacesSnapshot {
     let activeReels: [ReelRow]
 }
 
+struct ReelSubmission: Equatable {
+    let instagramURL: String
+    let clientRequestID: UUID
+
+    init(instagramURL: String, clientRequestID: UUID = UUID()) {
+        self.instagramURL = instagramURL
+        self.clientRequestID = clientRequestID
+    }
+}
+
 struct SaveInstagramReelResponse: Decodable {
     let reelId: UUID
     let status: String?
@@ -167,38 +179,52 @@ struct QueueReelPlaceRow: Identifiable, Decodable {
 
 struct QueueReelRow: Identifiable, Decodable {
     let id: UUID
-    let instagramTitle: String?
-    let instagramDescription: String?
-    let instagramAuthorUsername: String?
-    let instagramThumbnailURL: String?
-    let reelPlaces: [QueueReelPlaceRow]
+    let lastQueuedAt: String
+    let extraction: QueueReelExtractionRow
+    let queueItems: [QueueReelPlaceRow]
 
     enum CodingKeys: String, CodingKey {
         case id
-        case instagramTitle = "instagram_title"
-        case instagramDescription = "instagram_description"
-        case instagramAuthorUsername = "instagram_author_username"
-        case instagramThumbnailURL = "instagram_thumbnail_url"
-        case reelPlaces = "reel_places"
+        case lastQueuedAt = "last_queued_at"
+        case extraction
+        case queueItems = "queue_items"
     }
 
     var caption: String {
-        instagramDescription?.queueNonEmpty
-            ?? instagramTitle?.queueNonEmpty
+        extraction.instagramDescription?.queueNonEmpty
+            ?? extraction.instagramTitle?.queueNonEmpty
             ?? "캡션 없음"
     }
 
     var author: String {
-        guard let username = instagramAuthorUsername?.queueNonEmpty else {
+        guard let username = extraction.instagramAuthorUsername?.queueNonEmpty else {
             return "작성자 정보 없음"
         }
         return username.hasPrefix("@") ? username : "@\(username)"
     }
 
+    var instagramThumbnailURL: String? {
+        extraction.instagramThumbnailURL
+    }
+
     var pendingPlaces: [QueueReelPlaceRow] {
-        reelPlaces
+        queueItems
             .filter { $0.reviewStatus == .pending }
             .sorted { $0.position < $1.position }
+    }
+}
+
+struct QueueReelExtractionRow: Decodable {
+    let instagramTitle: String?
+    let instagramDescription: String?
+    let instagramAuthorUsername: String?
+    let instagramThumbnailURL: String?
+
+    enum CodingKeys: String, CodingKey {
+        case instagramTitle = "instagram_title"
+        case instagramDescription = "instagram_description"
+        case instagramAuthorUsername = "instagram_author_username"
+        case instagramThumbnailURL = "instagram_thumbnail_url"
     }
 }
 
@@ -227,9 +253,9 @@ struct HistoryReelRow: Identifiable, Decodable {
     let failureReason: FailureReason?
     let saveMode: ReelSaveMode
     let createdAt: String
-    /// History list requests omit this relationship. Detail requests include it,
-    /// including an empty array when analysis completed without a matched place.
-    let reelPlaces: [QueueReelPlaceRow]?
+    /// History list requests omit this relationship. Detail requests include the
+    /// shared extraction referenced by this request when one is available.
+    let extraction: HistoryReelExtractionRow?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -242,7 +268,7 @@ struct HistoryReelRow: Identifiable, Decodable {
         case failureReason = "failure_reason"
         case saveMode = "save_mode"
         case createdAt = "created_at"
-        case reelPlaces = "reel_places"
+        case extraction
     }
 
     var historyTitle: String {
@@ -268,8 +294,8 @@ struct HistoryReelRow: Identifiable, Decodable {
         return username.hasPrefix("@") ? username : "@\(username)"
     }
 
-    var orderedPlaces: [QueueReelPlaceRow] {
-        (reelPlaces ?? []).sorted { $0.position < $1.position }
+    var orderedPlaces: [ExtractedPlaceRow] {
+        (extraction?.extractionPlaces ?? []).sorted { $0.position < $1.position }
     }
 
     var createdDate: Date? {
@@ -279,6 +305,20 @@ struct HistoryReelRow: Identifiable, Decodable {
     var historyCursor: HistoryCursor {
         HistoryCursor(createdAt: createdAt, id: id)
     }
+}
+
+struct HistoryReelExtractionRow: Decodable {
+    let extractionPlaces: [ExtractedPlaceRow]
+
+    enum CodingKeys: String, CodingKey {
+        case extractionPlaces = "extraction_places"
+    }
+}
+
+struct ExtractedPlaceRow: Identifiable, Decodable {
+    let id: UUID
+    let position: Int
+    let place: PlaceRow
 }
 
 struct HistoryCursor: Equatable {

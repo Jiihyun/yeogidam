@@ -5,6 +5,7 @@ struct HistoryDetailView: View {
     @EnvironmentObject private var appState: AppState
 
     @State private var reel: HistoryReelRow
+    @State private var isDetailLoaded: Bool
     @State private var isLoadingDetail = false
     @State private var isRefreshing = false
     @State private var isRetrying = false
@@ -12,6 +13,7 @@ struct HistoryDetailView: View {
     @State private var activeRefreshToken: UUID?
     @State private var activeRetryToken: UUID?
     @State private var activeReportToken: UUID?
+    @State private var pendingRetrySubmission: ReelSubmission?
     @State private var refreshTask: Task<Void, Never>?
     @State private var retryTask: Task<Void, Never>?
     @State private var reportTask: Task<Void, Never>?
@@ -19,15 +21,16 @@ struct HistoryDetailView: View {
 
     init(initialReel: HistoryReelRow) {
         _reel = State(initialValue: initialReel)
+        _isDetailLoaded = State(initialValue: initialReel.extraction != nil)
     }
 
     var body: some View {
         ScrollView {
             Group {
-                if isLoadingDetail && reel.reelPlaces == nil {
+                if isLoadingDetail && !isDetailLoaded {
                     ProgressView("상세 기록을 불러오는 중...")
                         .frame(maxWidth: .infinity, minHeight: 280)
-                } else if reel.reelPlaces == nil {
+                } else if !isDetailLoaded {
                     detailUnavailableContent
                 } else {
                     statusContent
@@ -41,7 +44,7 @@ struct HistoryDetailView: View {
         .navigationTitle("히스토리")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            guard reel.reelPlaces == nil else { return }
+            guard !isDetailLoaded else { return }
             startRefresh(showSpinner: true)
         }
         .onDisappear {
@@ -304,12 +307,23 @@ struct HistoryDetailView: View {
 
         do {
             let client = try api()
-            let response = try await client.saveInstagramReel(reel.instagramURL)
+            let submission: ReelSubmission
+            if let pendingRetrySubmission,
+               pendingRetrySubmission.instagramURL == reel.instagramURL {
+                submission = pendingRetrySubmission
+            } else {
+                submission = ReelSubmission(instagramURL: reel.instagramURL)
+                pendingRetrySubmission = submission
+            }
+
+            let response = try await client.saveInstagramReel(submission)
             guard isActiveRetry(retryToken) else { return }
+            pendingRetrySubmission = nil
 
             if let updated = try await client.fetchHistoryReel(id: response.reelId) {
                 guard isActiveRetry(retryToken) else { return }
                 reel = updated
+                isDetailLoaded = true
             }
 
             for attempt in 0...20 {
@@ -328,6 +342,7 @@ struct HistoryDetailView: View {
                     }
                     guard isActiveRetry(retryToken) else { return }
                     reel = updated
+                    isDetailLoaded = true
                     return
                 case .pending, .processing:
                     break
@@ -363,7 +378,7 @@ struct HistoryDetailView: View {
 
         let refreshToken = UUID()
         activeRefreshToken = refreshToken
-        isLoadingDetail = showSpinner && reel.reelPlaces == nil
+        isLoadingDetail = showSpinner && !isDetailLoaded
         isRefreshing = !isLoadingDetail
 
         defer {
@@ -380,6 +395,7 @@ struct HistoryDetailView: View {
             }
             guard activeRefreshToken == refreshToken else { return }
             reel = updated
+            isDetailLoaded = true
         } catch {
             guard activeRefreshToken == refreshToken, !Task.isCancelled else { return }
             activeAlert = .notice(
@@ -447,7 +463,7 @@ private struct InstagramGlyph: View {
 }
 
 private struct HistoryPlaceCard: View {
-    let reelPlace: QueueReelPlaceRow
+    let reelPlace: ExtractedPlaceRow
 
     var body: some View {
         Group {

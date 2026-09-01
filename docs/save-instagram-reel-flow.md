@@ -1,6 +1,6 @@
 # 릴스 장소 저장 구현 플로우
 
-- 엔드포인트: `POST /functions/v1/save-instagram-reel`
+- 엔드포인트: `POST /functions/v1/save-instagram-reel` (`AUTO_SAVE`), `POST /functions/v1/save-instagram-reel-v2` (`REVIEW_QUEUE`)
 - 구현: `supabase/functions/save-instagram-reel`
 - 처리: 접수는 동기, 장소 추출·저장은 비동기
 - 장소 자연키: Kakao Local API `id`
@@ -17,11 +17,14 @@ Content-Type: application/json
 ```json
 {
   "instagramUrl": "https://www.instagram.com/reel/SHORTCODE",
-  "source": "instagram_share"
+  "source": "instagram_share",
+  "clientRequestId": "6d8c1b73-5be1-4c29-9241-5da0b829e81a"
 }
 ```
 
-신규 접수는 `202`와 `reelId`를 반환한다. 이미 완료된 동일 릴스 결과를 재사용한 경우에는 `200`, `status: COMPLETED`, `reused: true`, `placeIds`를 바로 반환한다.
+클라이언트는 사용자가 명시적으로 공유하거나 URL을 입력할 때마다 새 `clientRequestId` UUID를 만들고, 응답을 확신할 수 없는 네트워크 재시도에는 같은 값을 유지한다. `(user_id, request_id)`가 유일하므로 같은 ID의 재전송은 같은 `reels` 히스토리로 수렴하고 대기함 순서나 저장 시각도 다시 갱신하지 않는다. 반대로 같은 릴스라도 새 ID로 보낸 명시적 재요청은 별도의 `reels` 히스토리를 만든다. 구버전 클라이언트가 ID를 보내지 않으면 서버가 호환용 UUID를 생성하지만, 클라이언트 재시도 간 멱등성은 보장할 수 없다.
+
+새 추출을 시작하거나 진행 중인 공용 추출에 합류하면 `202`와 `reelId`를 반환한다. 현재 파이프라인 버전의 완료 캐시를 즉시 재사용하면 `200`, `status: COMPLETED`, `placeIds`를 반환한다. 화면은 신규 추출과 캐시 재사용을 구분해 표시하지 않는다.
 
 ## 2. 전체 순서
 
@@ -36,43 +39,48 @@ sequenceDiagram
     participant G as Google Places
     participant S as Storage
 
-    U->>F: URL + JWT
+    U->>F: URL + clientRequestId + JWT
     F->>F: JWT 검증 + URL에서 shortcode 정규화
-    F->>D: 동일 사용자 또는 완료된 shortcode 조회
-    alt 재사용 가능한 결과 있음
-        F->>D: saved_places + reel_places 복원/복사
-        F-->>U: 200/202 + 기존 결과 + reused=true
-    else 신규 또는 재처리 필요
-    F->>D: reels(PROCESSING) insert
-    F-->>U: 202 + reelId
-    F->>I: 릴스 HTML head meta
-    I-->>F: caption + thumbnail
-    F->>AI: 전체 caption, places[] schema
-    AI-->>F: 0..N 장소명·주소·지역
-    loop 원문에 근거가 있는 각 장소
-        F->>K: 장소명 키워드 검색
-        K-->>F: 0..15 후보 + Kakao place id
-        F->>F: Kakao place id 중복 제거
-        alt 후보 0개
-            F->>F: 장소별 실패 기록
-        else 후보 1개
-            F->>F: 즉시 선택
-        else 후보 2개 이상
-            F->>F: 주소·지역으로 유일 후보 확인
-            opt 위치만으로 하나를 못 고름
-                F->>AI: 전체 caption + Kakao 후보
-                AI-->>F: candidateId 또는 NONE
-                F->>F: 전달한 candidateId인지 확인
+    F->>D: begin_reel_request 트랜잭션
+    D->>D: clientRequestId 기준 reels 히스토리 멱등 생성
+    alt 현재 버전의 완전한 완료 캐시 있음
+        D->>D: 저장된 extraction 장소로 요청 결과 구체화
+        D->>D: AUTO_SAVE upsert 또는 REVIEW_QUEUE 카드 생성·갱신
+        F-->>U: 200 + COMPLETED
+    else 같은 shortcode/version 추출 진행 중
+        D->>D: 새 히스토리를 같은 extraction에 연결
+        F-->>U: 202 + reelId
+    else 재사용 가능한 extraction 없음
+        D->>D: reel_extractions(PROCESSING) 생성 + worker 선점
+        F-->>U: 202 + reelId
+        F->>I: 릴스 HTML head meta
+        I-->>F: caption + thumbnail
+        F->>AI: 전체 caption, places[] schema
+        AI-->>F: 0..N 장소명·주소·지역
+        loop 원문에 근거가 있는 각 장소
+            F->>K: 장소명 키워드 검색
+            K-->>F: 0..15 후보 + Kakao place id
+            F->>F: Kakao place id 중복 제거
+            alt 후보 0개
+                F->>F: 장소별 실패 기록
+            else 후보 1개
+                F->>F: 즉시 선택
+            else 후보 2개 이상
+                F->>F: 주소·지역으로 유일 후보 확인
+                opt 위치만으로 하나를 못 고름
+                    F->>AI: 전체 caption + Kakao 후보
+                    AI-->>F: candidateId 또는 NONE
+                    F->>F: 전달한 candidateId인지 확인
+                end
+            end
+            opt 후보가 선택됨
+                F->>D: places upsert on kakao_place_id
+                F->>G: 대표 사진 조회
+                F->>S: 선택된 이미지 업로드
+                F->>D: worker reel_places 저장
             end
         end
-        opt 후보가 선택됨
-            F->>D: places upsert on kakao_place_id
-            F->>G: 대표 사진 조회
-            F->>S: 선택된 이미지 업로드
-            F->>D: saved_places + reel_places upsert
-        end
-    end
-    F->>D: reels(COMPLETED / FAILED)
+        F->>D: extraction 확정 + 연결된 모든 요청 구체화
     end
 ```
 
@@ -152,24 +160,29 @@ HTTP 200 응답의 `documents: []`만 실제 후보 0개로 처리한다. Kakao�
 - `source_address`: Instagram 원문의 상세주소
 - `road_address`, `address`, 좌표, 전화, 카테고리: Kakao 정규화 결과
 
-`saved_places(user_id, place_id)`는 사용자별 중복을 막고, `reel_places(reel_id, place_id, position)`는 하나의 릴스와 여러 장소 관계를 보존한다. `position`은 성공한 Gemini 결과의 상대 순서다. 기존 앱 호환을 위해 `reels.place_id`는 첫 장소를 계속 가리킨다.
+`reels`는 추출 결과 자체가 아니라 사용자 요청 히스토리다. 사용자가 명시적으로 다시 공유하면 같은 사용자·shortcode라도 새 행이 생기고, 네트워크 재전송만 같은 `clientRequestId`로 한 행에 수렴한다. 각 요청은 `extraction_id`로 공용 추출 attempt를 참조하며 기존 앱 호환을 위해 `reels.place_id`는 해당 결과의 첫 장소를 계속 가리킨다.
 
-인증 사용자는 `reel_places`를 임의로 쓰지 못한다. 다만 장소 상세의 관련 릴스를 조회할 수 있도록, RLS가 현재 사용자의 `reels.user_id`와 연결된 관계에 한해서 읽기를 허용한다. iOS는 이 관계로 완료된 릴스를 최신순 조회하고 썸네일을 누르면 원본 `instagram_url`을 연다.
+`reel_extractions`와 `reel_extraction_places`는 사용자와 무관한 추출 결과다. 현재 `PIPELINE_VERSION`의 `(instagram_shortcode, pipeline_version)`에 대해 진행 중인 attempt 또는 `COMPLETED/cacheable=true`인 완전한 결과 하나만 활성 캐시가 된다. 같은 사용자든 다른 사용자든 완료 결과가 있으면 Instagram·Gemini·Kakao를 다시 호출하지 않고 저장된 장소 목록을 사용하며, 동시에 들어온 요청도 한 worker에 합류한다. 알려진 장소 매칭 실패가 섞인 부분 성공은 `COMPLETED/cacheable=false`, 전체 실패는 `FAILED/cacheable=false`로 보존하므로 다음 명시적 요청은 새 extraction을 만들어 다시 추출한다.
 
-`reels.instagram_shortcode`는 Instagram 콘텐츠 식별자다. `(user_id, instagram_shortcode)` partial unique index로 같은 사용자의 동시 중복 요청을 한 행으로 수렴시킨다.
+`REVIEW_QUEUE` 대기함은 요청 히스토리와 분리된 사용자별 `reel_queue_batches`·`reel_queue_items`다.
 
-- 같은 사용자의 `PROCESSING` 또는 `COMPLETED`: 기존 `reelId`와 상태 반환
-- 다른 사용자의 같은 shortcode가 현재 알고리즘 버전으로 완료됨: 장소 관계와 저장 목록만 복사하고 외부 API 생략
-- `FAILED`, 15분 이상 갱신되지 않은 작업, 낮은 `processing_version`: 같은 행을 비우고 재처리
-- 완료된 릴스의 저장 장소를 사용자가 삭제한 뒤 다시 저장: 기존 `reel_places`에서 `saved_places` 복원
+- 같은 사용자의 같은 shortcode에 미처리(open) batch가 있으면 카드를 중복 생성하지 않고 `last_queued_at`을 갱신해 상단으로 올린다. 재추출에서 새로 발견된 장소만 기존 batch에 합친다.
+- 모든 item을 저장하거나 버리면 batch에 `resolved_at`을 기록한다. 이후 같은 릴스를 다시 공유하면 새 batch와 item을 만든다.
+- 명시적 재공유는 open batch 유무와 관계없이 언제나 새 `reels` 히스토리를 남긴다.
 
-장소 매칭 결과가 달라지는 코드를 배포할 때 `PIPELINE_VERSION`을 올리지 않으면 완료된 같은 shortcode는 기존 결과를 계속 재사용한다. 반대로 버전을 올리면 재처리되지만, 현재 정리는 `reel_places`만 대상으로 하고 사용자 단위 `saved_places`는 자동 삭제하지 않는다. 과거 오탐을 제거하려면 다른 릴스가 같은 장소를 참조하는지 확인하는 별도 정리 정책이 필요하다.
+`saved_places(user_id, place_id)`는 사용자별 장소를 한 행으로 유지한다. 처음 저장하면 행을 만들고 이미 있으면 행을 추가하지 않은 채 `last_saved_at = now()`로 갱신한다. 보관함 조회는 `last_saved_at DESC, id DESC`이므로 재저장한 장소가 상단으로 이동한다. 공용 extraction worker의 `AUTO_SAVE`는 장소를 처리할 때마다 사용자 보관함에 쓰지 않고, extraction을 확정하는 한 트랜잭션에서 연결된 요청의 장소를 한꺼번에 upsert한다.
+
+`reel_places(reel_id, place_id, position)`는 extraction worker의 중간 결과와 구버전 호환 관계를 보존한다. `position`은 성공한 Gemini 결과의 상대 순서이며, 완료 후 재사용할 공용 목록은 `reel_extraction_places`에 고정된다.
+
+인증 사용자는 추출·대기함 관계를 임의로 쓰지 못하고, RLS를 통해 자신이 요청한 extraction과 자신의 batch/item만 읽는다. iOS의 장소 상세는 `user_related_reels` 뷰로 같은 shortcode의 반복 히스토리를 하나로 정리해 최신 관련 릴스를 보여주며, 썸네일을 누르면 원본 `instagram_url`을 연다.
+
+장소 매칭 결과가 달라지는 코드를 배포할 때 `PIPELINE_VERSION`을 올리지 않으면 완료된 같은 shortcode는 기존 결과를 계속 재사용한다. 반대로 버전을 올리면 새 extraction을 만들고 과거 extraction과 요청 히스토리는 그대로 보존한다. 사용자 단위 `saved_places`도 자동 삭제하지 않으므로 과거 오탐을 제거하려면 다른 릴스가 같은 장소를 참조하는지 확인하는 별도 정리 정책이 필요하다.
 
 Naver 전용 `naver_place_id`, `naver_link`, `naver_thumbnail_url`은 Kakao 전환 마이그레이션에서 제거한다. 장소 식별자와 지도 링크의 SSOT는 각각 `kakao_place_id`, `kakao_place_url`이다.
 
-`places.source_address`는 공용 장소 행에 저장되므로 릴스별 주소 이력이 아니다. 같은 Kakao 장소가 다른 캡션의 상세주소로 다시 저장되면 최근 non-null 원문 주소로 바뀔 수 있다. 릴스별 원문 보존이 필요하면 `reel_places`에 별도 컬럼을 두어야 한다.
+`places.source_address`는 공용 장소 행에 저장되므로 릴스별 주소 이력이 아니다. 같은 Kakao 장소가 다른 캡션의 상세주소로 다시 저장되면 최근 non-null 원문 주소로 바뀔 수 있다. 릴스별 원문 보존이 필요하면 extraction 관계에 별도 컬럼을 두어야 한다.
 
-다중 장소 저장은 현재 하나의 Postgres 트랜잭션으로 묶이지 않는다. 앞 장소의 `places`·`saved_places`·`reel_places` 저장 후 뒤 장소에서 DB 오류가 발생하면 릴스는 `FAILED/UNKNOWN`이지만 앞선 쓰기가 남을 수 있다.
+추출 중 `places`·worker `reel_places`·Storage 쓰기는 단계별로 일어나므로 실패한 attempt가 공용 장소나 중간 관계를 일부 남길 수 있다. 다만 재사용 캐시 확정과 새 흐름의 `AUTO_SAVE` 보관함 반영은 `finalize_reel_extraction` 트랜잭션에서 함께 처리되어 사용자 보관함에 부분 결과를 공개하지 않는다.
 
 ## 7. 썸네일
 
@@ -186,7 +199,7 @@ Naver 전용 `naver_place_id`, `naver_link`, `naver_thumbnail_url`은 Kakao 전�
 | 상태 | 의미 |
 |---|---|
 | `PROCESSING` | 접수 후 백그라운드 처리 중 |
-| `COMPLETED` | 선택된 장소가 1개 이상 저장됨 |
+| `COMPLETED` | 장소가 1개 이상 매칭되어 공용 추출 결과와 사용자별 반영이 완료됨 |
 | `FAILED` | 구조화 또는 저장 실패 |
 
 | 실패 사유 | 대표 원인 |
@@ -199,7 +212,7 @@ Naver 전용 `naver_place_id`, `naver_link`, `naver_thumbnail_url`은 Kakao 전�
 | `PLACE_NOT_FOUND` | 이전 버전 호환용 일반 장소 탐색 실패 |
 | `UNKNOWN` | DB·Storage 또는 예상하지 못한 예외 |
 
-`COMPLETED`가 모든 캡션 장소의 저장을 보장하지는 않는다. 다음은 실패 상태가 아닌 부분 성공이다.
+`COMPLETED`가 모든 캡션 장소의 저장을 보장하지는 않는다. 확인된 일부 Kakao 매칭 실패를 포함한 완료 결과는 `cacheable=false`라 다음 명시적 요청에서 재추출한다. 다음은 실패 상태가 아닌 부분 성공 또는 공급자 특성상 감지하기 어려운 누락이다.
 
 - Gemini 모델이 캡션의 일부 장소를 응답에서 누락함
 - 여러 Gemini 항목 중 일부만 Kakao 후보 선택에 성공함
