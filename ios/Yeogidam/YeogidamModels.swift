@@ -179,13 +179,13 @@ struct QueueReelPlaceRow: Identifiable, Decodable {
 
 struct QueueReelRow: Identifiable, Decodable {
     let id: UUID
-    let lastQueuedAt: String
+    let createdAt: String
     let extraction: QueueReelExtractionRow
     let queueItems: [QueueReelPlaceRow]
 
     enum CodingKeys: String, CodingKey {
         case id
-        case lastQueuedAt = "last_queued_at"
+        case createdAt = "created_at"
         case extraction
         case queueItems = "queue_items"
     }

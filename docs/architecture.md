@@ -1,6 +1,6 @@
 # 여기담 MVP 현재 시스템 설계
 
-- 기준일: 2026-09-01
+- 기준일: 2026-09-03
 - 상태: 구현 기준(as-built)
 - 대상: iOS 17+, Supabase 프로젝트 `hbbrgudsbvnwuylxqlta`
 
@@ -127,8 +127,10 @@ erDiagram
       uuid id PK
       uuid user_id FK
       uuid extraction_id FK
+      timestamp generation_created_at
+      uuid generation_reel_id
       text instagram_shortcode
-      timestamp last_queued_at
+      timestamp created_at
       timestamp resolved_at
     }
     REEL_QUEUE_ITEMS {
@@ -154,7 +156,7 @@ erDiagram
 - `places`: 모든 인증 사용자가 읽는 공용 장소 정규화 결과
 - `reels`: 명시적 공유·URL 입력마다 생성되는 사용자 요청 히스토리. `(user_id, request_id)`로 전송 재시도만 멱등 처리
 - `reel_extractions`, `reel_extraction_places`: `(instagram_shortcode, pipeline_version)` 단위의 사용자 공용 추출 attempt와 완료 장소 목록
-- `reel_queue_batches`, `reel_queue_items`: 사용자별 검토 대기 카드와 장소. 같은 shortcode의 open batch는 하나
+- `reel_queue_batches`, `reel_queue_items`: 사용자별 검토 대기 카드와 장소. 같은 shortcode의 open batch는 하나이며 성공한 재공유는 새 카드로 교체. 세대 watermark는 히스토리 삭제와 무관하게 batch에 유지
 - `reel_places`: extraction worker의 중간 결과와 구버전 호환 관계
 - `saved_places`: 사용자와 장소의 유일한 연결. `(user_id, place_id)` unique이며 재저장 시 `last_saved_at` 갱신
 - `provider_usage_monthly`: Google 썸네일 워크플로 예약 횟수
@@ -169,7 +171,7 @@ erDiagram
 | `saved_places` | 본인 조회·삭제 | 생성·수정 |
 | `reel_places` | 본인 `reels`에 연결된 행 조회 | 생성·수정 |
 | `reel_extractions`·`reel_extraction_places` | 본인 `reels`가 참조하는 결과 조회 | 생성·수정 |
-| `reel_queue_batches`·`reel_queue_items` | 본인 대기함 조회 | 생성·수정 |
+| `reel_queue_batches`·`reel_queue_items` | 본인 대기함 조회 | 생성·수정·삭제 |
 | `provider_usage_monthly` | 접근 불가 | 예약 RPC 실행 |
 | `place-thumbnails` | 공개 읽기 | 업로드 |
 
@@ -189,7 +191,7 @@ Edge Function은 인증과 입력 검증 후 `begin_reel_request`에서 요청 �
 
 현재 `PIPELINE_VERSION`의 완전한 완료 extraction이 있으면 같은 사용자든 다른 사용자든 외부 API 호출 없이 저장된 장소를 즉시 구체화합니다. 같은 shortcode/version 추출이 진행 중이면 새 요청은 그 extraction에 합류하고, 캐시가 없을 때만 한 worker가 Instagram·Gemini·Kakao 처리를 `EdgeRuntime.waitUntil()`에서 수행합니다. 알려진 부분 성공과 실패 attempt는 `cacheable=false`로 보존되어 다음 요청이 새 extraction을 만들며, 오래 정체된 worker는 새 processing token으로 인계해 늦은 결과의 확정을 막습니다.
 
-완료 시 `finalize_reel_extraction`이 공용 장소 목록을 고정하고 연결된 모든 요청을 함께 완료합니다. `REVIEW_QUEUE`는 사용자의 같은 shortcode open batch가 있으면 `last_queued_at`을 갱신합니다. 완료 cache 재사용 시 기존 item을 새 ID의 `PENDING` 세대로 바꿔 전체 장소를 즉시 다시 보여주고, 새 추출이 필요하면 완료 시 새 결과 전체를 한 번만 열어 새 장소도 같은 batch에 합칩니다. 과거 item ID로 늦게 도착한 요청은 거부하고, 모두 처리된 뒤 재요청하면 새 batch를 만듭니다. 재공유 자체는 보관함 저장 시각을 바꾸지 않고, `AUTO_SAVE` 또는 사용자의 명시적 `SAVE`만 `saved_places`를 upsert해 기존 장소의 `last_saved_at`을 갱신합니다. 앱 보관함은 `last_saved_at DESC, id DESC`로 조회합니다.
+완료 시 `finalize_reel_extraction`이 공용 장소 목록을 고정하고 연결된 모든 요청을 함께 완료합니다. `REVIEW_QUEUE` 재공유가 성공하면 같은 사용자의 같은 shortcode open batch와 item을 물리 삭제하고, 현재 추출의 전체 장소를 모두 `PENDING`으로 담은 새 batch를 만듭니다. 완료 cache는 즉시 교체하고, 새 추출이 필요한 요청은 추출에 성공한 순간에만 한 트랜잭션으로 교체하므로 처리 중이거나 실패한 동안에는 기존 카드가 유지됩니다. 새 카드는 실제 생성 시각인 `created_at DESC, id DESC`로 상단에 보입니다. 과거 item ID로 늦게 도착한 요청은 거부하며, 이미 처리된 resolved batch는 히스토리로 유지합니다. 재공유 자체는 보관함 저장 시각을 바꾸지 않고, `AUTO_SAVE` 또는 사용자의 명시적 `SAVE`만 `saved_places`를 upsert해 기존 장소의 `last_saved_at`을 갱신합니다. 앱 보관함은 `last_saved_at DESC, id DESC`로 조회합니다.
 
 앱은 저장 직후 `saved_places`와 `reels`를 다시 조회합니다. 현재 Realtime 구독과 자동 polling은 없으며 화면 진입 또는 당겨서 새로고침으로 갱신합니다.
 
@@ -204,7 +206,7 @@ Edge Function은 인증과 입력 검증 후 `begin_reel_request`에서 요청 �
 - Kakao 장소 ID 기준 중복 방지와 유일 후보 확정
 - `clientRequestId` 기반 전송 멱등성과 명시적 요청별 히스토리
 - Instagram shortcode·파이프라인 버전 기반 사용자 공용 추출 캐시
-- 사용자별 대기함 batch/item의 재공유 상단 이동·전체 장소 재노출·장소 병합·처리 후 재생성
+- 사용자별 대기함 batch/item의 성공한 재공유 시 기존 open 카드 삭제·전체 장소 새 카드 생성·실패 시 기존 카드 보존
 - 기존 장소 재저장 시 `last_saved_at` 갱신과 보관함 최신순 정렬
 - 장소와 사용자 저장 데이터 분리
 - Google Places 썸네일, 제공자 폴백, Storage 업로드

@@ -46,11 +46,11 @@ struct YeogidamAPI {
         components.queryItems = [
             URLQueryItem(
                 name: "select",
-                value: "id,last_queued_at,extraction:reel_extractions(instagram_title,instagram_description,instagram_author_username,instagram_thumbnail_url),queue_items:reel_queue_items!inner(id,position,review_status,reviewed_at,place:places(id,name,category,source_address,road_address,address,latitude,longitude,kakao_place_url,thumbnail_url,photo_attribution))"
+                value: "id,created_at,extraction:reel_extractions(instagram_title,instagram_description,instagram_author_username,instagram_thumbnail_url),queue_items:reel_queue_items!inner(id,position,review_status,reviewed_at,place:places(id,name,category,source_address,road_address,address,latitude,longitude,kakao_place_url,thumbnail_url,photo_attribution))"
             ),
             URLQueryItem(name: "resolved_at", value: "is.null"),
             URLQueryItem(name: "queue_items.review_status", value: "eq.PENDING"),
-            URLQueryItem(name: "order", value: "last_queued_at.desc,id.desc"),
+            URLQueryItem(name: "order", value: "created_at.desc,id.desc"),
             URLQueryItem(name: "queue_items.order", value: "position.asc"),
         ]
         let reels: [QueueReelRow] = try await get(components)
@@ -293,7 +293,7 @@ struct YeogidamAPI {
     private func queueMessage(for message: String) -> String {
         switch message {
         case "queue_items_not_available", "queue_items_changed_during_request":
-            return "이미 처리된 장소가 있어요. 새로고침 후 다시 선택해주세요."
+            return "대기함이 갱신되었거나 이미 처리된 장소가 있어요. 새로고침 후 다시 선택해주세요."
         case "queue_selection_required":
             return "저장하거나 삭제할 장소를 선택해주세요."
         case "queue_selection_contains_duplicates_or_nulls":

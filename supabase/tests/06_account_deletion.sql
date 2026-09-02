@@ -64,13 +64,17 @@ insert into public.reel_queue_batches (
   id,
   user_id,
   extraction_id,
-  latest_reel_id,
+  generation_created_at,
+  generation_reel_id,
   instagram_shortcode
 )
 values (
   '66666666-dddd-dddd-dddd-dddddddddddd',
   '66666666-6666-6666-6666-666666666666',
   '66666666-cccc-cccc-cccc-cccccccccccc',
+  (select created_at
+   from public.reels
+   where id = '66666666-bbbb-bbbb-bbbb-bbbbbbbbbbbb'),
   '66666666-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
   'delete-account-cache'
 );

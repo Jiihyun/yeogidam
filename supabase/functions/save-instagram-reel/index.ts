@@ -35,7 +35,7 @@ import {
   rehostThumbnail,
   scrapePageImage,
 } from "./thumbnail.ts";
-import { completedProcessingVersion, parseInstagramReelURL } from "./reel.ts";
+import { parseInstagramReelURL } from "./reel.ts";
 import {
   begunReelHTTPResult,
   type BegunReelRequest,

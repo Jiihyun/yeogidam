@@ -45,7 +45,7 @@ sequenceDiagram
     D->>D: clientRequestId 기준 reels 히스토리 멱등 생성
     alt 현재 버전의 완전한 완료 캐시 있음
         D->>D: 저장된 extraction 장소로 요청 결과 구체화
-        D->>D: AUTO_SAVE upsert 또는 REVIEW_QUEUE 카드 생성·갱신
+        D->>D: AUTO_SAVE upsert 또는 REVIEW_QUEUE 새 카드 생성·교체
         F-->>U: 200 + COMPLETED
     else 같은 shortcode/version 추출 진행 중
         D->>D: 새 히스토리를 같은 extraction에 연결
@@ -166,7 +166,7 @@ HTTP 200 응답의 `documents: []`만 실제 후보 0개로 처리한다. Kakao�
 
 `REVIEW_QUEUE` 대기함은 요청 히스토리와 분리된 사용자별 `reel_queue_batches`·`reel_queue_items`다.
 
-- 같은 사용자의 같은 shortcode에 미처리(open) batch가 있으면 카드를 중복 생성하지 않고 `last_queued_at`을 갱신해 상단으로 올린다. 완료 cache를 재사용할 때는 기존 item을 새 ID의 `PENDING` 세대로 바꿔 릴스의 전체 장소를 즉시 다시 보여준다. 새 추출이 필요하면 완료 시 새 결과 전체를 한 번만 열고 새로 발견된 장소도 같은 batch에 합친다. 따라서 재공유 전 item ID로 늦게 도착한 저장 요청은 새 카드를 변경하지 못하며, 재공유만으로는 `saved_places.last_saved_at`도 바뀌지 않는다.
+- 같은 사용자의 같은 shortcode에 미처리(open) batch가 있어도 재공유가 성공하면 기존 batch와 item을 물리 삭제하고, 릴스의 전체 장소를 새 `PENDING` item으로 담은 batch를 생성한다. 새 batch는 실제 생성 시각인 `created_at DESC, id DESC` 순서로 상단에 보인다. 완료 cache를 재사용하면 즉시 교체하고, 새 추출이 필요하면 추출 성공 시에만 삭제와 생성을 한 트랜잭션으로 수행한다. 따라서 추출 중이거나 실패하면 기존 카드는 그대로 남고, 재공유 전 item ID로 늦게 도착한 저장 요청은 새 카드를 변경하지 못한다. 재공유만으로는 `saved_places.last_saved_at`도 바뀌지 않는다.
 - 모든 item을 저장하거나 버리면 batch에 `resolved_at`을 기록한다. 이후 같은 릴스를 다시 공유하면 새 batch와 item을 만든다.
 - 명시적 재공유는 open batch 유무와 관계없이 언제나 새 `reels` 히스토리를 남긴다.
 
