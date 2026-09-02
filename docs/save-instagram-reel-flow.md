@@ -166,7 +166,7 @@ HTTP 200 응답의 `documents: []`만 실제 후보 0개로 처리한다. Kakao�
 
 `REVIEW_QUEUE` 대기함은 요청 히스토리와 분리된 사용자별 `reel_queue_batches`·`reel_queue_items`다.
 
-- 같은 사용자의 같은 shortcode에 미처리(open) batch가 있으면 카드를 중복 생성하지 않고 `last_queued_at`을 갱신해 상단으로 올린다. 재추출에서 새로 발견된 장소만 기존 batch에 합친다.
+- 같은 사용자의 같은 shortcode에 미처리(open) batch가 있으면 카드를 중복 생성하지 않고 `last_queued_at`을 갱신해 상단으로 올린다. 완료 cache를 재사용할 때는 기존 item을 새 ID의 `PENDING` 세대로 바꿔 릴스의 전체 장소를 즉시 다시 보여준다. 새 추출이 필요하면 완료 시 새 결과 전체를 한 번만 열고 새로 발견된 장소도 같은 batch에 합친다. 따라서 재공유 전 item ID로 늦게 도착한 저장 요청은 새 카드를 변경하지 못하며, 재공유만으로는 `saved_places.last_saved_at`도 바뀌지 않는다.
 - 모든 item을 저장하거나 버리면 batch에 `resolved_at`을 기록한다. 이후 같은 릴스를 다시 공유하면 새 batch와 item을 만든다.
 - 명시적 재공유는 open batch 유무와 관계없이 언제나 새 `reels` 히스토리를 남긴다.
 

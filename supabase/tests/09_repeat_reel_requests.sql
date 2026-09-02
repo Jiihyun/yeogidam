@@ -1,5 +1,5 @@
 begin;
-select plan(61);
+select plan(71);
 
 select has_table('public', 'reel_extractions', '공용 릴스 추출 테이블 존재');
 select has_table('public', 'reel_extraction_places', '공용 추출 장소 테이블 존재');
@@ -19,7 +19,8 @@ insert into public.places (id, name, thumbnail_url)
 values
   ('e1000000-0000-0000-0000-000000000001', '반복 장소 1', 'https://example.com/e1.jpg'),
   ('e2000000-0000-0000-0000-000000000002', '반복 장소 2', 'https://example.com/e2.jpg'),
-  ('e3000000-0000-0000-0000-000000000003', '자동 저장 원자성 장소', null);
+  ('e3000000-0000-0000-0000-000000000003', '자동 저장 원자성 장소', null),
+  ('e4000000-0000-0000-0000-000000000004', '반복 장소 3', 'https://example.com/e4.jpg');
 
 select set_config(
   'test.repeat_first',
@@ -151,6 +152,13 @@ select public.persist_reel_place_result(
   null,
   (current_setting('test.repeat_first')::jsonb ->> 'processing_token')::uuid
 );
+select public.persist_reel_place_result(
+  (current_setting('test.repeat_first')::jsonb ->> 'worker_reel_id')::uuid,
+  'e4000000-0000-0000-0000-000000000004',
+  2,
+  null,
+  (current_setting('test.repeat_first')::jsonb ->> 'processing_token')::uuid
+);
 
 select is(
   public.finalize_reel_extraction(
@@ -176,7 +184,7 @@ select is(
    from public.reel_extraction_places
    where extraction_id =
      (current_setting('test.repeat_first')::jsonb ->> 'extraction_id')::uuid),
-  2,
+  3,
   'worker의 전체 장소를 공용 extraction에 고정'
 );
 select is(
@@ -194,8 +202,80 @@ select is(
    join public.reel_queue_batches as batch on batch.id = queue_item.batch_id
    where batch.user_id = '91000000-0000-0000-0000-000000000001'
      and batch.instagram_shortcode = 'repeat-cache'),
-  2,
+  3,
   'open queue 카드의 장소도 중복 없이 한 벌만 생성'
+);
+
+select set_config(
+  'test.repeat_open_batch_before_reshare',
+  (select id::text
+   from public.reel_queue_batches
+   where user_id = '91000000-0000-0000-0000-000000000001'
+     and instagram_shortcode = 'repeat-cache'
+     and resolved_at is null),
+  true
+);
+
+select set_config(
+  'test.repeat_item_before_reshare',
+  (select id::text
+   from public.reel_queue_items
+   where batch_id =
+       current_setting('test.repeat_open_batch_before_reshare')::uuid
+     and place_id = 'e1000000-0000-0000-0000-000000000001'),
+  true
+);
+
+update public.reel_queue_items as queue_item
+set
+  review_status = 'SAVED',
+  reviewed_at = now()
+where queue_item.batch_id =
+    current_setting('test.repeat_open_batch_before_reshare')::uuid
+  and queue_item.place_id = 'e1000000-0000-0000-0000-000000000001';
+
+insert into public.saved_places (
+  user_id,
+  place_id,
+  last_saved_at
+)
+values (
+  '91000000-0000-0000-0000-000000000001',
+  'e1000000-0000-0000-0000-000000000001',
+  '2000-01-01 00:00:00+00'
+);
+
+select set_config(
+  'test.repeat_completed_duplicate',
+  public.begin_reel_request(
+    '91000000-0000-0000-0000-000000000001',
+    'd1000000-0000-0000-0000-000000000001',
+    'repeat-cache',
+    'https://www.instagram.com/reel/repeat-cache/',
+    'instagram_share',
+    'REVIEW_QUEUE',
+    9,
+    now() - interval '15 minutes'
+  )::text,
+  true
+);
+
+select is(
+  (select review_status
+   from public.reel_queue_items
+   where batch_id =
+       current_setting('test.repeat_open_batch_before_reshare')::uuid
+     and place_id = 'e1000000-0000-0000-0000-000000000001'),
+  'SAVED',
+  '같은 request ID 재전송은 처리한 queue 장소를 다시 열지 않음'
+);
+select is(
+  (select count(*)::integer
+   from public.reels
+   where user_id = '91000000-0000-0000-0000-000000000001'
+     and instagram_shortcode = 'repeat-cache'),
+  2,
+  '완료 뒤 같은 request ID 재전송도 히스토리를 늘리지 않음'
 );
 
 update public.reel_queue_batches
@@ -253,10 +333,70 @@ select is(
    from public.reel_queue_items as queue_item
    join public.reel_queue_batches as batch on batch.id = queue_item.batch_id
    where batch.user_id = '91000000-0000-0000-0000-000000000001'
-     and batch.instagram_shortcode = 'repeat-cache'),
-  2,
-  '상단 이동 때 queue 장소를 중복 생성하지 않음'
+     and batch.instagram_shortcode = 'repeat-cache'
+     and queue_item.review_status = 'PENDING'
+     and queue_item.reviewed_at is null),
+  3,
+  '재공유하면 이미 저장했던 장소까지 모두 queue에 다시 노출'
 );
+select is(
+  (select id::text
+   from public.reel_queue_batches
+   where user_id = '91000000-0000-0000-0000-000000000001'
+     and instagram_shortcode = 'repeat-cache'
+     and resolved_at is null),
+  current_setting('test.repeat_open_batch_before_reshare'),
+  '재공유는 기존 open queue 카드를 그대로 재사용'
+);
+select isnt(
+  (select id::text
+   from public.reel_queue_items
+   where batch_id =
+       current_setting('test.repeat_open_batch_before_reshare')::uuid
+     and place_id = 'e1000000-0000-0000-0000-000000000001'),
+  current_setting('test.repeat_item_before_reshare'),
+  '재공유는 새 item 세대를 발급해 과거 저장 요청을 무효화'
+);
+select is(
+  (select last_saved_at
+   from public.saved_places
+   where user_id = '91000000-0000-0000-0000-000000000001'
+     and place_id = 'e1000000-0000-0000-0000-000000000001'),
+  '2000-01-01 00:00:00+00'::timestamptz,
+  '재공유만으로 이미 저장한 장소의 보관함 순서를 바꾸지 않음'
+);
+
+select set_config(
+  'test.repeat_item_before_stale_materialize',
+  (select id::text
+   from public.reel_queue_items
+   where batch_id =
+       current_setting('test.repeat_open_batch_before_reshare')::uuid
+     and place_id = 'e2000000-0000-0000-0000-000000000002'),
+  true
+);
+update public.reel_queue_items
+set
+  review_status = 'DISCARDED',
+  reviewed_at = now()
+where id = current_setting('test.repeat_item_before_stale_materialize')::uuid;
+select public.materialize_reel_request(
+  (current_setting('test.repeat_first')::jsonb ->> 'reel_id')::uuid
+);
+select ok(
+  (select id::text = current_setting('test.repeat_item_before_stale_materialize')
+      and review_status = 'DISCARDED'
+   from public.reel_queue_items
+   where batch_id =
+       current_setting('test.repeat_open_batch_before_reshare')::uuid
+     and place_id = 'e2000000-0000-0000-0000-000000000002'),
+  '늦게 materialize된 과거 요청은 최신 카드의 처리 상태를 되돌리지 않음'
+);
+update public.reel_queue_items
+set
+  review_status = 'PENDING',
+  reviewed_at = null
+where id = current_setting('test.repeat_item_before_stale_materialize')::uuid;
 
 select set_config(
   'test.repeat_other_user',
@@ -335,16 +475,10 @@ values (
   0
 );
 
-insert into public.saved_places (
-  user_id,
-  place_id,
-  last_saved_at
-)
-values (
-  '91000000-0000-0000-0000-000000000001',
-  'e1000000-0000-0000-0000-000000000001',
-  '2000-01-01 00:00:00+00'
-);
+update public.saved_places
+set last_saved_at = '2000-01-01 00:00:00+00'
+where user_id = '91000000-0000-0000-0000-000000000001'
+  and place_id = 'e1000000-0000-0000-0000-000000000001';
 
 set local role authenticated;
 select set_config(
@@ -354,6 +488,18 @@ select set_config(
     'role', 'authenticated'
   )::text,
   true
+);
+
+prepare stale_queue_item_save as
+  select public.resolve_queue_items(
+    array[current_setting('test.repeat_item_before_reshare')::uuid],
+    'SAVE'
+  );
+select throws_ok(
+  'stale_queue_item_save',
+  'P0001',
+  'queue_items_not_available',
+  '재공유 전 item ID의 늦은 SAVE 요청은 새 카드를 변경하지 못함'
 );
 
 select is(
@@ -400,16 +546,50 @@ select is(
        where queue_item.batch_id = current_setting('test.repeat_batch')::uuid
          and queue_item.place_id = 'e2000000-0000-0000-0000-000000000002')
     ],
+    'SAVE'
+  ),
+  1,
+  '재공유 카드에서 처음 저장하는 두 번째 장소 확정'
+);
+select is(
+  (select count(*)::integer
+   from public.saved_places
+   where user_id = '91000000-0000-0000-0000-000000000001'
+     and place_id = 'e2000000-0000-0000-0000-000000000002'),
+  1,
+  '처음 저장한 두 번째 장소는 saved_places에 생성'
+);
+select ok(
+  (select batch.resolved_at is null
+      and (
+        select count(*)
+        from public.reel_queue_items as queue_item
+        where queue_item.batch_id = batch.id
+          and queue_item.review_status = 'PENDING'
+          and queue_item.place_id = 'e4000000-0000-0000-0000-000000000004'
+      ) = 1
+   from public.reel_queue_batches as batch
+   where batch.id = current_setting('test.repeat_batch')::uuid),
+  'A와 B를 저장하면 재공유 카드에는 C만 남음'
+);
+select is(
+  public.resolve_queue_items(
+    array[
+      (select queue_item.id
+       from public.reel_queue_items as queue_item
+       where queue_item.batch_id = current_setting('test.repeat_batch')::uuid
+         and queue_item.place_id = 'e4000000-0000-0000-0000-000000000004')
+    ],
     'DISCARD'
   ),
   1,
-  '남은 open queue item 제외'
+  '재공유 카드에 남은 세 번째 장소 제외'
 );
 select ok(
   (select resolved_at is not null
    from public.reel_queue_batches
    where id = current_setting('test.repeat_batch')::uuid),
-  '원래 queue도 모든 item 처리 뒤 resolved 처리'
+  '재공유 카드의 모든 item 처리 뒤 resolved 처리'
 );
 
 reset role;
@@ -458,7 +638,7 @@ select is(
    where batch.user_id = '91000000-0000-0000-0000-000000000001'
      and batch.instagram_shortcode = 'repeat-cache'
      and batch.resolved_at is null),
-  2,
+  3,
   '새 queue batch에 캐시 장소 전체를 다시 노출'
 );
 
@@ -523,7 +703,6 @@ select ok(
      and resolved_at is null),
   '새 추출이 진행 중이어도 명시적 재요청 즉시 기존 open queue를 상단으로 이동'
 );
-
 select is(
   (current_setting('test.partial_second')::jsonb ->> 'should_process')::boolean,
   true,

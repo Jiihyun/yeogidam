@@ -189,7 +189,7 @@ Edge Function은 인증과 입력 검증 후 `begin_reel_request`에서 요청 �
 
 현재 `PIPELINE_VERSION`의 완전한 완료 extraction이 있으면 같은 사용자든 다른 사용자든 외부 API 호출 없이 저장된 장소를 즉시 구체화합니다. 같은 shortcode/version 추출이 진행 중이면 새 요청은 그 extraction에 합류하고, 캐시가 없을 때만 한 worker가 Instagram·Gemini·Kakao 처리를 `EdgeRuntime.waitUntil()`에서 수행합니다. 알려진 부분 성공과 실패 attempt는 `cacheable=false`로 보존되어 다음 요청이 새 extraction을 만들며, 오래 정체된 worker는 새 processing token으로 인계해 늦은 결과의 확정을 막습니다.
 
-완료 시 `finalize_reel_extraction`이 공용 장소 목록을 고정하고 연결된 모든 요청을 함께 완료합니다. `REVIEW_QUEUE`는 사용자의 같은 shortcode open batch가 있으면 `last_queued_at`을 갱신하고 새 장소만 합치며, 모두 처리된 뒤 재요청하면 새 batch를 만듭니다. `AUTO_SAVE`는 같은 트랜잭션에서 `saved_places`를 upsert하고 기존 장소의 `last_saved_at`을 갱신합니다. 앱 보관함은 `last_saved_at DESC, id DESC`로 조회합니다.
+완료 시 `finalize_reel_extraction`이 공용 장소 목록을 고정하고 연결된 모든 요청을 함께 완료합니다. `REVIEW_QUEUE`는 사용자의 같은 shortcode open batch가 있으면 `last_queued_at`을 갱신합니다. 완료 cache 재사용 시 기존 item을 새 ID의 `PENDING` 세대로 바꿔 전체 장소를 즉시 다시 보여주고, 새 추출이 필요하면 완료 시 새 결과 전체를 한 번만 열어 새 장소도 같은 batch에 합칩니다. 과거 item ID로 늦게 도착한 요청은 거부하고, 모두 처리된 뒤 재요청하면 새 batch를 만듭니다. 재공유 자체는 보관함 저장 시각을 바꾸지 않고, `AUTO_SAVE` 또는 사용자의 명시적 `SAVE`만 `saved_places`를 upsert해 기존 장소의 `last_saved_at`을 갱신합니다. 앱 보관함은 `last_saved_at DESC, id DESC`로 조회합니다.
 
 앱은 저장 직후 `saved_places`와 `reels`를 다시 조회합니다. 현재 Realtime 구독과 자동 polling은 없으며 화면 진입 또는 당겨서 새로고침으로 갱신합니다.
 
@@ -204,7 +204,7 @@ Edge Function은 인증과 입력 검증 후 `begin_reel_request`에서 요청 �
 - Kakao 장소 ID 기준 중복 방지와 유일 후보 확정
 - `clientRequestId` 기반 전송 멱등성과 명시적 요청별 히스토리
 - Instagram shortcode·파이프라인 버전 기반 사용자 공용 추출 캐시
-- 사용자별 대기함 batch/item의 재공유 상단 이동·장소 병합·처리 후 재생성
+- 사용자별 대기함 batch/item의 재공유 상단 이동·전체 장소 재노출·장소 병합·처리 후 재생성
 - 기존 장소 재저장 시 `last_saved_at` 갱신과 보관함 최신순 정렬
 - 장소와 사용자 저장 데이터 분리
 - Google Places 썸네일, 제공자 폴백, Storage 업로드

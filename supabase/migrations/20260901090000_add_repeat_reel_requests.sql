@@ -353,7 +353,8 @@ revoke all on function public.finalize_auto_save_reel_on_completion() from anon;
 revoke all on function public.finalize_auto_save_reel_on_completion() from authenticated;
 
 -- 완료된 extraction을 요청 히스토리와 사용자별 저장/대기함 상태에 반영한다.
--- 같은 shortcode의 open batch가 있으면 장소 행을 다시 만들지 않고 시각만 올린다.
+-- 같은 shortcode의 open batch가 있으면 카드를 재사용하되 모든 장소를 다시
+-- PENDING으로 열고 요청 시각을 올린다.
 create function public.materialize_reel_request(p_reel_id uuid)
 returns uuid
 language plpgsql
@@ -364,6 +365,10 @@ declare
   v_reel public.reels%rowtype;
   v_extraction public.reel_extractions%rowtype;
   v_batch_id uuid;
+  v_previous_extraction_id uuid;
+  v_previous_latest_reel_id uuid;
+  v_effective_extraction_id uuid;
+  v_effective_latest_reel_id uuid;
   v_next_position integer;
   v_now timestamptz := now();
 begin
@@ -446,6 +451,20 @@ begin
     return null;
   end if;
 
+  -- begin_reel_request에서 이미 이 요청으로 카드를 다시 연 경우에는 완료 시
+  -- 사용자가 그사이 처리한 상태를 보존하고 새 장소만 합친다.
+  select
+    batch.extraction_id,
+    batch.latest_reel_id
+  into
+    v_previous_extraction_id,
+    v_previous_latest_reel_id
+  from public.reel_queue_batches as batch
+  where batch.user_id = v_reel.user_id
+    and batch.instagram_shortcode = v_extraction.instagram_shortcode
+    and batch.resolved_at is null
+  for update;
+
   insert into public.reel_queue_batches (
     user_id,
     extraction_id,
@@ -460,13 +479,14 @@ begin
     v_reel.id,
     v_extraction.instagram_shortcode,
     v_now,
-    v_now
+    v_reel.created_at
   )
   on conflict (user_id, instagram_shortcode)
     where resolved_at is null
   do update set
     extraction_id = case
       when reel_queue_batches.latest_reel_id is null
+        or reel_queue_batches.latest_reel_id = v_reel.id
         or coalesce(
           (
             select latest_reel.created_at
@@ -474,12 +494,13 @@ begin
             where latest_reel.id = reel_queue_batches.latest_reel_id
           ),
           '-infinity'::timestamptz
-        ) <= v_reel.created_at
+        ) < v_reel.created_at
       then excluded.extraction_id
       else reel_queue_batches.extraction_id
     end,
     latest_reel_id = case
       when reel_queue_batches.latest_reel_id is null
+        or reel_queue_batches.latest_reel_id = v_reel.id
         or coalesce(
           (
             select latest_reel.created_at
@@ -487,7 +508,7 @@ begin
             where latest_reel.id = reel_queue_batches.latest_reel_id
           ),
           '-infinity'::timestamptz
-        ) <= v_reel.created_at
+        ) < v_reel.created_at
       then excluded.latest_reel_id
       else reel_queue_batches.latest_reel_id
     end,
@@ -495,7 +516,50 @@ begin
       reel_queue_batches.last_queued_at,
       v_reel.created_at
     )
-  returning id into v_batch_id;
+  returning
+    id,
+    extraction_id,
+    latest_reel_id
+  into
+    v_batch_id,
+    v_effective_extraction_id,
+    v_effective_latest_reel_id;
+
+  -- 더 최신 요청이 이미 같은 카드를 차지했다면 늦게 끝난 과거 요청은
+  -- 장소 상태나 item 세대를 되돌리지 않는다.
+  if v_effective_latest_reel_id is distinct from v_reel.id then
+    return v_batch_id;
+  end if;
+
+  -- 명시적으로 같은 릴스를 다시 공유하면 기존 처리 여부와 관계없이 카드의
+  -- 모든 장소를 새 item 세대로 다시 보여준다. 이전 item ID의 늦은 SAVE가
+  -- 새 카드에 적용되지 않으며 보관함 시각은 실제 새 SAVE 때만 갱신된다.
+  if v_previous_latest_reel_id is distinct from v_reel.id
+     or v_previous_extraction_id is distinct from v_effective_extraction_id then
+    delete from public.reel_queue_items as queue_item
+    where queue_item.batch_id = v_batch_id;
+
+    insert into public.reel_queue_items (
+      batch_id,
+      place_id,
+      position,
+      review_status,
+      reviewed_at
+    )
+    select
+      v_batch_id,
+      extraction_place.place_id,
+      row_number() over (
+        order by extraction_place.position, extraction_place.id
+      )::integer - 1,
+      'PENDING',
+      null
+    from public.reel_extraction_places as extraction_place
+    where extraction_place.extraction_id = v_effective_extraction_id
+    order by extraction_place.position, extraction_place.id;
+
+    return v_batch_id;
+  end if;
 
   select coalesce(max(queue_item.position) + 1, 0)
   into v_next_position
@@ -522,7 +586,7 @@ begin
         order by extraction_place.position, extraction_place.id
       )::integer - 1 as append_offset
     from public.reel_extraction_places as extraction_place
-    where extraction_place.extraction_id = v_extraction.id
+    where extraction_place.extraction_id = v_effective_extraction_id
       and not exists (
         select 1
         from public.reel_queue_items as existing_item
@@ -843,8 +907,6 @@ begin
     update public.reels
     set extraction_id = v_extraction.id
     where id = v_reel_id;
-
-    perform public.materialize_reel_request(v_reel_id);
   elsif v_extraction.updated_at <= p_stale_before
         or v_extraction.worker_reel_id is null then
     v_old_worker_reel_id := v_extraction.worker_reel_id;
@@ -892,7 +954,8 @@ begin
   end if;
 
   -- extraction row를 먼저 잠근 뒤 batch를 만져 finalize와 lock 순서를 맞춘다.
-  -- 새 분석의 성공 여부와 무관하게 명시적 요청 시각에 기존 open 카드를 올린다.
+  -- 새 REVIEW_QUEUE 분석의 성공 여부와 무관하게 명시적 요청 시각에 기존
+  -- open 카드를 올린다. AUTO_SAVE는 별도 대기함 상태를 건드리지 않는다.
   update public.reel_queue_batches as open_batch
   set
     latest_reel_id = case
@@ -922,7 +985,33 @@ begin
     )
   where open_batch.user_id = p_user_id
     and open_batch.instagram_shortcode = v_shortcode
-    and open_batch.resolved_at is null;
+    and open_batch.resolved_at is null
+    and v_save_mode = 'REVIEW_QUEUE';
+
+  -- 완료 cache를 재사용하는 REVIEW_QUEUE 재공유는 기존 장소를 즉시 새
+  -- item 세대로 다시 연다. 새 추출이 필요한 요청은 결과가 완료된 뒤
+  -- materialize에서 새 결과 전체를 한 번만 연다.
+  if v_save_mode = 'REVIEW_QUEUE' and v_reused then
+    update public.reel_queue_items as queue_item
+    set
+      id = gen_random_uuid(),
+      review_status = 'PENDING',
+      reviewed_at = null,
+      created_at = now()
+    where exists (
+      select 1
+      from public.reel_queue_batches as open_batch
+      where open_batch.id = queue_item.batch_id
+        and open_batch.user_id = p_user_id
+        and open_batch.instagram_shortcode = v_shortcode
+        and open_batch.latest_reel_id = v_reel_id
+        and open_batch.resolved_at is null
+    );
+  end if;
+
+  if v_reused then
+    perform public.materialize_reel_request(v_reel_id);
+  end if;
 
   return public.reel_request_payload(
     v_reel_id,
