@@ -395,6 +395,10 @@ verify_jwt = true
 # Google Cloud Monitoring이 호출하는 공개 웹훅이다. 함수 내부 Basic Auth로 보호한다.
 verify_jwt = false
 
+[functions.app-update-policy]
+# 로그인 전에도 호출해야 하는 공개 업데이트 정책 조회 API다.
+verify_jwt = false
+
 # [edge_runtime.secrets]
 # secret_key = "env(SECRET_VALUE)"
 

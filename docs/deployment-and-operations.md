@@ -54,6 +54,10 @@ OPENAI_MATCH_MODEL           선택, 기본 OPENAI_MODEL
 KAKAO_REST_API_KEY
 GOOGLE_PLACES_API_KEY
 PUBLIC_SUPABASE_URL          선택, Storage 공개 URL 기준
+APP_UPDATE_IOS_MINIMUM_SUPPORTED_VERSION
+APP_UPDATE_IOS_STORE_URL
+APP_UPDATE_ANDROID_MINIMUM_SUPPORTED_VERSION  Android 배포 후 설정
+APP_UPDATE_ANDROID_STORE_URL                  Android 배포 후 설정
 ```
 
 Supabase가 자동으로 제공하는 값:
@@ -77,6 +81,54 @@ supabase secrets set \
 ```
 
 키 값을 문서, Git, 앱 번들에 넣지 않습니다. iOS에 포함되는 Supabase `anon` 키는 공개 클라이언트 키이며 `service_role` 키와 다릅니다.
+
+### 앱 업데이트 정책
+
+`app-update-policy` Function은 앱이 로그인하기 전에도 호출하는 공개 API다.
+현재 앱 버전이 플랫폼별 최소 지원 버전보다 낮으면 `updateRequired=true`를
+반환한다. 정책은 프로젝트별 Function Secret으로 관리해 함수를 재배포하지
+않고도 바꿀 수 있다.
+
+```bash
+supabase secrets set \
+  APP_UPDATE_IOS_MINIMUM_SUPPORTED_VERSION=1.1.0 \
+  APP_UPDATE_IOS_STORE_URL=https://apps.apple.com/app/id6801408355 \
+  --project-ref vowmaqcmwocrocfymyux
+```
+
+운영의 최소 지원 버전은 App Store에서 해당 버전을 실제로 다운로드할 수
+있는지 확인한 뒤에만 다음과 같이 올린다.
+
+```bash
+supabase secrets set \
+  APP_UPDATE_IOS_MINIMUM_SUPPORTED_VERSION=1.1.0 \
+  APP_UPDATE_IOS_STORE_URL=https://apps.apple.com/app/id6801408355 \
+  --project-ref hbbrgudsbvnwuylxqlta
+```
+
+Android는 Play Store 배포 후 같은 형식의 `APP_UPDATE_ANDROID_*` 값을
+등록한다. 요청한 플랫폼의 정책이 누락되거나 잘못되면 HTTP 503을
+반환하므로 앱은 조회 장애 시 진입을 차단하지 않는다. `ios`, `android`
+외의 플랫폼 값은 HTTP 400을 반환한다.
+
+이 API 호출 로직이 없는 기존 앱에는 소급해서 강제 업데이트를 표시할
+수 없다. 업데이트 조회가 처음 포함된 버전부터 이후 버전의 강제 전환을
+제어할 수 있다.
+
+API 요청과 응답 계약은 다음과 같다. `appVersion`은 `major.minor` 또는
+`major.minor.patch` 형식이다.
+
+```http
+GET /functions/v1/app-update-policy?platform=ios&appVersion=1.0
+```
+
+```json
+{
+  "updateRequired": true,
+  "minimumSupportedVersion": "1.1.0",
+  "storeUrl": "https://apps.apple.com/app/id6801408355"
+}
+```
 
 ### 장소 AI 키 교체와 공급자 전환
 
@@ -151,6 +203,9 @@ supabase functions deploy save-instagram-reel-v2 \
 supabase functions deploy gemini-quota-discord \
   --no-verify-jwt \
   --project-ref vowmaqcmwocrocfymyux
+supabase functions deploy app-update-policy \
+  --no-verify-jwt \
+  --project-ref vowmaqcmwocrocfymyux
 ```
 
 `gemini-quota-discord`는 환경 간 Function 구성을 맞추기 위해 개발 프로젝트에도
@@ -170,6 +225,9 @@ supabase functions deploy save-instagram-reel \
   --project-ref hbbrgudsbvnwuylxqlta
 supabase functions deploy save-instagram-reel-v2 \
   --project-ref hbbrgudsbvnwuylxqlta
+supabase functions deploy app-update-policy \
+  --no-verify-jwt \
+  --project-ref hbbrgudsbvnwuylxqlta
 ```
 
 개발·QA 배포 후 확인:
@@ -180,7 +238,8 @@ supabase functions list --project-ref vowmaqcmwocrocfymyux
 ```
 
 Function 목록에서 `save-instagram-reel`, `save-instagram-reel-v2`,
-`gemini-quota-discord`가 모두 `ACTIVE`인지 확인한다. QA 앱과 Share Extension은
+`gemini-quota-discord`, `app-update-policy`가 모두 `ACTIVE`인지 확인한다.
+QA 앱과 Share Extension은
 다음 v2 경로를 사용해 저장 요청과 대기함 반영을 확인한다.
 
 ```text
@@ -222,10 +281,13 @@ open Yeogidam.xcodeproj
 ```bash
 npx -y deno@2 fmt --check \
   supabase/functions/save-instagram-reel \
-  supabase/functions/save-instagram-reel-v2
+  supabase/functions/save-instagram-reel-v2 \
+  supabase/functions/app-update-policy
 npx -y deno@2 test supabase/functions/save-instagram-reel/*_test.ts
+npx -y deno@2 test supabase/functions/app-update-policy/*_test.ts
 npx -y deno@2 check supabase/functions/save-instagram-reel/index.ts
 npx -y deno@2 check supabase/functions/save-instagram-reel-v2/index.ts
+npx -y deno@2 check supabase/functions/app-update-policy/index.ts
 ```
 
 ### DB

@@ -30,7 +30,9 @@ Instagram 릴스에서 발견한 장소를 추출해 개인 장소 목록에 저
 ```bash
 # Edge Function 단위 테스트와 타입 검사
 npx -y deno@2 test supabase/functions/save-instagram-reel/*_test.ts
+npx -y deno@2 test supabase/functions/app-update-policy/*_test.ts
 npx -y deno@2 check supabase/functions/save-instagram-reel/index.ts
+npx -y deno@2 check supabase/functions/app-update-policy/index.ts
 
 # 로컬 Supabase DB 테스트
 supabase start

@@ -60,6 +60,12 @@ export const ErrorCode = {
     httpStatus: 400,
     retryable: false,
   },
+  INVALID_QUERY_PARAMETER: {
+    code: "COMMON400_002",
+    message: "요청 파라미터를 확인해주세요.",
+    httpStatus: 400,
+    retryable: false,
+  },
   INVALID_INSTAGRAM_URL: {
     code: "REEL400_001",
     message: "Instagram 게시물 주소를 확인해주세요.",
@@ -155,6 +161,12 @@ export const ErrorCode = {
     message: "계정을 삭제하지 못했어요. 고객지원에 문의해주세요.",
     httpStatus: 500,
     retryable: false,
+  },
+  APP_UPDATE_POLICY_UNAVAILABLE: {
+    code: "UPDATE503_001",
+    message: "업데이트 정보를 확인하지 못했어요. 잠시 후 다시 시도해주세요.",
+    httpStatus: 503,
+    retryable: true,
   },
   NETWORK_UNAVAILABLE: {
     code: "CLIENT000_001",
