@@ -296,6 +296,64 @@ npx -y deno@2 check supabase/functions/app-update-policy/index.ts
 supabase db test
 ```
 
+### 구버전 관련 릴스 HTTP 회귀 테스트
+
+`20260905090000_legacy_related_reels_compat.sql`은 데이터를 변경하지 않고
+`reels → reel_places` embedding을 `user_related_reels`에 연결한다.
+PostgREST computed relationship으로 기존 FK 관계를 덮어쓰는 방식이며,
+마이그레이션 끝에서 schema cache reload를 요청한다.
+
+- [PostgREST computed relationship 공식 문서](https://docs.postgrest.org/en/v14/references/api/resource_embedding.html#overriding-relationships)
+- DB 검증: `supabase/tests/10_legacy_related_reels.sql`
+- HTTP 검증: `supabase/scripts/test-legacy-related-reels-http.mjs`
+
+SQL 테스트만으로는 PostgREST의 관계 선택과 `!inner` 필터를 검증할 수 없으므로
+실제 HTTP 테스트를 함께 실행한다. 테스트 대상은 애플리케이션 마이그레이션과
+Supabase `auth`/`storage` 스키마가 준비된 **폐기 가능한 로컬 전용 DB**와 그 DB에
+연결한 PostgREST다. 아래 이름의 DB를 미리 만들고, 서버의 JWT secret과 같은
+로컬 테스트 전용 값을 지정한다. 운영 secret은 사용하지 않는다.
+
+```bash
+POSTGRES_TEST_URL=postgresql://postgres@127.0.0.1:55432/yeogidam_compat_test \
+POSTGREST_TEST_URL=http://127.0.0.1:55433 \
+POSTGREST_TEST_JWT_SECRET=local-only-compat-test-secret-at-least-32-chars \
+PSQL_BINARY=/path/to/psql \
+node --test supabase/scripts/test-legacy-related-reels-http.mjs
+```
+
+이 스크립트는 loopback 주소와 `yeogidam_compat_test` 또는
+`yeogidam_compat_test_*` 이름의 DB만 허용한다. 임의 UUID의 테스트 사용자·장소를
+만들고 종료 시 해당 자료만 삭제하며, 마이그레이션을 실행하거나 기존 테이블을
+비우지 않는다. 구버전 프론트의 실제 select/filter를 그대로 사용해 다음을 검증한다.
+
+- 다른 사용자의 완료 캐시 및 진행 중 분석을 재사용한 요청의 관련 릴스 조회
+- 재공유 시 최신 성공 요청 한 건만 표시하고 신규 조회와 결과가 일치하는지
+- 작성자·캡션·썸네일과 보관함 자동 저장 유지
+- 사용자 격리, 익명 요청 거부, 장소 필터와 `!inner` 동작
+- 기존 자료 조회, stale worker 결과 제외, 물리 worker 기록 보존
+
+개발 환경에서 구버전 앱으로 URL 저장·인스타 공유·보관함·장소 상세를 확인한 뒤
+운영에 적용한다. **DB migration → 업데이트된 v1 → v2** 배포 순서는 유지한다.
+계산 관계만 되돌릴 때는 `public.reel_places(public.reels)` 함수를 제거하고
+PostgREST schema cache를 다시 로드하면 기존 FK 조회로 돌아간다. 이 경우
+재사용 요청의 구버전 관련 릴스 누락도 다시 발생한다. 반복 요청 데이터가 생긴
+뒤 저장 함수 전체를 예전 main으로 되돌리는 것은 별도 문제이므로, 이를 안전한
+전체 서버 롤백 절차로 취급하지 않는다.
+
+#### 2026-09-05 로컬 검증 기록
+
+- PostgreSQL 17.11 / PostgREST 16.2 / pgTAP 1.3.4의 격리된 로컬 환경에서 검증했다.
+- 수정 전에는 다른 사용자의 진행 중·완료 결과를 재사용한 요청의 관련 릴스가
+  누락됐고, 인계된 worker의 이전 중간 결과가 조회되는 문제도 재현했다.
+- 수정 후 구버전 HTTP 조회 10개 시나리오가 모두 통과했다. 동일 테스트에서
+  신규 `user_related_reels` 조회와 보관함 조회가 유지되는 것도 확인했다.
+- DB 테스트 11개 파일의 assertion 236개와 Edge Function 단위 테스트 248개가
+  모두 통과했다. 조회 전후 worker·요청·추출·보관함·대기함 데이터가 동일했다.
+- 로컬 `auth`/`storage`는 DB 테스트용 최소 스키마로 구성했다. 실제 Supabase
+  Auth·Storage HTTP 서비스, Edge Runtime, 운영 JWT 설정과 실기기 앱은 검증하지
+  않았으며 운영 DB에도 적용하지 않았다. 운영 승격 전 개발 프로젝트에서
+  기존 앱으로 확인하는 절차는 별도로 필요하다.
+
 ### iOS Simulator
 
 ```bash

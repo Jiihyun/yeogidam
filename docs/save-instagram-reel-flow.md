@@ -176,6 +176,22 @@ HTTP 200 응답의 `documents: []`만 실제 후보 0개로 처리한다. Kakao�
 
 인증 사용자는 추출·대기함 관계를 임의로 쓰지 못하고, RLS를 통해 자신이 요청한 extraction과 자신의 batch/item만 읽는다. iOS의 장소 상세는 `user_related_reels` 뷰로 같은 shortcode의 반복 히스토리를 하나로 정리해 최신 관련 릴스를 보여주며, 썸네일을 누르면 원본 `instagram_url`을 연다.
 
+구버전 React Native 앱(`fe-release/1.0.1`)의
+`reels?select=...,reel_places!inner(place_id)&reel_places.place_id=eq.<placeId>`
+요청도 같은 `user_related_reels` 결과를 사용한다. DB의
+`public.reel_places(public.reels)` computed relationship이 기존 embedding을
+덮어쓰므로 앱의 URL·필터·응답 필드는 바뀌지 않는다. 부모 `reels`에서 읽는
+작성자·캡션·썸네일도 그대로 유지한다. 반환형은 `SETOF user_related_reels`이며
+이 호환 계약의 중첩 선택 필드는 `place_id`다. 물리 `reel_places` 행 ID나 대기함
+item ID를 합성하지 않으며, 기존 테이블에 연결을 복제하거나 worker의 중간
+결과를 지우지 않는다. 따라서 재공유 중복 제거와 stale attempt 제외도 새
+조회와 같은 기준을 따른다.
+
+이 함수는 호출자 권한으로 실제 부모 행과 소유자를 다시 확인한다. 요청에서
+넘긴 composite의 `user_id`나 `extraction_id`는 신뢰하지 않는다. 독립적인
+`/rest/v1/reel_places` 조회와 서버의 worker 쓰기에는 영향을 주지 않는다.
+이전 `extraction_id IS NULL` 자료는 뷰의 legacy 경로로 계속 조회한다.
+
 장소 매칭 결과가 달라지는 코드를 배포할 때 `PIPELINE_VERSION`을 올리지 않으면 완료된 같은 shortcode는 기존 결과를 계속 재사용한다. 반대로 버전을 올리면 새 extraction을 만들고 과거 extraction과 요청 히스토리는 그대로 보존한다. 사용자 단위 `saved_places`도 자동 삭제하지 않으므로 과거 오탐을 제거하려면 다른 릴스가 같은 장소를 참조하는지 확인하는 별도 정리 정책이 필요하다.
 
 Naver 전용 `naver_place_id`, `naver_link`, `naver_thumbnail_url`은 Kakao 전환 마이그레이션에서 제거한다. 장소 식별자와 지도 링크의 SSOT는 각각 `kakao_place_id`, `kakao_place_url`이다.
