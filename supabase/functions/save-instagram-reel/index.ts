@@ -1,6 +1,7 @@
 // POST /functions/v1/save-instagram-reel
-// 1) JWT 인증 → 2) IG URL/shortcode 검증 → 3) 완료 결과 재사용 또는 PROCESSING insert
-// → 4) 202 즉시 반환 → 5) waitUntil 파이프라인(IG 추출 → AI → Kakao → 썸네일 → DB)
+// 1) JWT 인증 → 2) IG URL/shortcode 검증 → 3) 요청 히스토리 멱등 생성
+// → 4) shortcode/version 공용 완료 캐시 재사용 또는 단일 worker 선점
+// → 5) 필요할 때만 waitUntil 파이프라인(IG 추출 → AI → Kakao → 썸네일 → DB)
 //
 // 로컬 검증용: 환경변수 PIPELINE_SYNC=1 이면 백그라운드 대신 동기로 처리하고
 // 최종 상태를 응답에 담아 반환한다(테스트 편의). 프로덕션 기본은 비동기(202).
@@ -34,11 +35,20 @@ import {
   rehostThumbnail,
   scrapePageImage,
 } from "./thumbnail.ts";
+import { parseInstagramReelURL } from "./reel.ts";
 import {
-  completedProcessingVersion,
-  parseInstagramReelURL,
-  shouldRetryReel,
-} from "./reel.ts";
+  begunReelHTTPResult,
+  type BegunReelRequest,
+  clientRequestId,
+  isIdempotencyKeyPayloadMismatch,
+  parseBegunReelRequest,
+  type ReelRequestPayload,
+} from "./request.ts";
+import {
+  AUTO_SAVE,
+  type ReelSaveMode,
+  responseForSaveMode,
+} from "./workflow.ts";
 
 // Supabase Edge Runtime 전역 (백그라운드 처리)
 declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void };
@@ -46,7 +56,7 @@ declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void };
 const cors = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
+    "authorization, x-client-info, apikey, content-type, idempotency-key",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
@@ -162,7 +172,16 @@ const STUB_THUMBNAIL = {
   attribution: "Google Places stub",
 };
 
-Deno.serve(async (req) => {
+export function createSaveInstagramReelHandler(
+  requestedSaveMode: ReelSaveMode,
+): (req: Request) => Promise<Response> {
+  return (req) => handleSaveInstagramReel(req, requestedSaveMode);
+}
+
+async function handleSaveInstagramReel(
+  req: Request,
+  requestedSaveMode: ReelSaveMode,
+): Promise<Response> {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   const requestId = createRequestId();
   try {
@@ -196,7 +215,7 @@ Deno.serve(async (req) => {
     const userId = userData.user.id;
 
     // 2) 입력 검증
-    let payload: { instagramUrl?: string; source?: string };
+    let payload: ReelRequestPayload;
     try {
       payload = await req.json();
     } catch {
@@ -205,8 +224,16 @@ Deno.serve(async (req) => {
         details: { field: "body" },
       });
     }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return errorResponse("INVALID_REQUEST_BODY", requestId, {
+        headers: cors,
+        details: { field: "body" },
+      });
+    }
     const reelReference = parseInstagramReelURL(
-      (payload.instagramUrl ?? "").trim(),
+      typeof payload.instagramUrl === "string"
+        ? payload.instagramUrl.trim()
+        : "",
     );
     const source = payload.source === "url_input"
       ? "url_input"
@@ -218,155 +245,68 @@ Deno.serve(async (req) => {
       });
     }
     const instagramUrl = reelReference.canonicalUrl;
+    const idempotency = clientRequestId(req, payload);
+    if (!idempotency.value) {
+      return errorResponse("INVALID_REQUEST_BODY", requestId, {
+        headers: cors,
+        details: { field: "clientRequestId" },
+      });
+    }
 
-    // 3) 같은 사용자의 shortcode가 이미 처리 중이거나 완료됐다면 그대로 반환한다.
+    // 3) 요청 히스토리를 생성하고 shortcode+pipeline version 공용 추출을 선점한다.
+    // 같은 clientRequestId 재전송은 동일 히스토리로 수렴하고, 서로 다른 사용자의
+    // 동시 요청도 하나의 worker만 외부 API를 호출한다.
     const admin = createClient(SUPABASE_URL, SERVICE);
-    const { data: existing, error: existingError } = await admin
-      .from("reels")
-      .select(
-        "id, place_id, processing_status, failure_reason, processing_version, updated_at",
-      )
-      .eq("user_id", userId)
-      .eq("instagram_shortcode", reelReference.shortcode)
-      .maybeSingle();
-    if (existingError) return databaseErrorResponse(requestId, existingError);
-
-    if (
-      existing && !shouldRetryReel(
-        {
-          processingStatus: existing.processing_status,
-          processingVersion: existing.processing_version,
-          updatedAt: existing.updated_at,
-        },
-        PIPELINE_VERSION,
-        STALE_PROCESSING_MS,
-      )
-    ) {
-      return await cachedReelResponse(admin, existing, userId, true);
+    const staleBefore = new Date(Date.now() - STALE_PROCESSING_MS)
+      .toISOString();
+    const { data: begunData, error: begunError } = await admin.rpc(
+      "begin_reel_request",
+      {
+        p_user_id: userId,
+        p_client_request_id: idempotency.value,
+        p_instagram_shortcode: reelReference.shortcode,
+        p_instagram_url: instagramUrl,
+        p_source: source,
+        p_save_mode: requestedSaveMode,
+        p_pipeline_version: PIPELINE_VERSION,
+        p_stale_before: staleBefore,
+      },
+    );
+    if (isIdempotencyKeyPayloadMismatch(begunError)) {
+      return errorResponse("INVALID_REQUEST_BODY", requestId, {
+        headers: cors,
+        details: { field: "clientRequestId" },
+      });
+    }
+    const begun = parseBegunReelRequest(begunData);
+    if (begunError || !begun) {
+      return databaseErrorResponse(
+        requestId,
+        begunError ?? new Error("invalid_begin_reel_request"),
+      );
     }
 
-    // FAILED 또는 오래 멈춘 작업은 같은 행을 원자적으로 비우고 재시도한다.
-    if (existing) {
-      const { data: retryReel, error: retryError } = await admin
-        .from("reels")
-        .update({
-          instagram_url: instagramUrl,
-          source,
-          place_id: null,
-          processing_version: PIPELINE_VERSION,
-          processing_status: "PROCESSING",
-          failure_reason: null,
-        })
-        .eq("id", existing.id)
-        .eq("updated_at", existing.updated_at)
-        .select("id")
-        .maybeSingle();
-      if (retryError) return databaseErrorResponse(requestId, retryError);
-      if (retryReel) {
-        const { error: cleanupError } = await admin.from("reel_places").delete()
-          .eq("reel_id", retryReel.id);
-        const { error: failureCleanupError } = await admin
-          .from("reel_place_match_failures")
-          .delete()
-          .eq("reel_id", retryReel.id);
-        if (cleanupError || failureCleanupError) {
-          await admin.from("reels").update({
-            processing_status: "FAILED",
-            failure_reason: "UNKNOWN",
-          }).eq("id", retryReel.id);
-          return databaseErrorResponse(
-            requestId,
-            cleanupError ?? failureCleanupError,
-          );
-        }
-        return scheduleOrProcess(
-          admin,
-          retryReel.id,
-          userId,
-          instagramUrl,
-          false,
-        );
-      }
-
-      const { data: raced } = await admin
-        .from("reels")
-        .select(
-          "id, place_id, processing_status, failure_reason, processing_version, updated_at",
-        )
-        .eq("id", existing.id)
-        .single();
-      return raced
-        ? await cachedReelResponse(admin, raced, userId, true)
-        : databaseErrorResponse(requestId);
+    if (!begun.shouldProcess) {
+      return begunReelResponse(begun, requestedSaveMode);
+    }
+    if (!begun.workerReelId) {
+      return databaseErrorResponse(
+        requestId,
+        new Error("missing_worker_reel_for_claimed_extraction"),
+      );
     }
 
-    // 다른 사용자가 이미 완료한 동일 릴스가 있으면 외부 API 결과를 재사용한다.
-    const { data: completedSource, error: sourceError } = await admin
-      .from("reels")
-      .select(
-        "id, place_id, instagram_description, instagram_author_username, instagram_thumbnail_url",
-      )
-      .eq("instagram_shortcode", reelReference.shortcode)
-      .eq("processing_status", "COMPLETED")
-      .eq("processing_version", PIPELINE_VERSION)
-      .order("created_at", { ascending: true })
-      .limit(1)
-      .maybeSingle();
-    if (sourceError) return databaseErrorResponse(requestId, sourceError);
-
-    // 4) 신규 사용자 저장 행 생성. partial unique index가 동시 중복 요청도 막는다.
-    const { data: reel, error: insErr } = await admin
-      .from("reels")
-      .insert({
-        user_id: userId,
-        instagram_url: instagramUrl,
-        instagram_shortcode: reelReference.shortcode,
-        processing_version: PIPELINE_VERSION,
-        source,
-        processing_status: "PROCESSING",
-      })
-      .select("id")
-      .single();
-    if (insErr?.code === "23505") {
-      const { data: raced } = await admin
-        .from("reels")
-        .select(
-          "id, place_id, processing_status, failure_reason, processing_version, updated_at",
-        )
-        .eq("user_id", userId)
-        .eq("instagram_shortcode", reelReference.shortcode)
-        .single();
-      return raced
-        ? await cachedReelResponse(admin, raced, userId, true)
-        : databaseErrorResponse(requestId);
-    }
-    if (insErr || !reel) {
-      return databaseErrorResponse(requestId, insErr);
-    }
-
-    if (completedSource) {
-      try {
-        const reused = await copyCompletedReel(
-          admin,
-          completedSource,
-          reel.id,
-          userId,
-        );
-        if (reused) {
-          return json({ reelId: reel.id, ...reused, reused: true }, 200);
-        }
-      } catch (error) {
-        console.error(JSON.stringify({
-          event: "reel_cache_reuse_failed",
-          reelId: reel.id,
-          sourceReelId: completedSource.id,
-          message: error instanceof Error ? error.message : String(error),
-        }));
-        await admin.from("reel_places").delete().eq("reel_id", reel.id);
-      }
-    }
-
-    return scheduleOrProcess(admin, reel.id, userId, instagramUrl, false);
+    return scheduleOrProcess(
+      admin,
+      begun.reelId,
+      begun.workerReelId,
+      begun.extractionId,
+      instagramUrl,
+      begun.reused,
+      requestedSaveMode,
+      begun.saveMode,
+      begun.processingToken,
+    );
   } catch (error) {
     console.error(JSON.stringify({
       event: "api_error",
@@ -376,22 +316,50 @@ Deno.serve(async (req) => {
     }));
     return errorResponse("INTERNAL_ERROR", requestId, { headers: cors });
   }
-});
+}
+
+if (import.meta.main) {
+  Deno.serve(createSaveInstagramReelHandler(AUTO_SAVE));
+}
 
 async function scheduleOrProcess(
   admin: SupabaseClient,
   reelId: string,
-  userId: string,
+  workerReelId: string,
+  extractionId: string,
   instagramUrl: string,
   reused: boolean,
+  requestedSaveMode: ReelSaveMode,
+  initialSaveMode: ReelSaveMode,
+  processingToken: string,
 ): Promise<Response> {
-  const work = processReel(admin, reelId, userId, instagramUrl);
+  const work = processReel(
+    admin,
+    workerReelId,
+    extractionId,
+    processingToken,
+    instagramUrl,
+  );
   if (Deno.env.get("PIPELINE_SYNC") === "1") {
     const result = await work;
-    return json({ reelId, ...result, reused }, 200);
+    return json(
+      responseForSaveMode(
+        { reelId, ...result, reused },
+        requestedSaveMode,
+        initialSaveMode,
+      ),
+      200,
+    );
   }
   EdgeRuntime.waitUntil(work);
-  return json({ reelId, status: "PROCESSING", reused }, 202);
+  return json(
+    responseForSaveMode(
+      { reelId, status: "PROCESSING", reused },
+      requestedSaveMode,
+      initialSaveMode,
+    ),
+    202,
+  );
 }
 
 interface ProcessResult {
@@ -401,130 +369,12 @@ interface ProcessResult {
   placeIds?: string[];
 }
 
-interface CachedReel {
-  id: string;
-  place_id: string | null;
-  processing_status: "PENDING" | "PROCESSING" | "COMPLETED" | "FAILED";
-  failure_reason: FailureReason | null;
-  processing_version: number;
-  updated_at: string;
-}
-
-interface CompletedSourceReel {
-  id: string;
-  place_id: string | null;
-  instagram_description: string | null;
-  instagram_author_username: string | null;
-  instagram_thumbnail_url: string | null;
-}
-
-async function reelPlaceIds(
-  admin: SupabaseClient,
-  reelId: string,
-  fallbackPlaceId: string | null,
-): Promise<string[]> {
-  const { data, error } = await admin
-    .from("reel_places")
-    .select("place_id, position")
-    .eq("reel_id", reelId)
-    .order("position", { ascending: true });
-  if (error) throw error;
-  const placeIds = (data ?? []).map((row) => row.place_id as string);
-  return placeIds.length > 0
-    ? placeIds
-    : fallbackPlaceId
-    ? [fallbackPlaceId]
-    : [];
-}
-
-async function cachedReelResponse(
-  admin: SupabaseClient,
-  reel: CachedReel,
-  userId: string,
-  reused: boolean,
-): Promise<Response> {
-  const placeIds = reel.processing_status === "COMPLETED"
-    ? await reelPlaceIds(admin, reel.id, reel.place_id)
-    : [];
-  if (placeIds.length > 0) {
-    await savePlacesForUser(admin, userId, placeIds);
-  }
-  const status = reel.processing_status;
-  return json({
-    reelId: reel.id,
-    status,
-    ...(reel.failure_reason ? { failureReason: reel.failure_reason } : {}),
-    ...(placeIds[0] ? { placeId: placeIds[0], placeIds } : {}),
-    reused,
-  }, status === "PENDING" || status === "PROCESSING" ? 202 : 200);
-}
-
-async function copyCompletedReel(
-  admin: SupabaseClient,
-  source: CompletedSourceReel,
-  targetReelId: string,
-  userId: string,
-): Promise<ProcessResult | null> {
-  const placeIds = await reelPlaceIds(admin, source.id, source.place_id);
-  if (placeIds.length === 0) return null;
-
-  await savePlacesForUser(admin, userId, placeIds);
-
-  const { error: linksError } = await admin.from("reel_places").insert(
-    placeIds.map((placeId, position) => ({
-      reel_id: targetReelId,
-      place_id: placeId,
-      position,
-    })),
-  );
-  if (linksError) throw linksError;
-
-  const { error: reelError } = await admin.from("reels").update({
-    place_id: placeIds[0],
-    instagram_description: source.instagram_description,
-    instagram_author_username: source.instagram_author_username,
-    instagram_thumbnail_url: source.instagram_thumbnail_url,
-    processing_status: "COMPLETED",
-    failure_reason: null,
-  }).eq("id", targetReelId);
-  if (reelError) throw reelError;
-
-  console.info(JSON.stringify({
-    event: "completed_reel_reused",
-    reelId: targetReelId,
-    sourceReelId: source.id,
-    placeCount: placeIds.length,
-  }));
-  return {
-    status: "COMPLETED",
-    placeId: placeIds[0],
-    placeIds,
-  };
-}
-
-async function savePlacesForUser(
-  admin: SupabaseClient,
-  userId: string,
-  placeIds: string[],
-): Promise<void> {
-  const { data: places, error: placesError } = await admin
-    .from("places")
-    .select("id, thumbnail_url")
-    .in("id", placeIds);
-  if (placesError) throw placesError;
-  const thumbnails = new Map(
-    (places ?? []).map((place) => [place.id as string, place.thumbnail_url]),
-  );
-
-  const { error: savedError } = await admin.from("saved_places").upsert(
-    placeIds.map((placeId) => ({
-      user_id: userId,
-      place_id: placeId,
-      thumbnail_url: thumbnails.get(placeId) ?? null,
-    })),
-    { onConflict: "user_id,place_id", ignoreDuplicates: true },
-  );
-  if (savedError) throw savedError;
+function begunReelResponse(
+  reel: BegunReelRequest,
+  requestedSaveMode: ReelSaveMode,
+): Response {
+  const result = begunReelHTTPResult(reel, requestedSaveMode);
+  return json(result.body, result.status);
 }
 
 interface MatchedPlace {
@@ -534,11 +384,15 @@ interface MatchedPlace {
 
 async function processReel(
   admin: SupabaseClient,
-  reelId: string,
-  userId: string,
+  workerReelId: string,
+  extractionId: string,
+  processingToken: string,
   instagramUrl: string,
 ): Promise<ProcessResult> {
   const stub = Deno.env.get("STUB_PROVIDERS") === "1";
+  const reelId = workerReelId;
+  const failWorker = (reason: FailureReason) =>
+    fail(admin, extractionId, workerReelId, processingToken, reason);
   try {
     // 1. Instagram HTML → og:*
     let meta;
@@ -550,7 +404,7 @@ async function processReel(
         reelId,
         message: error instanceof Error ? error.message : String(error),
       }));
-      return await fail(admin, reelId, "IG_FETCH_FAILED");
+      return await failWorker("IG_FETCH_FAILED");
     }
     // 사진 게시물(/p/)의 og:image 는 정사각으로 잘려 있어 embed 의 원본 비율 주소를 우선 쓴다.
     let thumbnailSource = meta.thumbnailUrl;
@@ -569,7 +423,7 @@ async function processReel(
       ? (await rehostThumbnail(admin, `reels/${reelId}`, thumbnailSource)) ??
         thumbnailSource
       : null;
-    const { error: metadataUpdateError } = await admin
+    const { data: metadataReel, error: metadataUpdateError } = await admin
       .from("reels")
       .update({
         instagram_description: meta.description,
@@ -578,8 +432,12 @@ async function processReel(
           : {}),
         instagram_thumbnail_url: reelThumbnailUrl,
       })
-      .eq("id", reelId);
+      .eq("id", reelId)
+      .eq("processing_token", processingToken)
+      .select("id")
+      .maybeSingle();
     if (metadataUpdateError) throw metadataUpdateError;
+    if (!metadataReel) throw new Error("stale_reel_processing_attempt");
 
     const caption = meta.description;
     if (!caption) {
@@ -589,7 +447,7 @@ async function processReel(
         hasThumbnail: Boolean(meta.thumbnailUrl),
         hasCanonicalUrl: Boolean(meta.canonicalUrl),
       }));
-      return await fail(admin, reelId, "IG_CAPTION_NOT_FOUND");
+      return await failWorker("IG_CAPTION_NOT_FOUND");
     }
 
     // 2. 정규식으로 찾은 도로명·지번 주소는 관측하고, 아래에서 AI가 주소를
@@ -605,7 +463,7 @@ async function processReel(
     // 원문에 실제 있는 문자열만 남긴다.
     const kakaoKey = Deno.env.get("KAKAO_REST_API_KEY");
     if (!stub && !kakaoKey) {
-      return await fail(admin, reelId, "PROVIDER_CONFIG_MISSING");
+      return await failWorker("PROVIDER_CONFIG_MISSING");
     }
 
     let matchedPlaces: MatchedPlace[] = [];
@@ -633,7 +491,7 @@ async function processReel(
             reelId,
             message: error.message,
           }));
-          return await fail(admin, reelId, "PROVIDER_CONFIG_MISSING");
+          return await failWorker("PROVIDER_CONFIG_MISSING");
         }
         throw error;
       }
@@ -659,7 +517,7 @@ async function processReel(
         ).length,
       }));
       if (extracted.length === 0 || guesses.length === 0) {
-        return await fail(admin, reelId, "GEMINI_PLACE_NOT_FOUND");
+        return await failWorker("GEMINI_PLACE_NOT_FOUND");
       }
 
       const resolution = await resolvePlacesFromKakao(caption, guesses, {
@@ -677,9 +535,14 @@ async function processReel(
       matchedPlaces = resolution.matches;
       matchFailures.push(...resolution.failures);
     }
-    await persistPlaceMatchFailures(admin, reelId, matchFailures);
+    await persistPlaceMatchFailures(
+      admin,
+      reelId,
+      processingToken,
+      matchFailures,
+    );
     if (matchedPlaces.length === 0) {
-      return await fail(admin, reelId, "KAKAO_PLACE_NOT_FOUND");
+      return await failWorker("KAKAO_PLACE_NOT_FOUND");
     }
 
     // 4. 선택된 모든 장소를 places/saved_places/reel_places에 순서대로 저장한다.
@@ -688,7 +551,7 @@ async function processReel(
       const placeId = await persistMatchedPlace(
         admin,
         reelId,
-        userId,
+        processingToken,
         position,
         match,
         // 장소 썸네일의 인스타 폴백에도 정사각(og:image) 대신 원본 비율 주소를 쓴다.
@@ -698,22 +561,20 @@ async function processReel(
       placeIds.push(placeId);
     }
 
-    // 5. 기존 앱 호환을 위해 reels.place_id는 첫 번째 장소를 가리킨다.
-    const { error: reelUpdateError } = await admin
-      .from("reels")
-      .update({
-        place_id: placeIds[0],
-        // 부분 성공은 다음 공유에서 누락 장소를 다시 판단하고 다른 사용자에게
-        // 완료 캐시로 전파하지 않도록 현재 파이프라인과 겹치지 않는 예약값으로 표시한다.
-        processing_version: completedProcessingVersion(
-          PIPELINE_VERSION,
-          matchFailures.length,
-        ),
-        processing_status: "COMPLETED",
-        failure_reason: null,
-      })
-      .eq("id", reelId);
-    if (reelUpdateError) throw reelUpdateError;
+    // 5. worker 결과를 immutable 공용 cache로 확정하고, 이 추출을 기다리는
+    // 모든 요청 히스토리와 사용자별 대기함/자동 저장을 한 transaction에서 맞춘다.
+    const { error: finalizeError } = await admin.rpc(
+      "finalize_reel_extraction",
+      {
+        p_extraction_id: extractionId,
+        p_worker_reel_id: workerReelId,
+        p_processing_token: processingToken,
+        // 일부 장소의 매칭이 실패한 성공 결과는 당시 히스토리에는 남기되,
+        // 다음 명시 요청이 새 extraction을 만들어 누락 장소를 다시 시도한다.
+        p_cacheable: matchFailures.length === 0,
+      },
+    );
+    if (finalizeError) throw finalizeError;
 
     return {
       status: "COMPLETED",
@@ -733,26 +594,30 @@ async function processReel(
           model: attempt.model,
         })),
       }));
-      return await fail(admin, reelId, aiFailureReason(error));
+      return await failWorker(aiFailureReason(error));
     }
     console.error(JSON.stringify({
       event: "reel_processing_failed",
       reelId,
       message: error instanceof Error ? error.message : String(error),
     }));
-    return await fail(admin, reelId, "UNKNOWN");
+    return await failWorker("UNKNOWN");
   }
 }
 
 async function persistPlaceMatchFailures(
   admin: SupabaseClient,
   reelId: string,
+  processingToken: string,
   failures: PlaceMatchFailure[],
 ): Promise<void> {
   if (failures.length === 0) return;
 
   const { error } = await admin.from("reel_place_match_failures").upsert(
-    failures.map((failure) => placeMatchFailureRow(reelId, failure)),
+    failures.map((failure) => ({
+      ...placeMatchFailureRow(reelId, failure),
+      processing_token: processingToken,
+    })),
     { onConflict: "reel_id,guess_index" },
   );
   if (error) throw error;
@@ -761,7 +626,7 @@ async function persistPlaceMatchFailures(
 async function persistMatchedPlace(
   admin: SupabaseClient,
   reelId: string,
-  userId: string,
+  processingToken: string,
   position: number,
   { guess, place }: MatchedPlace,
   instagramThumbnailUrl: string | null,
@@ -816,27 +681,37 @@ async function persistMatchedPlace(
     if (error) throw error;
   }
 
-  const { error: savedPlaceError } = await admin
-    .from("saved_places")
-    .upsert(
-      {
-        user_id: userId,
-        place_id: placeRow.id,
-        thumbnail_url: thumbnail.url,
-      },
-      { onConflict: "user_id,place_id", ignoreDuplicates: true },
-    );
-  if (savedPlaceError) throw savedPlaceError;
-
-  const { error: reelPlaceError } = await admin
-    .from("reel_places")
-    .upsert(
-      { reel_id: reelId, place_id: placeRow.id, position },
-      { onConflict: "reel_id,place_id" },
-    );
-  if (reelPlaceError) throw reelPlaceError;
+  await persistReelPlaceResult(
+    admin,
+    reelId,
+    placeRow.id as string,
+    position,
+    thumbnail.url,
+    processingToken,
+  );
 
   return placeRow.id as string;
+}
+
+async function persistReelPlaceResult(
+  admin: SupabaseClient,
+  reelId: string,
+  placeId: string,
+  position: number,
+  thumbnailUrl: string | null,
+  processingToken: string | null = null,
+): Promise<string> {
+  const { data, error } = await admin.rpc("persist_reel_place_result", {
+    p_reel_id: reelId,
+    p_place_id: placeId,
+    p_position: position,
+    p_thumbnail_url: thumbnailUrl,
+    p_processing_token: processingToken,
+  });
+  if (error || typeof data !== "string") {
+    throw error ?? new Error("reel_place_result_missing");
+  }
+  return data;
 }
 
 interface ThumbnailResult {
@@ -979,12 +854,25 @@ async function resolveThumbnail(
 
 async function fail(
   admin: SupabaseClient,
-  reelId: string,
+  extractionId: string,
+  workerReelId: string,
+  processingToken: string,
   reason: FailureReason,
 ): Promise<ProcessResult> {
-  await admin
-    .from("reels")
-    .update({ processing_status: "FAILED", failure_reason: reason })
-    .eq("id", reelId);
+  const { error } = await admin.rpc("fail_reel_extraction", {
+    p_extraction_id: extractionId,
+    p_worker_reel_id: workerReelId,
+    p_processing_token: processingToken,
+    p_failure_reason: reason,
+  });
+  if (error) {
+    console.error(JSON.stringify({
+      event: "reel_extraction_failure_persist_failed",
+      extractionId,
+      workerReelId,
+      failureReason: reason,
+      message: error.message,
+    }));
+  }
   return { status: "FAILED", failureReason: reason };
 }

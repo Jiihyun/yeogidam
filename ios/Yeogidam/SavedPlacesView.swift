@@ -47,7 +47,12 @@ struct SavedPlacesView: View {
                     .refreshable { await load() }
                 }
             }
+            #if LOCAL_BUILD
+            .navigationTitle("보관함")
+            #else
             .navigationTitle("저장됨")
+            #endif
+            #if !LOCAL_BUILD
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -58,6 +63,7 @@ struct SavedPlacesView: View {
                     .disabled(appState.session == nil)
                 }
             }
+            #endif
             .safeAreaInset(edge: .bottom) {
                 if let errorMessage {
                     Text(errorMessage)
@@ -69,14 +75,20 @@ struct SavedPlacesView: View {
                         .background(.red)
                 }
             }
+            #if !LOCAL_BUILD
             .sheet(isPresented: $showsAddSheet) {
                 if let accessToken = appState.session?.accessToken {
-                    AddByURLSheet(accessToken: accessToken) {
+                    AddByURLSheet(accessToken: accessToken) { _ in
                         await load()
                     }
                 }
             }
+            #endif
+            #if LOCAL_BUILD
+            .onAppear { Task { await load() } }
+            #else
             .task { await load() }
+            #endif
         }
     }
 
@@ -88,10 +100,18 @@ struct SavedPlacesView: View {
                 .foregroundStyle(.secondary)
             Text("아직 저장된 장소가 없어요")
                 .font(.headline)
+            #if LOCAL_BUILD
+            Text("대기함에서 원하는 장소를 선택해\n보관함에 저장해보세요.")
+                .font(.subheadline)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+            #else
             Text("릴스 URL을 직접 입력해 먼저 저장 흐름을 확인해보세요.")
                 .font(.subheadline)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
+            #endif
+            #if !LOCAL_BUILD
             Button {
                 showsAddSheet = true
             } label: {
@@ -99,6 +119,7 @@ struct SavedPlacesView: View {
             }
             .buttonStyle(.borderedProminent)
             .padding(.top, 8)
+            #endif
             Spacer()
         }
         .padding(24)
@@ -209,7 +230,11 @@ private struct ReelStatusRow: View {
 
     private var title: String {
         if reel.processingStatus == .failed {
+            #if LOCAL_BUILD
+            return reel.failureReason?.displayText ?? "분석에 실패했어요"
+            #else
             return reel.failureReason?.displayText ?? "저장에 실패했어요"
+            #endif
         }
         return "장소를 찾고 있어요"
     }

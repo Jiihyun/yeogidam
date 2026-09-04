@@ -13,6 +13,23 @@ final class ShareViewController: UIViewController {
             ?? "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0"
     }
 
+    private var appGroupIdentifier: String {
+        Bundle.main.object(forInfoDictionaryKey: "APP_GROUP_IDENTIFIER") as? String
+            ?? "group.com.yeogidam"
+    }
+
+    private var saveInstagramReelFunctionSlug: String {
+        Bundle.main.object(forInfoDictionaryKey: "SAVE_INSTAGRAM_REEL_FUNCTION_SLUG") as? String
+            ?? "save-instagram-reel"
+    }
+
+    private var saveInstagramReelFunctionURL: URL {
+        supabaseURL
+            .appendingPathComponent("functions")
+            .appendingPathComponent("v1")
+            .appendingPathComponent(saveInstagramReelFunctionSlug)
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         configureView()
@@ -41,10 +58,14 @@ final class ShareViewController: UIViewController {
             guard isInstagramURL(url) else {
                 throw ShareError.invalidURL
             }
-            guard let token = UserDefaults(suiteName: "group.com.yeogidam")?.string(forKey: "supabase.accessToken") else {
+            guard let token = UserDefaults(suiteName: appGroupIdentifier)?.string(forKey: "supabase.accessToken") else {
                 throw ShareError.missingSession
             }
-            try await save(url: url.absoluteString, accessToken: token)
+            try await save(
+                url: url.absoluteString,
+                accessToken: token,
+                clientRequestID: UUID()
+            )
             complete("저장 요청을 보냈어요.")
         } catch {
             complete(error.localizedDescription)
@@ -75,8 +96,12 @@ final class ShareViewController: UIViewController {
         return nil
     }
 
-    private func save(url instagramURL: String, accessToken: String) async throws {
-        var request = URLRequest(url: supabaseURL.appendingPathComponent("functions/v1/save-instagram-reel"))
+    private func save(
+        url instagramURL: String,
+        accessToken: String,
+        clientRequestID: UUID
+    ) async throws {
+        var request = URLRequest(url: saveInstagramReelFunctionURL)
         request.httpMethod = "POST"
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue(supabaseAnonKey, forHTTPHeaderField: "apikey")
@@ -84,6 +109,7 @@ final class ShareViewController: UIViewController {
         request.httpBody = try JSONSerialization.data(withJSONObject: [
             "instagramUrl": instagramURL,
             "source": "instagram_share",
+            "clientRequestId": clientRequestID.uuidString,
         ])
 
         let (data, response) = try await URLSession.shared.data(for: request)

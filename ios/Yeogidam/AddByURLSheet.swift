@@ -2,12 +2,13 @@ import SwiftUI
 
 struct AddByURLSheet: View {
     let accessToken: String
-    let onSaved: () async -> Void
+    let onSaved: (SaveInstagramReelResponse) async -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var instagramURL = ""
     @State private var isSaving = false
     @State private var errorMessage: String?
+    @State private var pendingSubmission: ReelSubmission?
 
     var body: some View {
         NavigationStack {
@@ -26,7 +27,11 @@ struct AddByURLSheet: View {
                     }
                 }
             }
+            #if LOCAL_BUILD
+            .navigationTitle("릴스 분석")
+            #else
             .navigationTitle("릴스 저장")
+            #endif
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("취소") { dismiss() }
@@ -39,7 +44,11 @@ struct AddByURLSheet: View {
                         if isSaving {
                             ProgressView()
                         } else {
+                            #if LOCAL_BUILD
+                            Text("분석")
+                            #else
                             Text("저장")
+                            #endif
                         }
                     }
                     .disabled(isSaving || instagramURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -60,9 +69,27 @@ struct AddByURLSheet: View {
         defer { isSaving = false }
 
         do {
-            _ = try await YeogidamAPI(accessToken: accessToken).saveInstagramReel(url)
-            await onSaved()
+            let submission: ReelSubmission
+            if let pendingSubmission, pendingSubmission.instagramURL == url {
+                submission = pendingSubmission
+            } else {
+                submission = ReelSubmission(instagramURL: url)
+                pendingSubmission = submission
+            }
+
+            let response = try await YeogidamAPI(accessToken: accessToken)
+                .saveInstagramReel(submission)
+            pendingSubmission = nil
+            #if LOCAL_BUILD
             dismiss()
+            Task {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                await onSaved(response)
+            }
+            #else
+            await onSaved(response)
+            dismiss()
+            #endif
         } catch {
             errorMessage = error.localizedDescription
         }

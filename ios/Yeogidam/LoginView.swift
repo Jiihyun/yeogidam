@@ -66,24 +66,32 @@ struct LoginView: View {
             .buttonStyle(.plain)
             .disabled(appState.isWorking)
 
-            SignInWithAppleButton(.signIn) { request in
-                appState.prepareSignInWithApple(request)
-            } onCompletion: { result in
-                Task { await appState.completeSignInWithApple(result) }
-            }
-            .signInWithAppleButtonStyle(.black)
-            .frame(maxWidth: .infinity, minHeight: 52, maxHeight: 52)
-            .disabled(appState.isWorking)
+            #if !LOCAL_BUILD
+                SignInWithAppleButton(.signIn) { request in
+                    appState.prepareSignInWithApple(request)
+                } onCompletion: { result in
+                    Task { await appState.completeSignInWithApple(result) }
+                }
+                .signInWithAppleButtonStyle(.black)
+                .frame(maxWidth: .infinity, minHeight: 52, maxHeight: 52)
+                .disabled(appState.isWorking)
+            #endif
 
             if appState.isWorking {
                 ProgressView("로그인 확인 중...")
                     .font(.caption)
             }
 
-            Text("카카오, Google 또는 Apple 계정으로 안전하게 로그인합니다.\n계정 비밀번호는 여기담에 저장되지 않아요.")
-                .font(.caption2)
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.tertiary)
+            Group {
+                #if LOCAL_BUILD
+                    Text("카카오 또는 Google 계정으로 안전하게 로그인합니다.\n계정 비밀번호는 여기담에 저장되지 않아요.")
+                #else
+                    Text("카카오, Google 또는 Apple 계정으로 안전하게 로그인합니다.\n계정 비밀번호는 여기담에 저장되지 않아요.")
+                #endif
+            }
+            .font(.caption2)
+            .multilineTextAlignment(.center)
+            .foregroundStyle(.tertiary)
         }
         .padding(24)
     }

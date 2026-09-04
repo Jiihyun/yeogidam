@@ -8,7 +8,7 @@ import Supabase
 /// code verifier를 찾지 못하는 경우가 있어, 일회성 값만 별도로 다룬다.
 private final class YeogidamAuthStorage: AuthLocalStorage, @unchecked Sendable {
     private let persistentStorage = KeychainLocalStorage(
-        service: "com.yeogidamm.app.supabase-auth"
+        service: YeogidamConfig.authKeychainService
     )
     private let lock = NSLock()
     private var codeVerifier: Data?
@@ -59,7 +59,7 @@ enum SupabaseManager {
         options: SupabaseClientOptions(
             auth: .init(
                 storage: YeogidamAuthStorage(),
-                redirectToURL: URL(string: "com.yeogidamm.app://auth-callback"),
+                redirectToURL: YeogidamConfig.oauthRedirectURL,
                 flowType: .pkce
             )
         )

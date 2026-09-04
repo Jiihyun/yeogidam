@@ -1,7 +1,14 @@
 # 배포 및 운영 가이드
 
-- 기준일: 2026-08-11
+- 기준일: 2026-08-30
 - 대상: Supabase Cloud + iOS/Xcode
+
+Supabase 프로젝트는 다음과 같이 분리한다.
+
+| 환경 | 프로젝트 | Project ref | 기본 릴스 저장 Function |
+|---|---|---|---|
+| 개발·QA | `yeogidam develop` | `vowmaqcmwocrocfymyux` | `save-instagram-reel-v2` |
+| 운영 | `yeogidam demo` | `hbbrgudsbvnwuylxqlta` | `save-instagram-reel` |
 
 ## 1. 사전 요구 사항
 
@@ -47,6 +54,10 @@ OPENAI_MATCH_MODEL           선택, 기본 OPENAI_MODEL
 KAKAO_REST_API_KEY
 GOOGLE_PLACES_API_KEY
 PUBLIC_SUPABASE_URL          선택, Storage 공개 URL 기준
+APP_UPDATE_IOS_MINIMUM_SUPPORTED_VERSION
+APP_UPDATE_IOS_STORE_URL
+APP_UPDATE_ANDROID_MINIMUM_SUPPORTED_VERSION  Android 배포 후 설정
+APP_UPDATE_ANDROID_STORE_URL                  Android 배포 후 설정
 ```
 
 Supabase가 자동으로 제공하는 값:
@@ -70,6 +81,54 @@ supabase secrets set \
 ```
 
 키 값을 문서, Git, 앱 번들에 넣지 않습니다. iOS에 포함되는 Supabase `anon` 키는 공개 클라이언트 키이며 `service_role` 키와 다릅니다.
+
+### 앱 업데이트 정책
+
+`app-update-policy` Function은 앱이 로그인하기 전에도 호출하는 공개 API다.
+현재 앱 버전이 플랫폼별 최소 지원 버전보다 낮으면 `updateRequired=true`를
+반환한다. 정책은 프로젝트별 Function Secret으로 관리해 함수를 재배포하지
+않고도 바꿀 수 있다.
+
+```bash
+supabase secrets set \
+  APP_UPDATE_IOS_MINIMUM_SUPPORTED_VERSION=1.1.0 \
+  APP_UPDATE_IOS_STORE_URL=https://apps.apple.com/app/id6801408355 \
+  --project-ref vowmaqcmwocrocfymyux
+```
+
+운영의 최소 지원 버전은 App Store에서 해당 버전을 실제로 다운로드할 수
+있는지 확인한 뒤에만 다음과 같이 올린다.
+
+```bash
+supabase secrets set \
+  APP_UPDATE_IOS_MINIMUM_SUPPORTED_VERSION=1.1.0 \
+  APP_UPDATE_IOS_STORE_URL=https://apps.apple.com/app/id6801408355 \
+  --project-ref hbbrgudsbvnwuylxqlta
+```
+
+Android는 Play Store 배포 후 같은 형식의 `APP_UPDATE_ANDROID_*` 값을
+등록한다. 요청한 플랫폼의 정책이 누락되거나 잘못되면 HTTP 503을
+반환하므로 앱은 조회 장애 시 진입을 차단하지 않는다. `ios`, `android`
+외의 플랫폼 값은 HTTP 400을 반환한다.
+
+이 API 호출 로직이 없는 기존 앱에는 소급해서 강제 업데이트를 표시할
+수 없다. 업데이트 조회가 처음 포함된 버전부터 이후 버전의 강제 전환을
+제어할 수 있다.
+
+API 요청과 응답 계약은 다음과 같다. `appVersion`은 `major.minor` 또는
+`major.minor.patch` 형식이다.
+
+```http
+GET /functions/v1/app-update-policy?platform=ios&appVersion=1.0
+```
+
+```json
+{
+  "updateRequired": true,
+  "minimumSupportedVersion": "1.1.0",
+  "storeUrl": "https://apps.apple.com/app/id6801408355"
+}
+```
 
 ### 장소 AI 키 교체와 공급자 전환
 
@@ -107,26 +166,91 @@ Edge Function 로컬 실행:
 
 ```bash
 cp supabase/functions/.env.example supabase/functions/.env
-supabase functions serve save-instagram-reel \
-  --env-file supabase/functions/.env
+supabase functions serve --env-file supabase/functions/.env
 ```
+
+현재 CLI는 등록된 Function을 함께 serve하므로 v1과 v2를 각각 positional
+argument로 넘기지 않는다.
 
 외부 키 없이 파이프라인 구조만 검증하려면 로컬 환경에서만 `STUB_PROVIDERS=1`, 최종 상태를 응답으로 받으려면 `PIPELINE_SYNC=1`을 사용합니다. 스텁 모드에서는 장소 AI와 Kakao 설정을 읽지 않습니다. 두 값은 프로덕션 secret으로 등록하지 않습니다.
 
 ## 5. DB와 Function 배포
+
+대기함 API는 기존 앱의 자동 저장 계약을 유지하는 v1과 새 대기함 계약을 쓰는
+v2를 별도 slug로 운영한다.
+
+- v1: `/functions/v1/save-instagram-reel`
+- v2: `/functions/v1/save-instagram-reel-v2`
+
+`/functions/v1`의 `v1`은 Supabase Edge Function gateway 경로이고, API 버전은
+함수 이름의 `-v2`로 구분한다.
+
+배포 순서는 반드시 **DB migration → 업데이트된 v1 → v2**로 고정한다. DB보다
+Function을 먼저 배포하거나 v1보다 v2를 먼저 배포하면 전환 구간의 구버전 앱과
+v1/v2 경합 처리가 새 스키마 계약을 보장하지 못한다. 각 Function을 이름으로
+배포하고 `--prune`은 사용하지 않아 기존 `delete-account`와
+`gemini-quota-discord`를 삭제하지 않는다.
+
+개발·QA 프로젝트 배포:
+
+```bash
+supabase link --project-ref vowmaqcmwocrocfymyux
+supabase db push
+supabase functions deploy save-instagram-reel \
+  --project-ref vowmaqcmwocrocfymyux
+supabase functions deploy save-instagram-reel-v2 \
+  --project-ref vowmaqcmwocrocfymyux
+supabase functions deploy gemini-quota-discord \
+  --no-verify-jwt \
+  --project-ref vowmaqcmwocrocfymyux
+supabase functions deploy app-update-policy \
+  --no-verify-jwt \
+  --project-ref vowmaqcmwocrocfymyux
+```
+
+`gemini-quota-discord`는 환경 간 Function 구성을 맞추기 위해 개발 프로젝트에도
+배포 상태를 유지한다. 단, 개발 프로젝트에는
+`DISCORD_GEMINI_ALERT_WEBHOOK_URL`, `MONITORING_WEBHOOK_USERNAME`,
+`MONITORING_WEBHOOK_PASSWORD`를 등록하지 않고, Google Cloud Monitoring 알림
+채널도 개발 URL에 연결하지 않으며, 개발 Discord 알림 시험 호출도 하지 않는다.
+실제 알림 설정과 호출은 운영 프로젝트에만 둔다.
+
+프론트와 백엔드가 함께 검증된 뒤 운영 프로젝트에 승격할 때도 같은 순서를
+사용한다.
 
 ```bash
 supabase link --project-ref hbbrgudsbvnwuylxqlta
 supabase db push
 supabase functions deploy save-instagram-reel \
   --project-ref hbbrgudsbvnwuylxqlta
+supabase functions deploy save-instagram-reel-v2 \
+  --project-ref hbbrgudsbvnwuylxqlta
+supabase functions deploy app-update-policy \
+  --no-verify-jwt \
+  --project-ref hbbrgudsbvnwuylxqlta
 ```
 
-배포 후 확인:
+개발·QA 배포 후 확인:
 
 ```bash
 supabase migration list
-supabase functions list --project-ref hbbrgudsbvnwuylxqlta
+supabase functions list --project-ref vowmaqcmwocrocfymyux
+```
+
+Function 목록에서 `save-instagram-reel`, `save-instagram-reel-v2`,
+`gemini-quota-discord`, `app-update-policy`가 모두 `ACTIVE`인지 확인한다.
+QA 앱과 Share Extension은
+다음 v2 경로를 사용해 저장 요청과 대기함 반영을 확인한다.
+
+```text
+https://vowmaqcmwocrocfymyux.supabase.co/functions/v1/save-instagram-reel-v2
+```
+
+동시에 v1 경로로 요청한 기존 앱 계약이 자동 저장을 계속 유지하는지 회귀
+검증한다.
+
+```text
+https://vowmaqcmwocrocfymyux.supabase.co/functions/v1/save-instagram-reel
 ```
 
 Supabase Dashboard에서 Anonymous sign-ins가 활성화되어 있어야 합니다.
@@ -155,9 +279,15 @@ open Yeogidam.xcodeproj
 ### Edge Function
 
 ```bash
-npx -y deno@2 fmt --check supabase/functions/save-instagram-reel
+npx -y deno@2 fmt --check \
+  supabase/functions/save-instagram-reel \
+  supabase/functions/save-instagram-reel-v2 \
+  supabase/functions/app-update-policy
 npx -y deno@2 test supabase/functions/save-instagram-reel/*_test.ts
+npx -y deno@2 test supabase/functions/app-update-policy/*_test.ts
 npx -y deno@2 check supabase/functions/save-instagram-reel/index.ts
+npx -y deno@2 check supabase/functions/save-instagram-reel-v2/index.ts
+npx -y deno@2 check supabase/functions/app-update-policy/index.ts
 ```
 
 ### DB
@@ -165,6 +295,64 @@ npx -y deno@2 check supabase/functions/save-instagram-reel/index.ts
 ```bash
 supabase db test
 ```
+
+### 구버전 관련 릴스 HTTP 회귀 테스트
+
+`20260905090000_legacy_related_reels_compat.sql`은 데이터를 변경하지 않고
+`reels → reel_places` embedding을 `user_related_reels`에 연결한다.
+PostgREST computed relationship으로 기존 FK 관계를 덮어쓰는 방식이며,
+마이그레이션 끝에서 schema cache reload를 요청한다.
+
+- [PostgREST computed relationship 공식 문서](https://docs.postgrest.org/en/v14/references/api/resource_embedding.html#overriding-relationships)
+- DB 검증: `supabase/tests/10_legacy_related_reels.sql`
+- HTTP 검증: `supabase/scripts/test-legacy-related-reels-http.mjs`
+
+SQL 테스트만으로는 PostgREST의 관계 선택과 `!inner` 필터를 검증할 수 없으므로
+실제 HTTP 테스트를 함께 실행한다. 테스트 대상은 애플리케이션 마이그레이션과
+Supabase `auth`/`storage` 스키마가 준비된 **폐기 가능한 로컬 전용 DB**와 그 DB에
+연결한 PostgREST다. 아래 이름의 DB를 미리 만들고, 서버의 JWT secret과 같은
+로컬 테스트 전용 값을 지정한다. 운영 secret은 사용하지 않는다.
+
+```bash
+POSTGRES_TEST_URL=postgresql://postgres@127.0.0.1:55432/yeogidam_compat_test \
+POSTGREST_TEST_URL=http://127.0.0.1:55433 \
+POSTGREST_TEST_JWT_SECRET=local-only-compat-test-secret-at-least-32-chars \
+PSQL_BINARY=/path/to/psql \
+node --test supabase/scripts/test-legacy-related-reels-http.mjs
+```
+
+이 스크립트는 loopback 주소와 `yeogidam_compat_test` 또는
+`yeogidam_compat_test_*` 이름의 DB만 허용한다. 임의 UUID의 테스트 사용자·장소를
+만들고 종료 시 해당 자료만 삭제하며, 마이그레이션을 실행하거나 기존 테이블을
+비우지 않는다. 구버전 프론트의 실제 select/filter를 그대로 사용해 다음을 검증한다.
+
+- 다른 사용자의 완료 캐시 및 진행 중 분석을 재사용한 요청의 관련 릴스 조회
+- 재공유 시 최신 성공 요청 한 건만 표시하고 신규 조회와 결과가 일치하는지
+- 작성자·캡션·썸네일과 보관함 자동 저장 유지
+- 사용자 격리, 익명 요청 거부, 장소 필터와 `!inner` 동작
+- 기존 자료 조회, stale worker 결과 제외, 물리 worker 기록 보존
+
+개발 환경에서 구버전 앱으로 URL 저장·인스타 공유·보관함·장소 상세를 확인한 뒤
+운영에 적용한다. **DB migration → 업데이트된 v1 → v2** 배포 순서는 유지한다.
+계산 관계만 되돌릴 때는 `public.reel_places(public.reels)` 함수를 제거하고
+PostgREST schema cache를 다시 로드하면 기존 FK 조회로 돌아간다. 이 경우
+재사용 요청의 구버전 관련 릴스 누락도 다시 발생한다. 반복 요청 데이터가 생긴
+뒤 저장 함수 전체를 예전 main으로 되돌리는 것은 별도 문제이므로, 이를 안전한
+전체 서버 롤백 절차로 취급하지 않는다.
+
+#### 2026-09-05 로컬 검증 기록
+
+- PostgreSQL 17.11 / PostgREST 16.2 / pgTAP 1.3.4의 격리된 로컬 환경에서 검증했다.
+- 수정 전에는 다른 사용자의 진행 중·완료 결과를 재사용한 요청의 관련 릴스가
+  누락됐고, 인계된 worker의 이전 중간 결과가 조회되는 문제도 재현했다.
+- 수정 후 구버전 HTTP 조회 10개 시나리오가 모두 통과했다. 동일 테스트에서
+  신규 `user_related_reels` 조회와 보관함 조회가 유지되는 것도 확인했다.
+- DB 테스트 11개 파일의 assertion 236개와 Edge Function 단위 테스트 248개가
+  모두 통과했다. 조회 전후 worker·요청·추출·보관함·대기함 데이터가 동일했다.
+- 로컬 `auth`/`storage`는 DB 테스트용 최소 스키마로 구성했다. 실제 Supabase
+  Auth·Storage HTTP 서비스, Edge Runtime, 운영 JWT 설정과 실기기 앱은 검증하지
+  않았으며 운영 DB에도 적용하지 않았다. 운영 승격 전 개발 프로젝트에서
+  기존 앱으로 확인하는 절차는 별도로 필요하다.
 
 ### iOS Simulator
 
@@ -278,8 +466,10 @@ Edge Function은 Instagram fetch, 장소 AI 공급자·모델·fallback 여부, 
 
 - [ ] DB migration과 pgTAP 통과
 - [ ] Deno 테스트·format·typecheck 통과
-- [ ] Edge Function 배포 상태 `ACTIVE`
-- [ ] Function secrets 등록 및 테스트
+- [ ] DB migration → 업데이트된 v1 → v2 순서로 배포
+- [ ] `save-instagram-reel`, `save-instagram-reel-v2`, `gemini-quota-discord` 배포 상태 `ACTIVE`
+- [ ] 개발 프로젝트의 `gemini-quota-discord`는 배포만 유지하고 Discord secret·Monitoring 연결·시험 호출은 하지 않았는지 확인
+- [ ] 릴스 처리 Function secrets 등록 및 테스트 (개발 Discord secret 제외)
 - [ ] 장소 AI primary/fallback이 서로 다르고 선택한 공급자의 key/model이 모두 등록됐는지 확인
 - [ ] 키 회전은 해당 공급자 secret만 갱신하고, 공급자 전환은 `PLACE_AI_PRIMARY_PROVIDER`와 대상 key/model을 함께 변경했는지 확인
 - [ ] Kakao Local API 실제 후보의 `id`·`place_url` 확인
