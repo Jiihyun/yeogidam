@@ -86,12 +86,16 @@ sequenceDiagram
 
 ## 3. Instagram 추출
 
-1. 캡션: HTML `og:description` → `name="description"` → `twitter:description`
-2. 보조 저장: `og:image`, `og:url`
+1. 모바일 Safari User-Agent로 공개 HTML을 요청한다.
+2. 캡션: HTML `og:description` → `name="description"` → `twitter:description`
+3. 썸네일: `twitter:image` → `og:image`. 두 태그가 모두 있으면 원본 비율을 유지하는 `twitter:image`를 우선한다.
+4. 보조 추출: `og:url`, title/description의 작성자 계정.
 
-릴스 URL의 HTML head가 유일한 캡션 입력이자 SSOT다. HTML 태그 배치 순서와 무관하게 위 description 우선순위를 적용하고, 큰따옴표·작은따옴표를 모두 처리하며 HTML entity를 디코딩한다. 한 번의 릴스 HTML 요청에서 description을 얻지 못하면 추가 Instagram 요청 없이 `IG_FETCH_FAILED`다.
+Supabase Edge Runtime 1.76.0은 함수가 설정한 User-Agent 뒤에도 실행 엔진·프로젝트 식별값을 자동으로 붙인다. 기존 `Twitterbot/1.0`에 이 접미사가 붙으면 Instagram이 축약 캡션과 가로로 잘린 `og:image`를 반환하는 문제가 재현됐다. 모바일 User-Agent는 같은 접미사가 붙어도 전체 캡션을 받았고, 잘린 응답에서도 `twitter:image`에는 정상 비율 이미지가 남아 있었다. [공식 변경 내역](https://github.com/supabase/edge-runtime/releases/tag/v1.76.0)
 
-Gemini 입력과 DB의 캡션 원문은 선택된 description 하나다. `og:title`과 `twitter:title`은 파싱하거나 저장하지 않는다. title과 description에 같은 전체 캡션이 반복되는 Instagram 응답에서 불필요한 데이터 보관과 중복 입력 가능성을 없앤다. 릴스 HTML 요청이 non-2xx이거나 description이 없으면 Gemini를 호출하지 않는다.
+릴스 URL의 HTML head가 유일한 캡션 입력이자 SSOT다. HTML 태그 배치 순서와 무관하게 위 description·image 우선순위를 적용하고, 큰따옴표·작은따옴표를 모두 처리하며 HTML entity를 디코딩한다. HTML 요청 실패는 `IG_FETCH_FAILED`, 한 번의 요청에서 description을 얻지 못하면 추가 Instagram 요청 없이 `IG_CAPTION_NOT_FOUND`다.
+
+Gemini 입력과 DB의 캡션 원문은 선택된 description 하나다. `og:title`과 `twitter:title`은 작성자 계정 추출에만 사용하고 캡션으로 저장하거나 AI에 중복 전달하지 않는다. 릴스 HTML 요청이 non-2xx이거나 description이 없으면 Gemini를 호출하지 않는다.
 
 레거시 스키마의 `reels.instagram_title` 컬럼은 기존 배포 호환을 위해 당분간 nullable 상태로 남겨 두지만 신규 처리와 동일 릴스 결과 재사용에서는 값을 쓰지 않는다. UI, 장소 매칭, 중복 판정, 재시도 어느 경로에서도 사용하지 않으며 다음 스키마 정리 때 제거할 수 있다.
 

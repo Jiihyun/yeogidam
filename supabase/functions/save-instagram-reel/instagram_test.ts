@@ -85,6 +85,37 @@ Deno.test("parses image attributes in either order", () => {
   assertEquals(meta.thumbnailUrl, "https://example.com/photo.jpg");
 });
 
+Deno.test("prefers the uncropped Twitter image regardless of tag order", () => {
+  const original = "https://example.com/reel.jpg?stp=dst-jpg_s640x640";
+  const cropped =
+    "https://example.com/reel.jpg?stp=c0.572.1170.364a_dst-jpg_s400x320";
+  const tags = [
+    `<meta property="og:image" content="${cropped}">`,
+    `<meta content="${original}" name="twitter:image">`,
+  ];
+
+  for (const order of [tags, [...tags].reverse()]) {
+    const meta = parseInstagramMeta(`<head>${order.join("\n")}</head>`);
+    assertEquals(meta.thumbnailUrl, original);
+  }
+});
+
+Deno.test("falls back to the Open Graph image when Twitter image is absent or empty", () => {
+  for (
+    const twitterTag of [
+      "",
+      '<meta name="twitter:image" content="">',
+    ]
+  ) {
+    const meta = parseInstagramMeta(`<head>
+      ${twitterTag}
+      <meta property="og:image" content="https://example.com/fallback.jpg">
+    </head>`);
+
+    assertEquals(meta.thumbnailUrl, "https://example.com/fallback.jpg");
+  }
+});
+
 Deno.test("prefers og description regardless of HTML tag order", () => {
   const html = `<head>
     <meta name="description" content="generic description">
@@ -109,19 +140,20 @@ Deno.test("falls back between head description tags only", () => {
   assertEquals(twitter.description, "twitter description");
 });
 
-Deno.test("uses reel HTML head metadata as the only caption source", async () => {
+Deno.test("requests mobile HTML and preserves the complete caption", async () => {
   const url = "https://www.instagram.com/reel/Db0azgWTF1h/";
   const calls: string[] = [];
   let userAgent = "";
-  const request =
-    (async (input: string | URL | Request, init?: RequestInit) => {
-      calls.push(String(input));
-      userAgent = new Headers(init?.headers).get("User-Agent") ?? "";
-      return new Response(
+  const request = ((input: string | URL | Request, init?: RequestInit) => {
+    calls.push(String(input));
+    userAgent = new Headers(init?.headers).get("User-Agent") ?? "";
+    return Promise.resolve(
+      new Response(
         `<head><meta name="description" content="보연희 서울 서대문구 연희맛로 17-63 2층"></head>`,
         { status: 200, headers: { "content-type": "text/html" } },
-      );
-    }) as typeof fetch;
+      ),
+    );
+  }) as typeof fetch;
 
   const meta = await fetchInstagramMeta(url, request);
 
@@ -129,18 +161,22 @@ Deno.test("uses reel HTML head metadata as the only caption source", async () =>
   assertEquals(meta.authorUsername, null);
   assertEquals(calls.length, 1);
   assertEquals(calls[0], url);
-  assertEquals(userAgent, "Twitterbot/1.0");
+  assertEquals(userAgent.startsWith("Mozilla/5.0"), true);
+  assertEquals(userAgent.includes("Mobile/"), true);
+  assertEquals(userAgent.includes("Safari/"), true);
 });
 
 Deno.test("returns empty metadata without a head caption or fallback request", async () => {
   const url = "https://www.instagram.com/reel/Db0azgWTF1h/";
   const calls: string[] = [];
-  const request = (async (input: string | URL | Request) => {
+  const request = ((input: string | URL | Request) => {
     calls.push(String(input));
-    return new Response("<head><title>Instagram</title></head>", {
-      status: 200,
-      headers: { "content-type": "text/html" },
-    });
+    return Promise.resolve(
+      new Response("<head><title>Instagram</title></head>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      }),
+    );
   }) as typeof fetch;
 
   const meta = await fetchInstagramMeta(url, request);
@@ -153,8 +189,8 @@ Deno.test("returns empty metadata without a head caption or fallback request", a
 
 Deno.test("fails when Instagram returns a non-success response", async () => {
   const url = "https://www.instagram.com/reel/Db0azgWTF1h/";
-  const request = (async () => {
-    return new Response("Forbidden", { status: 403 });
+  const request = (() => {
+    return Promise.resolve(new Response("Forbidden", { status: 403 }));
   }) as typeof fetch;
 
   let message = "";
