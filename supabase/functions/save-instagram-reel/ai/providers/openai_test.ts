@@ -68,6 +68,8 @@ Deno.test("OpenAI extraction sends Responses JSON schema and parses output_text"
       output_text: JSON.stringify({
         places: [{
           placeName: "키리",
+          searchNames: ["KIRI"],
+          searchAddress: "광주 동구 동명동 200-188",
           address: "광주 동구 동명동 200-188",
           addressType: "JIBUN",
           region: "동명동",
@@ -119,6 +121,8 @@ Deno.test("OpenAI extraction sends Responses JSON schema and parses output_text"
       address: "광주 동구 동명동 200-188",
       addressType: "JIBUN",
       region: "동명동",
+      searchNames: ["KIRI"],
+      searchAddress: "광주 동구 동명동 200-188",
     }],
     model: "gpt-extract",
     usage: { inputTokens: 21, outputTokens: 9 },

@@ -11,6 +11,7 @@ export interface KakaoPlace {
   longitude: number | null;
   placeUrl: string | null;
   telephone: string | null;
+  distanceMeters?: number;
 }
 
 export interface KakaoCoordinate {
@@ -170,6 +171,10 @@ export function parseKakaoPlaces(data: unknown): KakaoPlace[] {
       longitude: coordinate(item.x, 124, 132),
       placeUrl: optionalString(item.place_url),
       telephone: optionalString(item.phone),
+      ...(optionalString(item.distance) &&
+          Number.isFinite(Number(item.distance))
+        ? { distanceMeters: Number(item.distance) }
+        : {}),
     }];
   });
 }
@@ -192,9 +197,13 @@ export function parseKakaoAddressCoordinates(
     const addressType = optionalString(item.address_type);
     const topLevelAddress = optionalString(item.address_name);
     const roadAddress = nestedAddress(item.road_address) ??
-      (addressType === "ROAD_ADDR" ? topLevelAddress : null);
+      (addressType === "ROAD_ADDR" || addressType === "ROAD"
+        ? topLevelAddress
+        : null);
     const address = nestedAddress(item.address) ??
-      (addressType === "REGION_ADDR" ? topLevelAddress : null);
+      (addressType === "REGION_ADDR" || addressType === "REGION"
+        ? topLevelAddress
+        : null);
     return latitude === null || longitude === null ||
         (!roadAddress && !address)
       ? []
@@ -206,124 +215,109 @@ export function buildKakaoMapURL(kakaoPlaceId: string): string {
   return `https://map.kakao.com/link/map/${encodeURIComponent(kakaoPlaceId)}`;
 }
 
+export interface KakaoPlacePage {
+  places: KakaoPlace[];
+  isEnd: boolean;
+}
+
+export interface KakaoSearchOptions {
+  page?: number;
+  center?: KakaoCoordinate;
+  radiusMeters?: number;
+}
+
+/** 같은 검색의 다음 페이지와 주소 중심 검색을 공통으로 처리한다. */
+export async function searchKakaoPlacePage(
+  query: string,
+  restApiKey: string,
+  options: KakaoSearchOptions = {},
+  request: typeof fetch = fetch,
+): Promise<KakaoPlacePage> {
+  const params = new URLSearchParams({
+    query,
+    size: "15",
+    page: String(Math.min(45, Math.max(1, Math.trunc(options.page ?? 1)))),
+    sort: options.center ? "distance" : "accuracy",
+  });
+  if (options.center) {
+    const radius = options.radiusMeters ?? 500;
+    params.set("x", String(options.center.longitude));
+    params.set("y", String(options.center.latitude));
+    params.set(
+      "radius",
+      String(
+        Number.isFinite(radius)
+          ? Math.min(20000, Math.max(0, Math.trunc(radius)))
+          : 500,
+      ),
+    );
+  }
+  const failureEvent = options.center
+    ? "kakao_place_near_address_search_failed"
+    : "kakao_place_search_failed";
+  const { payload, status } = await fetchKakaoJson(
+    "https://dapi.kakao.com/v2/local/search/keyword.json?" + params,
+    restApiKey,
+    query,
+    failureEvent,
+    request,
+  );
+  const documents = responseDocuments(payload, status, query, failureEvent);
+  const places = parseKakaoPlaces(payload);
+  if (places.length !== documents.length) {
+    const error = new KakaoPlaceSearchError("INVALID_RESPONSE", status, true);
+    logSearchFailure(query, error, failureEvent);
+    throw error;
+  }
+  const isEnd =
+    (payload as { meta?: { is_end?: boolean } }).meta?.is_end !== false;
+  console.info(JSON.stringify({
+    event: "kakao_place_search_completed",
+    query,
+    mode: options.center ? "NEAR_ADDRESS" : "KEYWORD",
+    page: Number(params.get("page")),
+    radiusMeters: options.center ? Number(params.get("radius")) : null,
+    itemCount: places.length,
+    isEnd,
+  }));
+  return { places, isEnd };
+}
+
 export async function searchKakaoPlaces(
   query: string,
   restApiKey: string,
   request: typeof fetch = fetch,
 ): Promise<KakaoPlace[]> {
-  const params = new URLSearchParams({
-    query,
-    size: "15",
-    sort: "accuracy",
-  });
-  const url = `https://dapi.kakao.com/v2/local/search/keyword.json?${params}`;
-  const { payload, status } = await fetchKakaoJson(
-    url,
-    restApiKey,
-    query,
-    "kakao_place_search_failed",
-    request,
-  );
-  const documents = responseDocuments(
-    payload,
-    status,
-    query,
-    "kakao_place_search_failed",
-  );
-  const places = parseKakaoPlaces(payload);
-  if (places.length !== documents.length) {
-    const error = new KakaoPlaceSearchError(
-      "INVALID_RESPONSE",
-      status,
-      true,
-    );
-    logSearchFailure(query, error);
-    throw error;
-  }
-  console.info(JSON.stringify({
-    event: "kakao_place_search_completed",
-    query,
-    itemCount: places.length,
-  }));
-  return places;
+  return (await searchKakaoPlacePage(query, restApiKey, {}, request)).places;
 }
 
-const DEFAULT_ADDRESS_NEARBY_RADIUS_METERS = 300;
-const MAX_ADDRESS_NEARBY_RADIUS_METERS = 500;
-
-/** 주소검색 좌표를 중심으로 상호명을 거리순 재검색한다. */
 export async function searchKakaoPlacesNearAddress(
   query: string,
   center: KakaoCoordinate,
   restApiKey: string,
   request: typeof fetch = fetch,
-  radiusMeters = DEFAULT_ADDRESS_NEARBY_RADIUS_METERS,
+  radiusMeters = 500,
 ): Promise<KakaoPlace[]> {
-  const boundedRadius = Number.isFinite(radiusMeters)
-    ? Math.min(
-      MAX_ADDRESS_NEARBY_RADIUS_METERS,
-      Math.max(0, Math.trunc(radiusMeters)),
-    )
-    : DEFAULT_ADDRESS_NEARBY_RADIUS_METERS;
-  const params = new URLSearchParams({
+  return (await searchKakaoPlacePage(
     query,
-    x: String(center.longitude),
-    y: String(center.latitude),
-    radius: String(boundedRadius),
-    size: "15",
-    sort: "distance",
-  });
-  const url = `https://dapi.kakao.com/v2/local/search/keyword.json?${params}`;
-  const { payload, status } = await fetchKakaoJson(
-    url,
     restApiKey,
-    query,
-    "kakao_place_near_address_search_failed",
+    { center, radiusMeters },
     request,
-  );
-  const documents = responseDocuments(
-    payload,
-    status,
-    query,
-    "kakao_place_near_address_search_failed",
-  );
-  const places = parseKakaoPlaces(payload);
-  if (places.length !== documents.length) {
-    const error = new KakaoPlaceSearchError(
-      "INVALID_RESPONSE",
-      status,
-      true,
-    );
-    logSearchFailure(
-      query,
-      error,
-      "kakao_place_near_address_search_failed",
-    );
-    throw error;
-  }
-  console.info(JSON.stringify({
-    event: "kakao_place_search_completed",
-    query,
-    mode: "NEAR_ADDRESS",
-    radiusMeters: boundedRadius,
-    itemCount: places.length,
-  }));
-  return places;
+  )).places;
 }
 
-/** 검증된 도로명·지번 주소를 WGS84 좌표 하나로 변환한다. */
+/** 도로명·지번 주소를 WGS84 좌표 후보로 변환한다. */
 export async function searchKakaoAddressCoordinates(
   address: string,
   restApiKey: string,
   request: typeof fetch = fetch,
 ): Promise<KakaoAddressCoordinate[]> {
-  // 층·동·호는 장소 후보의 exact-address 검증에는 유지하지만, 주소검색
-  // 좌표에는 건물 단위 주소만 보내 검색 누락을 줄인다.
+  // 원문 주소는 보존하고 주소검색에는 건물 단위 표현을 사용한다.
   const query = address.normalize("NFKC").replace(
     /(?:\s+(?:(?:지하\s*)?\d+\s*층|B\d+\s*층|\d+(?:\s*,\s*\d+)*\s*F|\d+\s*동|\d+\s*호))+$/iu,
     "",
   ).trim();
-  const params = new URLSearchParams({ query, analyze_type: "exact" });
+  const params = new URLSearchParams({ query, analyze_type: "similar" });
   const url = `https://dapi.kakao.com/v2/local/search/address.json?${params}`;
   const { payload, status } = await fetchKakaoJson(
     url,
