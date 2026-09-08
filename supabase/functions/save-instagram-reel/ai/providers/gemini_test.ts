@@ -142,7 +142,9 @@ Deno.test("Gemini extraction sends generateContent schema and parses response", 
           parts: [{
             text: JSON.stringify({
               places: [{
-                placeName: " 보연희 ",
+                placeName: " 버연희 ",
+                searchNames: ["보연희", "BOYEONHUI"],
+                searchAddress: null,
                 address: null,
                 addressType: "NONE",
                 region: null,
@@ -164,7 +166,7 @@ Deno.test("Gemini extraction sends generateContent schema and parses response", 
     timeoutMs: 5_000,
   }, { fetch: request, state: createGeminiApiKeyStateStore() });
 
-  const result = await provider.extractPlaces("보연희에 다녀왔어요");
+  const result = await provider.extractPlaces("버연희에 다녀왔어요");
 
   assertEquals(
     capturedUrl,
@@ -176,7 +178,7 @@ Deno.test("Gemini extraction sends generateContent schema and parses response", 
   assertEquals(headers.get("x-goog-api-key"), "secret key/+");
   const body = requestBody(capturedInit);
   const contents = body.contents as Array<{ parts: Array<{ text: string }> }>;
-  assert(contents[0].parts[0].text.includes("보연희에 다녀왔어요"));
+  assert(contents[0].parts[0].text.includes("버연희에 다녀왔어요"));
   const generationConfig = body.generationConfig as Record<string, unknown>;
   assertEquals(generationConfig.responseMimeType, "application/json");
   const schema = generationConfig.responseJsonSchema as {
@@ -193,10 +195,12 @@ Deno.test("Gemini extraction sends generateContent schema and parses response", 
   assertEquals(schema.additionalProperties, false);
   assertEquals(result, {
     data: [{
-      placeName: "보연희",
+      placeName: "버연희",
       address: null,
       addressType: "NONE",
       region: null,
+      searchNames: ["보연희", "BOYEONHUI"],
+      searchAddress: null,
     }],
     model: "gemini/model",
     usage: { inputTokens: 17, outputTokens: 8 },
@@ -1170,7 +1174,7 @@ Deno.test("Gemini per-minute quota uses the longer server retry hint", async () 
 });
 
 Deno.test("Gemini per-minute quota honors an explicit zero retry delay", async () => {
-  let currentTime = 0;
+  const currentTime = 0;
   let primaryCalls = 0;
   const requestedKeys: Array<string | null> = [];
   const request = ((_input: string | URL | Request, init?: RequestInit) => {

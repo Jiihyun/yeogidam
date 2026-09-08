@@ -21,14 +21,27 @@ export const PLACE_EXTRACTION_JSON_SCHEMA = {
         type: "object",
         properties: {
           placeName: { type: "string" },
+          searchNames: {
+            type: "array",
+            maxItems: 3,
+            items: { type: "string", maxLength: 80 },
+          },
           address: { type: ["string", "null"] },
+          searchAddress: { type: ["string", "null"] },
           addressType: {
             type: "string",
             enum: ["ROAD", "JIBUN", "PARTIAL", "NONE"],
           },
           region: { type: ["string", "null"] },
         },
-        required: ["placeName", "address", "addressType", "region"],
+        required: [
+          "placeName",
+          "searchNames",
+          "address",
+          "searchAddress",
+          "addressType",
+          "region",
+        ],
         additionalProperties: false,
       },
     },
@@ -54,7 +67,7 @@ export const CANDIDATE_JUDGMENT_JSON_SCHEMA = {
           retryQueries: {
             type: "array",
             maxItems: 3,
-            items: { type: "string" },
+            items: { type: "string", maxLength: 80 },
           },
           reason: {
             type: "string",
@@ -133,16 +146,16 @@ function candidateJudgmentReason(
     : null;
 }
 
-function retryQueries(value: unknown): string[] {
+function searchStrings(value: unknown, context: string): string[] {
   if (!Array.isArray(value) || value.length > 3) {
-    throw new AiContractError("decision.retryQueries must contain 0-3 strings");
+    throw new AiContractError(context + " must contain 0-3 strings");
   }
   const unique = new Map<string, string>();
   for (const item of value) {
-    const query = requiredString(item, "decision.retryQueries[]");
+    const query = requiredString(item, context + "[]");
     if (query.length > 80) {
       throw new AiContractError(
-        "decision.retryQueries[] must be at most 80 characters",
+        context + "[] must be at most 80 characters",
       );
     }
     const key = query.normalize("NFKC").toLocaleLowerCase("ko-KR")
@@ -177,7 +190,14 @@ export function parsePlaceExtractionPayload(payload: unknown): PlaceGuess[] {
     }
     assertOnlyKeys(
       raw,
-      ["placeName", "address", "addressType", "region"],
+      [
+        "placeName",
+        "searchNames",
+        "address",
+        "searchAddress",
+        "addressType",
+        "region",
+      ],
       "AI place",
     );
     guesses.push({
@@ -185,6 +205,13 @@ export function parsePlaceExtractionPayload(payload: unknown): PlaceGuess[] {
       address: nullableString(raw.address, "place.address"),
       addressType: addressType(raw.addressType),
       region: nullableString(raw.region, "place.region"),
+      // 이전 추출 형식도 읽을 수 있도록 검색 보조 필드의 생략을 허용한다.
+      ...(raw.searchNames === undefined
+        ? {}
+        : { searchNames: searchStrings(raw.searchNames, "place.searchNames") }),
+      ...(raw.searchAddress === undefined ? {} : {
+        searchAddress: nullableString(raw.searchAddress, "place.searchAddress"),
+      }),
     });
   }
   return guesses;
@@ -229,7 +256,7 @@ export function parseCandidateJudgmentPayload(
 
     const reason = candidateJudgmentReason(raw.reason);
     if (!reason) throw new AiContractError("decision.reason is invalid");
-    const queries = retryQueries(raw.retryQueries);
+    const queries = searchStrings(raw.retryQueries, "decision.retryQueries");
     const candidateId = nullableString(
       raw.candidateId,
       "decision.candidateId",

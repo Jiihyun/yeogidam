@@ -1,27 +1,22 @@
-import {
-  type AiCandidateJudgment,
-  type KakaoCandidateReviewItem,
-  type PlaceGuess,
+import type {
+  AiCandidateJudgment,
+  KakaoCandidateReviewItem,
+  PlaceGuess,
 } from "./ai/types.ts";
 import {
   type KakaoAddressCoordinate,
   type KakaoCoordinate,
   type KakaoPlace,
+  type KakaoPlacePage,
   KakaoPlaceSearchError,
 } from "./kakao.ts";
 import {
-  addressMatches,
   buildKakaoQueries,
-  captionContextsForPlaceName,
-  classifyKakaoCandidates,
   deduplicateKakaoPlaces,
-  groundedRetryQueries,
-  hasDetailedAddressEvidence,
-  locationMatchedKakaoPlaces,
-  resolveAiSelectedKakaoPlace,
-  resolveRetriedKakaoPlace,
-  validateKakaoCandidate,
-  withCaptionRegionHints,
+  placeSearchNames,
+  searchKey,
+  selectedKakaoPlace,
+  uniqueSearchQueries,
 } from "./matching.ts";
 import type {
   PlaceMatchFailure,
@@ -40,18 +35,29 @@ export interface PlaceResolutionResult {
 }
 
 export interface PlaceResolutionDependencies {
-  search(query: string): Promise<KakaoPlace[]>;
+  search(query: string, page: number): Promise<KakaoPlacePage>;
   geocodeAddress?(address: string): Promise<KakaoAddressCoordinate[]>;
   searchNearby?(
     query: string,
     center: KakaoCoordinate,
-  ): Promise<KakaoPlace[]>;
+    radiusMeters: number,
+    page: number,
+  ): Promise<KakaoPlacePage>;
   judge(
     caption: string,
     items: KakaoCandidateReviewItem[],
   ): Promise<AiCandidateJudgment[]>;
   log?: (event: string, details: Record<string, unknown>) => void;
 }
+
+interface SearchState extends KakaoCandidateReviewItem {
+  queries: string[];
+  nearbyQueries: string[];
+  centers: KakaoCoordinate[];
+}
+
+const SEARCH_RADII = [500, 2000, 5000] as const;
+const SEARCH_CONCURRENCY = 3;
 
 function aiNoneFailureReason(
   reason: AiCandidateJudgment["reason"],
@@ -62,118 +68,21 @@ function aiNoneFailureReason(
     : "INSUFFICIENT_CONTEXT";
 }
 
-function searchKey(value: string): string {
-  return value.normalize("NFKC").toLocaleLowerCase("ko-KR").replace(/\s+/g, " ")
-    .trim();
-}
-
-function orderedUniqueMatches(matches: ResolvedPlace[]): ResolvedPlace[] {
-  const seen = new Set<string>();
-  return [...matches].sort((left, right) => left.guessIndex - right.guessIndex)
-    .filter((match) => {
-      if (seen.has(match.place.kakaoPlaceId)) return false;
-      seen.add(match.place.kakaoPlaceId);
-      return true;
-    });
-}
-
-async function addAddressNearbyCandidates(
-  guessIndex: number,
-  guess: PlaceGuess,
-  queries: string[],
-  initialCandidates: KakaoPlace[],
-  dependencies: PlaceResolutionDependencies,
-  geocodeCache: Map<string, Promise<KakaoAddressCoordinate[]>>,
-): Promise<KakaoPlace[]> {
-  if (
-    !guess.address || !hasDetailedAddressEvidence(guess) ||
-    initialCandidates.some((candidate) =>
-      validateKakaoCandidate(guess, candidate).status === "ACCEPTED"
-    ) ||
-    !dependencies.geocodeAddress || !dependencies.searchNearby
-  ) {
-    return initialCandidates;
-  }
-
-  try {
-    const geocodeKey = searchKey(guess.address);
-    let geocodedPromise = geocodeCache.get(geocodeKey);
-    if (!geocodedPromise) {
-      geocodedPromise = dependencies.geocodeAddress(guess.address);
-      geocodeCache.set(geocodeKey, geocodedPromise);
-    }
-    const geocoded = await geocodedPromise;
-    const matchingCoordinates = geocoded.filter((coordinate) =>
-      [coordinate.roadAddress, coordinate.address].some((candidateAddress) =>
-        Boolean(
-          candidateAddress &&
-            addressMatches(
-              guess.address!,
-              candidateAddress,
-              guess.region,
-            ),
-        )
-      )
+async function collectSearches<T>(jobs: Array<() => Promise<T>>): Promise<T[]> {
+  const results: T[] = [];
+  for (let index = 0; index < jobs.length; index += SEARCH_CONCURRENCY) {
+    const batch = await Promise.allSettled(
+      jobs.slice(index, index + SEARCH_CONCURRENCY).map((job) => job()),
     );
-    if (matchingCoordinates.length !== 1) {
-      dependencies.log?.("kakao_address_coordinate_unresolved", {
-        guessIndex,
-        geocodedCount: geocoded.length,
-        matchingCoordinateCount: matchingCoordinates.length,
-      });
-      return initialCandidates;
+    for (const result of batch) {
+      if (result.status === "rejected") throw result.reason;
+      results.push(result.value);
     }
-    const center = matchingCoordinates[0];
-
-    const nearbyCandidates: KakaoPlace[] = [];
-    for (const query of queries) {
-      nearbyCandidates.push(...await dependencies.searchNearby(query, center));
-    }
-    const exactNearbyCandidates = locationMatchedKakaoPlaces(
-      guess,
-      nearbyCandidates,
-    ).filter((candidate) =>
-      validateKakaoCandidate(guess, candidate).status === "ACCEPTED"
-    );
-    if (exactNearbyCandidates.length === 0) {
-      dependencies.log?.("kakao_address_nearby_exact_candidate_not_found", {
-        guessIndex,
-        nearbyCandidateCount: nearbyCandidates.length,
-      });
-      return initialCandidates;
-    }
-    // 정확주소 주변 결과를 먼저 두어 AI 검토의 15개 제한에도 해당 후보가
-    // 포함되게 하되, 자동 확정은 아래 기존 주소·이름 분류기만 수행한다.
-    const merged = deduplicateKakaoPlaces([
-      ...exactNearbyCandidates,
-      ...initialCandidates,
-    ]);
-    dependencies.log?.("kakao_address_nearby_candidates_merged", {
-      guessIndex,
-      initialCandidateCount: initialCandidates.length,
-      nearbyCandidateCount: nearbyCandidates.length,
-      exactNearbyCandidateCount: exactNearbyCandidates.length,
-      mergedCandidateCount: merged.length,
-      exactAddressCandidateCount: locationMatchedKakaoPlaces(guess, merged)
-        .length,
-    });
-    return merged;
-  } catch (error) {
-    // 보조 검색 장애는 기존 키워드 후보와 AI 판단 경로를 그대로 유지한다.
-    if (!(error instanceof KakaoPlaceSearchError)) throw error;
-    dependencies.log?.("kakao_address_nearby_search_skipped", {
-      guessIndex,
-      kind: error.kind,
-      status: error.status,
-    });
-    return initialCandidates;
   }
+  return results;
 }
 
-/**
- * 최초 Kakao 검색과 단 한 번의 AI 판단, 선택적 Kakao 재검색을 수행한다.
- * RETRY 결과는 결정론적으로 끝내며 세 번째 AI 호출은 존재하지 않는다.
- */
+/** AI 추출 → 후보 수집 → AI 선택. 미해결 항목만 최대 두 차례 검색을 확장한다. */
 export async function resolvePlacesFromKakao(
   caption: string,
   guesses: PlaceGuess[],
@@ -181,201 +90,231 @@ export async function resolvePlacesFromKakao(
 ): Promise<PlaceResolutionResult> {
   const matches: ResolvedPlace[] = [];
   const failures: PlaceMatchFailure[] = [];
-  const pendingReviews: KakaoCandidateReviewItem[] = [];
-  const validationGuesses = new Map<number, PlaceGuess>();
-  const geocodeCache = new Map<
-    string,
-    Promise<KakaoAddressCoordinate[]>
-  >();
-  const allPlaceNames = guesses.map((guess) => guess.placeName);
+  const searchCache = new Map<string, Promise<KakaoPlacePage>>();
+  const geocodeCache = new Map<string, Promise<KakaoAddressCoordinate[]>>();
 
-  for (const [guessIndex, guess] of guesses.entries()) {
-    const validationGuess = withCaptionRegionHints(
-      guess,
-      caption,
-      allPlaceNames,
-    );
-    validationGuesses.set(guessIndex, validationGuess);
-    const queries = buildKakaoQueries(guess);
-    const searchedCandidates: KakaoPlace[] = [];
-    for (const query of queries) {
-      searchedCandidates.push(...await dependencies.search(query));
-    }
-    const initialCandidates = deduplicateKakaoPlaces(searchedCandidates);
-    const candidates = await addAddressNearbyCandidates(
-      guessIndex,
-      validationGuess,
-      queries,
-      initialCandidates,
-      dependencies,
-      geocodeCache,
-    );
-    const decision = classifyKakaoCandidates(validationGuess, candidates);
-    dependencies.log?.("kakao_place_candidates_classified", {
-      guessIndex,
-      guess,
-      candidateCount: candidates.length,
-      decision: decision.type,
-    });
-
-    if (decision.type === "AUTO_MATCH") {
-      matches.push({ guessIndex, guess, place: decision.place });
-    } else {
-      pendingReviews.push({
-        guessIndex,
-        guess,
-        captionContexts: captionContextsForPlaceName(
-          caption,
-          guess.placeName,
-          allPlaceNames,
-        ),
-        candidates: decision.type === "NEEDS_AI_REVIEW"
-          ? decision.candidates
-          : [],
-      });
-    }
-  }
-
-  if (pendingReviews.length === 0) {
-    return { matches: orderedUniqueMatches(matches), failures };
-  }
-
-  // 모든 0개·모호·충돌 후보를 한 번에 판단한다.
-  const judgments = await dependencies.judge(caption, pendingReviews);
-  const judgmentByGuess = new Map(
-    judgments.map((judgment) => [judgment.guessIndex, judgment]),
-  );
-
-  for (const review of pendingReviews) {
-    const judgment = judgmentByGuess.get(review.guessIndex);
-    if (!judgment) {
-      failures.push({
-        guessIndex: review.guessIndex,
-        guess: review.guess,
-        stage: "AI_REVIEW",
-        reason: "AI_JUDGMENT_UNAVAILABLE",
-        candidates: review.candidates,
-      });
-      continue;
-    }
-
-    if (judgment.decision === "NONE") {
-      failures.push({
-        guessIndex: review.guessIndex,
-        guess: review.guess,
-        stage: "AI_REVIEW",
-        reason: aiNoneFailureReason(judgment.reason),
-        candidates: review.candidates,
-      });
-      dependencies.log?.("ai_candidate_judgment_unresolved", {
-        guessIndex: review.guessIndex,
-        decision: judgment.decision,
-        reason: judgment.reason,
-      });
-      continue;
-    }
-
-    if (judgment.decision === "SELECT") {
-      const validationGuess = validationGuesses.get(review.guessIndex) ??
-        review.guess;
-      const resolution = judgment.candidateId
-        ? resolveAiSelectedKakaoPlace(
-          validationGuess,
-          review.candidates,
-          judgment.candidateId,
-          review.captionContexts?.join(" ") ?? null,
-        )
-        : {
-          status: "REJECTED" as const,
-          reason: "AI_SELECTED_UNKNOWN_CANDIDATE" as const,
-        };
-      dependencies.log?.("ai_candidate_selection_guarded", {
-        guessIndex: review.guessIndex,
-        candidateId: judgment.candidateId,
-        result: resolution.status,
-        reason: resolution.status === "REJECTED" ? resolution.reason : null,
-      });
-      if (resolution.status === "ACCEPTED") {
-        matches.push({
-          guessIndex: review.guessIndex,
-          guess: review.guess,
-          place: resolution.place,
-        });
-      } else {
-        failures.push({
-          guessIndex: review.guessIndex,
-          guess: review.guess,
-          stage: "FINAL_GUARD",
-          reason: resolution.reason,
-          candidates: review.candidates,
+  async function addressCenters(guess: PlaceGuess): Promise<KakaoCoordinate[]> {
+    if (!dependencies.geocodeAddress || !dependencies.searchNearby) return [];
+    // 보정 주소가 검색되지 않을 때에는 보존한 원문 주소도 시도한다.
+    const addresses = [...new Map(
+      [guess.searchAddress, guess.address]
+        .filter((address): address is string => Boolean(address?.trim()))
+        .map((address) => [searchKey(address), address]),
+    ).values()];
+    for (const address of addresses) {
+      try {
+        const key = searchKey(address);
+        let response = geocodeCache.get(key);
+        if (!response) {
+          response = dependencies.geocodeAddress(address);
+          geocodeCache.set(key, response);
+        }
+        const coordinates = await response;
+        const centers = [...new Map(coordinates.map((coordinate) => [
+          coordinate.longitude + "," + coordinate.latitude,
+          coordinate,
+        ])).values()].slice(0, 2);
+        if (centers.length > 0) return centers;
+      } catch (error) {
+        if (!(error instanceof KakaoPlaceSearchError)) throw error;
+        dependencies.log?.("kakao_address_search_skipped", {
+          kind: error.kind,
+          status: error.status,
         });
       }
-      continue;
     }
-
-    const initialQueries = new Set(
-      buildKakaoQueries(review.guess).map(searchKey),
-    );
-    const validationGuess = validationGuesses.get(review.guessIndex) ??
-      review.guess;
-    const queries = groundedRetryQueries(
-      validationGuess,
-      caption,
-      judgment.retryQueries,
-      allPlaceNames,
-    ).filter((query) => !initialQueries.has(searchKey(query)));
-    if (queries.length === 0) {
-      failures.push({
-        guessIndex: review.guessIndex,
-        guess: review.guess,
-        stage: "AI_REVIEW",
-        reason: "INSUFFICIENT_CONTEXT",
-        candidates: review.candidates,
-      });
-      continue;
-    }
-
-    const retriedCandidates: KakaoPlace[] = [];
-    for (const query of queries) {
-      retriedCandidates.push(...await dependencies.search(query));
-    }
-    const candidates = deduplicateKakaoPlaces(retriedCandidates);
-    const resolution = resolveRetriedKakaoPlace(
-      validationGuess,
-      queries,
-      candidates,
-    );
-    dependencies.log?.("kakao_retry_candidates_resolved", {
-      guessIndex: review.guessIndex,
-      queries,
-      candidateCount: candidates.length,
-      result: resolution.status,
-      reason: resolution.status === "REJECTED" ? resolution.reason : null,
-    });
-    if (resolution.status === "ACCEPTED") {
-      matches.push({
-        guessIndex: review.guessIndex,
-        guess: review.guess,
-        place: resolution.place,
-      });
-    } else {
-      failures.push({
-        guessIndex: review.guessIndex,
-        guess: review.guess,
-        stage: resolution.reason === "NO_KAKAO_CANDIDATE_AFTER_EXPANSION"
-          ? "KAKAO_SEARCH"
-          : "FINAL_GUARD",
-        reason: resolution.reason,
-        candidates,
-        searchOrigin: "EXPANDED_NAME_ONLY",
-      });
-    }
+    return [];
   }
 
+  async function keywordCandidates(
+    query: string,
+    pages: number,
+  ): Promise<KakaoPlace[]> {
+    const candidates: KakaoPlace[] = [];
+    for (let page = 1; page <= pages; page += 1) {
+      const key = "keyword:" + searchKey(query) + ":" + page;
+      let response = searchCache.get(key);
+      if (!response) {
+        response = dependencies.search(query, page);
+        searchCache.set(key, response);
+      }
+      const result = await response;
+      candidates.push(...result.places);
+      if (result.isEnd) break;
+    }
+    return candidates;
+  }
+
+  async function nearbyCandidates(
+    query: string,
+    center: KakaoCoordinate,
+    radius: number,
+    pages: number,
+  ): Promise<KakaoPlace[]> {
+    if (!dependencies.searchNearby) return [];
+    const candidates: KakaoPlace[] = [];
+    try {
+      for (let page = 1; page <= pages; page += 1) {
+        const key = "nearby:" + JSON.stringify([
+          searchKey(query),
+          center.longitude,
+          center.latitude,
+          radius,
+          page,
+        ]);
+        let response = searchCache.get(key);
+        if (!response) {
+          response = dependencies.searchNearby(query, center, radius, page);
+          searchCache.set(key, response);
+        }
+        const result = await response;
+        candidates.push(...result.places);
+        if (result.isEnd) break;
+      }
+    } catch (error) {
+      if (!(error instanceof KakaoPlaceSearchError)) throw error;
+      dependencies.log?.("kakao_address_nearby_search_skipped", {
+        kind: error.kind,
+        status: error.status,
+      });
+    }
+    return candidates;
+  }
+
+  async function expand(
+    state: SearchState,
+    round: number,
+    retries: string[] = [],
+  ): Promise<void> {
+    state.queries = uniqueSearchQueries([...state.queries, ...retries]);
+    state.nearbyQueries = uniqueSearchQueries([
+      ...state.nearbyQueries,
+      ...retries,
+    ]);
+    const jobs: Array<() => Promise<KakaoPlace[]>> = [];
+    for (const center of state.centers) {
+      for (const name of state.nearbyQueries) {
+        jobs.push(() =>
+          nearbyCandidates(name, center, SEARCH_RADII[round], round + 1)
+        );
+      }
+    }
+    for (const query of state.queries) {
+      jobs.push(() => keywordCandidates(query, round + 1));
+    }
+    const results = await collectSearches(jobs);
+    state.candidates = deduplicateKakaoPlaces([
+      ...state.candidates,
+      ...results.flat(),
+    ]);
+    state.searchQueries = [...state.queries];
+    state.remainingSearchRounds = SEARCH_RADII.length - round - 1;
+    dependencies.log?.("kakao_place_candidates_collected", {
+      guessIndex: state.guessIndex,
+      round,
+      queries: state.queries,
+      radiusMeters: state.centers.length ? SEARCH_RADII[round] : null,
+      candidateCount: state.candidates.length,
+    });
+  }
+
+  function fail(
+    state: SearchState,
+    reason: PlaceMatchFailureReason,
+    stage: PlaceMatchFailure["stage"],
+  ): void {
+    failures.push({
+      guessIndex: state.guessIndex,
+      guess: state.guess,
+      candidates: state.candidates,
+      reason,
+      stage,
+      searchOrigin: state.remainingSearchRounds === SEARCH_RADII.length - 1
+        ? "INITIAL"
+        : "EXPANDED_NAME_ONLY",
+    });
+  }
+
+  let pending: SearchState[] = [];
+  for (const [guessIndex, guess] of guesses.entries()) {
+    const state: SearchState = {
+      guessIndex,
+      guess,
+      candidates: [],
+      queries: buildKakaoQueries(guess),
+      nearbyQueries: placeSearchNames(guess),
+      centers: await addressCenters(guess),
+    };
+    await expand(state, 0);
+    pending.push(state);
+  }
+
+  for (
+    let round = 0;
+    round < SEARCH_RADII.length && pending.length > 0;
+    round += 1
+  ) {
+    const judgments = await dependencies.judge(caption, pending);
+    const judgmentByGuess = new Map(
+      judgments.map((judgment) => [judgment.guessIndex, judgment]),
+    );
+    const next: SearchState[] = [];
+    for (const state of pending) {
+      const judgment = judgmentByGuess.get(state.guessIndex);
+      if (!judgment) {
+        fail(state, "AI_JUDGMENT_UNAVAILABLE", "AI_REVIEW");
+        continue;
+      }
+      if (judgment.decision === "SELECT") {
+        const place = selectedKakaoPlace(
+          state.candidates,
+          judgment.candidateId,
+        );
+        if (place) {
+          matches.push({
+            guessIndex: state.guessIndex,
+            guess: state.guess,
+            place,
+          });
+        } else fail(state, "AI_SELECTED_UNKNOWN_CANDIDATE", "FINAL_GUARD");
+      } else if (judgment.decision === "NONE") {
+        fail(state, aiNoneFailureReason(judgment.reason), "AI_REVIEW");
+      } else if (round + 1 < SEARCH_RADII.length) {
+        await expand(
+          state,
+          round + 1,
+          uniqueSearchQueries(judgment.retryQueries).slice(0, 3),
+        );
+        next.push(state);
+      } else {
+        fail(
+          state,
+          state.candidates.length === 0
+            ? "NO_KAKAO_CANDIDATE_AFTER_EXPANSION"
+            : "INSUFFICIENT_CONTEXT",
+          state.candidates.length === 0 ? "KAKAO_SEARCH" : "AI_REVIEW",
+        );
+      }
+      dependencies.log?.("ai_candidate_judgment_resolved", {
+        guessIndex: state.guessIndex,
+        round,
+        decision: judgment.decision,
+        candidateId: judgment.candidateId,
+        reason: judgment.reason,
+      });
+    }
+    pending = next;
+  }
+
+  const seen = new Set<string>();
   return {
-    matches: orderedUniqueMatches(matches),
-    failures: failures.sort((left, right) =>
-      left.guessIndex - right.guessIndex
+    matches: matches.sort((a, b) => a.guessIndex - b.guessIndex).filter(
+      ({ place }) => {
+        if (seen.has(place.kakaoPlaceId)) return false;
+        seen.add(place.kakaoPlaceId);
+        return true;
+      },
     ),
+    failures: failures.sort((a, b) => a.guessIndex - b.guessIndex),
   };
 }

@@ -1,43 +1,39 @@
-import type {
-  AiCandidateJudgment,
-  KakaoCandidateReviewItem,
-  PlaceGuess,
-} from "./ai/types.ts";
-import { type KakaoPlace, KakaoPlaceSearchError } from "./kakao.ts";
-import { sanitizePlaceGuesses } from "./matching.ts";
+// 외부 비동기 의존성을 대신하는 스텁은 값을 즉시 반환한다.
+// deno-lint-ignore-file require-await
+import type { AiCandidateJudgment, PlaceGuess } from "./ai/types.ts";
+import {
+  type KakaoPlace,
+  type KakaoPlacePage,
+  KakaoPlaceSearchError,
+} from "./kakao.ts";
 import { resolvePlacesFromKakao } from "./place_resolution.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error(
-      `Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
+      "Expected " + JSON.stringify(expected) + ", got " +
+        JSON.stringify(actual),
     );
   }
 }
-
-function guess(
-  placeName: string,
-  address: string | null = null,
-  region: string | null = null,
-): PlaceGuess {
+function assert(condition: unknown): asserts condition {
+  if (!condition) throw new Error("assertion failed");
+}
+function guess(placeName: string, searchNames: string[] = []): PlaceGuess {
   return {
     placeName,
-    address,
-    addressType: address ? "ROAD" : "NONE",
-    region,
+    searchNames,
+    address: null,
+    addressType: "NONE",
+    region: null,
   };
 }
-
-function candidate(
-  kakaoPlaceId: string,
-  name: string,
-  roadAddress: string | null = null,
-): KakaoPlace {
+function candidate(kakaoPlaceId: string, name: string): KakaoPlace {
   return {
     kakaoPlaceId,
     name,
-    category: "카페",
-    roadAddress,
+    category: "음식점",
+    roadAddress: null,
     address: null,
     latitude: null,
     longitude: null,
@@ -45,534 +41,421 @@ function candidate(
     telephone: null,
   };
 }
+function page(places: KakaoPlace[] = [], isEnd = true): KakaoPlacePage {
+  return { places, isEnd };
+}
+function select(guessIndex: number, candidateId: string): AiCandidateJudgment {
+  return {
+    guessIndex,
+    decision: "SELECT",
+    candidateId,
+    retryQueries: [],
+    reason: "MATCH",
+  };
+}
+function retry(
+  guessIndex: number,
+  retryQueries: string[],
+): AiCandidateJudgment {
+  return {
+    guessIndex,
+    decision: "RETRY",
+    candidateId: null,
+    retryQueries,
+    reason: "CANDIDATE_MISSING",
+  };
+}
 
-Deno.test("batches SELECT RETRY and NONE once while preserving original place order", async () => {
+Deno.test("finds 버연희 and 파파죤스 through AI corrections while preserving source fields", async () => {
   const guesses = [
-    guess("보연희", "서울 서대문구 연희맛로 17-63", "서울"),
-    guess("오우드", "서울 성동구 연무장길 12", "서울"),
-    guess("우직"),
-    guess("윤숲 후루츠산도점", "서울 중랑구 면목로7길 8", "서울"),
-    guess("용용선생"),
+    guess("버연희", ["보연희"]),
+    guess("파파죤스", ["파파존스", "Papa John's"]),
   ];
-  const direct = candidate(
-    "direct",
-    "보연희",
-    "서울특별시 서대문구 연희맛로 17-63",
-  );
-  const owoodSeoul = candidate(
-    "owood-seoul",
-    "오우드 성수점",
-    "서울특별시 성동구 연무장길 12",
-  );
-  const owoodBusan = candidate(
-    "owood-busan",
-    "오우드 성수점 별관",
-    "서울특별시 성동구 연무장길 12",
-  );
-  const woozik = candidate(
-    "1595758078",
-    "우직",
-    "부산광역시 부산진구 전포대로256번길 34-3",
-  );
-  const yunsoop = candidate(
-    "1775568752",
-    "윤숲 후르츠산도점",
-    "서울특별시 중랑구 면목로7길 8",
-  );
-  const chainCandidates = [
-    candidate("chain-seoul", "용용선생 서울점", "서울특별시 강남구 강남대로 1"),
-    candidate(
-      "chain-busan",
-      "용용선생 부산점",
-      "부산광역시 부산진구 중앙대로 1",
-    ),
+  const corrected = [
+    candidate("boyeon", "보연희"),
+    candidate("papa", "파파존스 연희점"),
   ];
-  const initialWoozikCandidates = Array.from(
-    { length: 15 },
-    (_, index) => candidate(`wrong-${index}`, `우직 ${index}`),
-  );
-  const responses = new Map<string, KakaoPlace[]>([
-    ["보연희", [direct]],
-    ["오우드", [owoodSeoul, owoodBusan]],
-    ["우직", initialWoozikCandidates],
-    ["윤숲 후루츠산도점", []],
-    ["용용선생", chainCandidates],
-    ["우직 부산", [woozik]],
-    ["윤숲 후르츠산도점", [yunsoop]],
-  ]);
-  const searchCalls: string[] = [];
-  let judgeCalls = 0;
-
-  const result = await resolvePlacesFromKakao(
-    "보연희 서울 서대문구 연희맛로 17-63 / " +
-      "오우드 서울 성동구 연무장길 12 / " +
-      "우직\n@woozik.busan / " +
-      "윤숲 후루츠산도점 서울 중랑구 면목로7길 8 / 용용선생",
-    guesses,
-    {
-      search(query) {
-        searchCalls.push(query);
-        return Promise.resolve(responses.get(query) ?? []);
-      },
-      judge(_caption: string, items: KakaoCandidateReviewItem[]) {
-        judgeCalls += 1;
-        assertEquals(items.map((item) => item.guessIndex), [1, 2, 3, 4]);
-        assertEquals(items[2].candidates, []);
-        const decisions: AiCandidateJudgment[] = [{
-          guessIndex: 1,
-          decision: "SELECT",
-          candidateId: "owood-seoul",
-          retryQueries: [],
-          reason: "MATCH",
-        }, {
-          guessIndex: 2,
-          decision: "RETRY",
-          candidateId: null,
-          retryQueries: ["우직 부산"],
-          reason: "CANDIDATE_MISSING",
-        }, {
-          guessIndex: 3,
-          decision: "RETRY",
-          candidateId: null,
-          retryQueries: ["윤숲 후르츠산도점", "윤숲"],
-          reason: "CANDIDATE_MISSING",
-        }, {
-          guessIndex: 4,
-          decision: "NONE",
-          candidateId: null,
-          retryQueries: [],
-          reason: "INSUFFICIENT_CONTEXT",
-        }];
-        return Promise.resolve(decisions);
-      },
-    },
-  );
-
-  assertEquals(judgeCalls, 1);
-  assertEquals(searchCalls, [
-    "보연희",
-    "오우드",
-    "우직",
-    "윤숲 후루츠산도점",
-    "용용선생",
-    "우직 부산",
-    "윤숲 후르츠산도점",
-  ]);
-  assertEquals(result.matches.map((match) => match.guessIndex), [0, 1, 2, 3]);
-  assertEquals(result.matches.map((match) => match.place.kakaoPlaceId), [
-    "direct",
-    "owood-seoul",
-    "1595758078",
-    "1775568752",
-  ]);
-  assertEquals(result.failures.map((failure) => failure.guessIndex), [4]);
-});
-
-Deno.test("resolves the 군자 bullet-list regression without weakening the final guard", async () => {
-  const caption = [
-    "📍 로컬타코야키",
-    "• 서울 광진구 군자로 166 1층",
-    "📍 윤숲 후루츠산도점",
-    "• 서울 광진구 면목로7길 8 1층",
-  ].join("\n");
-  const guesses = sanitizePlaceGuesses([
-    guess("로컬타코야키", "서울 광진구 군자로 166 1층", "서울"),
-    guess("윤숲 후루츠산도점", "서울 광진구 면목로7길 8 1층", "서울"),
-  ], caption);
-  const local: KakaoPlace = {
-    ...candidate(
-      "1372748435",
-      "로컬타코야끼 군자",
-      "서울특별시 광진구 군자로 166",
-    ),
-    address: "서울특별시 광진구 군자동 45-41",
-  };
-  const yunsoop = candidate(
-    "1775568752",
-    "윤숲 후르츠산도점",
-    "서울특별시 광진구 면목로7길 8",
-  );
-  const responses = new Map<string, KakaoPlace[]>([
-    ["로컬타코야키", []],
-    ["로컬타코야끼 군자", [local]],
-    ["윤숲 후루츠산도점", []],
-    ["윤숲 후르츠산도점", [yunsoop]],
-  ]);
-  const searchCalls: string[] = [];
-  let judgeCalls = 0;
-
-  const result = await resolvePlacesFromKakao(caption, guesses, {
-    search(query) {
-      searchCalls.push(query);
-      return Promise.resolve(responses.get(query) ?? []);
-    },
-    judge(_caption, items) {
-      judgeCalls += 1;
-      assertEquals(items.map((item) => item.guessIndex), [0, 1]);
-      return Promise.resolve([{
-        guessIndex: 0,
-        decision: "RETRY",
-        candidateId: null,
-        retryQueries: ["로컬타코야끼 군자"],
-        reason: "CANDIDATE_MISSING",
-      }, {
-        guessIndex: 1,
-        decision: "RETRY",
-        candidateId: null,
-        retryQueries: ["윤숲 후르츠산도점"],
-        reason: "CANDIDATE_MISSING",
-      }]);
-    },
-  });
-
-  assertEquals(judgeCalls, 1);
-  assertEquals(searchCalls, [
-    "로컬타코야키",
-    "윤숲 후루츠산도점",
-    "로컬타코야끼 군자",
-    "윤숲 후르츠산도점",
-  ]);
-  assertEquals(result.matches.map((match) => match.place.kakaoPlaceId), [
-    "1372748435",
-    "1775568752",
-  ]);
-  assertEquals(result.failures, []);
-});
-
-Deno.test("does not call AI review when every initial candidate is safe", async () => {
-  let judgeCalls = 0;
-  const result = await resolvePlacesFromKakao("보연희", [guess("보연희")], {
-    search: () => Promise.resolve([candidate("direct", "보연희")]),
-    judge: () => {
-      judgeCalls += 1;
-      return Promise.resolve([]);
-    },
-  });
-
-  assertEquals(judgeCalls, 0);
-  assertEquals(result.matches.map((match) => match.place.kakaoPlaceId), [
-    "direct",
-  ]);
-});
-
-Deno.test("finds an exact-address branch with address-centered keyword search", async () => {
-  const source = guess(
-    "동두천솥뚜껑삼겹살",
-    "서울 강남구 테헤란로1길 20 2층",
-    "서울",
-  );
-  const wrong = candidate(
-    "wrong",
-    "동두천솥뚜껑삼겹살 역삼점",
-    "서울 강남구 테헤란로 123",
-  );
-  const exact = candidate(
-    "312908843",
-    "동두천솥뚜껑삼겹살 강남역점",
-    "서울 강남구 테헤란로1길 20",
-  );
   const calls: string[] = [];
-  let judgeCalls = 0;
-
-  const result = await resolvePlacesFromKakao(
-    "동두천솥뚜껑삼겹살 서울 강남구 테헤란로1길 20 2층",
-    [source],
-    {
-      search(query) {
-        calls.push(`initial:${query}`);
-        return Promise.resolve([wrong]);
-      },
-      geocodeAddress(address) {
-        calls.push(`address:${address}`);
-        return Promise.resolve([{
-          latitude: 37.497942,
-          longitude: 127.027621,
-          roadAddress: "서울 강남구 테헤란로1길 20",
-          address: "서울 강남구 역삼동 825-20",
-        }]);
-      },
-      searchNearby(query, center) {
-        calls.push(`nearby:${query}:${center.longitude},${center.latitude}`);
-        return Promise.resolve([exact]);
-      },
-      judge() {
-        judgeCalls += 1;
-        return Promise.resolve([]);
-      },
+  const result = await resolvePlacesFromKakao("버연희 / 파파죤스", guesses, {
+    async search(query) {
+      calls.push(query);
+      return page(
+        query === "보연희"
+          ? [corrected[0]]
+          : query === "파파존스"
+          ? [corrected[1]]
+          : [],
+      );
     },
-  );
-
+    async judge(caption, items) {
+      assertEquals(caption, "버연희 / 파파죤스");
+      assertEquals(items.map((item) => item.guess.placeName), [
+        "버연희",
+        "파파죤스",
+      ]);
+      return [select(0, "boyeon"), select(1, "papa")];
+    },
+  });
   assertEquals(calls, [
-    "initial:동두천솥뚜껑삼겹살",
-    "address:서울 강남구 테헤란로1길 20 2층",
-    "nearby:동두천솥뚜껑삼겹살:127.027621,37.497942",
+    "버연희",
+    "보연희",
+    "파파죤스",
+    "파파존스",
+    "Papa John's",
   ]);
-  assertEquals(judgeCalls, 0);
-  assertEquals(result.matches.map((match) => match.place.kakaoPlaceId), [
-    "312908843",
-  ]);
+  assertEquals(
+    result.matches.map((match) => [match.guess.placeName, match.place.name]),
+    [["버연희", "보연희"], ["파파죤스", "파파존스 연희점"]],
+  );
   assertEquals(result.failures, []);
 });
 
-Deno.test("skips address-centered search when the initial result has the exact address", async () => {
-  const source = guess("춘식당", "서울 강남구 도산대로23길 17", "서울");
-  const exact = candidate(
-    "initial-exact",
-    "춘식당",
-    "서울 강남구 도산대로23길 17",
-  );
-  let geocodeCalls = 0;
-  let nearbyCalls = 0;
-
-  const result = await resolvePlacesFromKakao("춘식당", [source], {
-    search: () => Promise.resolve([exact]),
-    geocodeAddress: () => {
-      geocodeCalls += 1;
-      throw new Error("must not geocode");
+Deno.test("lets AI inspect a lone initial candidate and rejudge expanded candidates", async () => {
+  const wrong = candidate("wrong", "다른 가게");
+  const correct = candidate("correct", "보연희");
+  let rounds = 0;
+  const result = await resolvePlacesFromKakao("버연희", [guess("버연희")], {
+    async search(query) {
+      return page(query === "버연희" ? [wrong] : [correct]);
     },
-    searchNearby: () => {
-      nearbyCalls += 1;
-      throw new Error("must not search nearby");
+    async judge(_caption, items) {
+      rounds += 1;
+      if (rounds === 1) {
+        assertEquals(items[0].candidates, [wrong]);
+        return [retry(0, ["보연희 서울"])];
+      }
+      assertEquals(items[0].candidates, [wrong, correct]);
+      return [select(0, "correct")];
     },
-    judge: () => Promise.resolve([]),
   });
-
-  assertEquals([geocodeCalls, nearbyCalls], [0, 0]);
+  assertEquals(rounds, 2);
   assertEquals(result.matches.map((match) => match.place.kakaoPlaceId), [
-    "initial-exact",
+    "correct",
   ]);
 });
 
-Deno.test("keeps the existing AI path when address-centered search fails", async () => {
-  const source = guess("춘식당", "서울 강남구 도산대로23길 17", "서울");
-  const wrong = candidate(
-    "wrong",
-    "춘식당 부산점",
-    "부산 동래구 충렬대로 1",
+Deno.test("shows all pooled candidates and later pages without repeating prior requests", async () => {
+  const first = Array.from(
+    { length: 15 },
+    (_, i) => candidate("first-" + i, "체인점 " + i),
   );
-  const events: string[] = [];
-
-  const result = await resolvePlacesFromKakao("춘식당", [source], {
-    search: () => Promise.resolve([wrong]),
-    geocodeAddress: () =>
-      Promise.resolve([{
-        latitude: 37.521,
-        longitude: 127.028,
-        roadAddress: "서울 강남구 도산대로23길 17",
-        address: "서울 강남구 신사동 561-17",
-      }]),
-    searchNearby: () =>
-      Promise.reject(new KakaoPlaceSearchError("SERVER", 503, true)),
-    judge(_caption, items) {
-      assertEquals(items[0].candidates, [wrong]);
-      return Promise.resolve([{
-        guessIndex: 0,
-        decision: "NONE",
-        candidateId: null,
-        retryQueries: [],
-        reason: "ADDRESS_CONFLICT",
-      }]);
+  const correct = candidate("correct", "체인점 목표지점");
+  const calls: string[] = [];
+  let rounds = 0;
+  const result = await resolvePlacesFromKakao("체인점", [guess("체인점")], {
+    async search(query, currentPage) {
+      calls.push(query + ":" + currentPage);
+      return currentPage === 1 ? page(first, false) : page([correct]);
     },
-    log(event) {
-      events.push(event);
+    async judge(_caption, items) {
+      rounds += 1;
+      if (rounds === 1) return [retry(0, ["체인점"])];
+      assertEquals(items[0].candidates.length, 16);
+      assertEquals(items[0].candidates.at(-1)?.kakaoPlaceId, "correct");
+      return [select(0, "correct")];
     },
   });
-
-  assertEquals(result.matches, []);
-  assertEquals(result.failures.map((failure) => failure.reason), [
-    "ADDRESS_CONFLICT",
-  ]);
-  assertEquals(events.includes("kakao_address_nearby_search_skipped"), true);
+  assertEquals(calls, ["체인점:1", "체인점:2"]);
+  assertEquals(result.matches[0].place.kakaoPlaceId, "correct");
 });
 
-Deno.test("skips non-matching or ambiguous address coordinates", async () => {
-  const source = guess("춘식당", "서울 강남구 도산대로23길 17", "서울");
-  const wrong = candidate("wrong", "춘식당 부산점", "부산 동래구 충렬대로 1");
-  const exactCoordinate = {
-    latitude: 37.521,
-    longitude: 127.028,
-    roadAddress: "서울 강남구 도산대로23길 17",
-    address: "서울 강남구 신사동 561-17",
+Deno.test("accepts address-centered candidates without exact name or address filtering", async () => {
+  const source = {
+    ...guess("버연희", ["보연희"]),
+    address: "서울 서대문구 연희맛로 17-63 2층",
+    searchAddress: "서울 서대문구 연희맛로 17-63",
+    addressType: "ROAD" as const,
   };
-  const cases = [
-    [],
-    [exactCoordinate, { ...exactCoordinate, longitude: 127.0281 }],
-    [{
-      ...exactCoordinate,
-      roadAddress: "서울 강남구 도산대로23길 18",
-      address: "서울 강남구 신사동 561-18",
-    }],
-  ];
+  const correct = {
+    ...candidate("correct", "BOYEONHUI"),
+    address: "서울 서대문구 연희동 지번 표기",
+  };
+  const coordinates = [{
+    latitude: 37.5,
+    longitude: 127,
+    address: "서울 서대문구 연희동",
+    roadAddress: null,
+  }];
+  let geocodeCalls = 0;
+  const radii: number[] = [];
+  const result = await resolvePlacesFromKakao("버연희", [source], {
+    async geocodeAddress(address) {
+      geocodeCalls += 1;
+      assertEquals(address, source.searchAddress);
+      return coordinates;
+    },
+    async searchNearby(query, center, radius) {
+      assertEquals(center, coordinates[0]);
+      radii.push(radius);
+      return page(query === "보연희" ? [correct] : []);
+    },
+    async search() {
+      return page();
+    },
+    async judge(_caption, items) {
+      assertEquals(items[0].guess.address, source.address);
+      assertEquals(items[0].candidates, [correct]);
+      return [select(0, "correct")];
+    },
+  });
+  assertEquals(geocodeCalls, 1);
+  assertEquals(radii, [500, 500]);
+  assertEquals(result.matches[0].place, correct);
+});
 
-  for (const coordinates of cases) {
-    let nearbyCalls = 0;
-    const result = await resolvePlacesFromKakao("춘식당", [source], {
-      search: () => Promise.resolve([wrong]),
-      geocodeAddress: () => Promise.resolve(coordinates),
-      searchNearby: () => {
-        nearbyCalls += 1;
-        return Promise.resolve([]);
+Deno.test("expands nearby radii over two retries and judges the final results", async () => {
+  const radii: number[] = [];
+  let rounds = 0;
+  const correct = candidate("correct", "보연희");
+  const result = await resolvePlacesFromKakao("버연희", [{
+    ...guess("버연희"),
+    address: "연희동",
+    addressType: "PARTIAL",
+  }], {
+    async geocodeAddress() {
+      return [{
+        latitude: 37.5,
+        longitude: 127,
+        address: "연희동",
+        roadAddress: null,
+      }];
+    },
+    async searchNearby(_query, _center, radius) {
+      radii.push(radius);
+      return page(radius === 5000 ? [correct] : []);
+    },
+    async search() {
+      return page();
+    },
+    async judge(_caption, items) {
+      assertEquals(items[0].remainingSearchRounds, 2 - rounds);
+      rounds += 1;
+      return rounds < 3 ? [retry(0, ["버연희"])] : [select(0, "correct")];
+    },
+  });
+  assertEquals(radii, [500, 2000, 5000]);
+  assertEquals(rounds, 3);
+  assertEquals(result.matches[0].place, correct);
+});
+
+Deno.test("falls back to the source address and shares geocoding and keyword calls", async () => {
+  const source = {
+    ...guess("장소"),
+    address: "원문 주소",
+    searchAddress: "검색용 주소",
+  };
+  const geocoded: string[] = [];
+  let keywordCalls = 0;
+  const result = await resolvePlacesFromKakao("장소", [source, source], {
+    async geocodeAddress(address) {
+      geocoded.push(address);
+      return address === "원문 주소"
+        ? [{ latitude: 37.5, longitude: 127, address, roadAddress: null }]
+        : [];
+    },
+    async searchNearby() {
+      return page();
+    },
+    async search() {
+      keywordCalls += 1;
+      return page([candidate("one", "장소")]);
+    },
+    async judge() {
+      return [select(0, "one"), select(1, "one")];
+    },
+  });
+  assertEquals(geocoded, ["검색용 주소", "원문 주소"]);
+  assertEquals(keywordCalls, 1);
+  assertEquals(result.matches.length, 1);
+});
+
+Deno.test("continues keyword search when optional geocoding or nearby search fails", async () => {
+  for (const failureAt of ["geocode", "nearby"]) {
+    const result = await resolvePlacesFromKakao("장소", [{
+      ...guess("장소"),
+      address: "주소",
+    }], {
+      async geocodeAddress() {
+        if (failureAt === "geocode") {
+          throw new KakaoPlaceSearchError("SERVER", 503, true);
+        }
+        return [{
+          latitude: 37.5,
+          longitude: 127,
+          address: "주소",
+          roadAddress: null,
+        }];
       },
-      judge: () =>
-        Promise.resolve([{
-          guessIndex: 0,
+      async searchNearby() {
+        throw new KakaoPlaceSearchError("NETWORK", null, true);
+      },
+      async search() {
+        return page([candidate("one", "장소")]);
+      },
+      async judge() {
+        return [select(0, "one")];
+      },
+    });
+    assertEquals(result.matches.length, 1);
+  }
+});
+
+Deno.test("rejects unknown IDs, records missing judgments, and keeps valid matches ordered", async () => {
+  const result = await resolvePlacesFromKakao("a b c d", [
+    guess("a"),
+    guess("b"),
+    guess("c"),
+    guess("d"),
+  ], {
+    async search(query) {
+      return page([candidate(query, query)]);
+    },
+    async judge() {
+      return [select(3, "d"), select(2, "a"), select(0, "a")];
+    },
+  });
+  assertEquals(result.matches.map((match) => match.guessIndex), [0, 3]);
+  assertEquals(
+    result.failures.map((failure) => [failure.guessIndex, failure.reason]),
+    [[1, "AI_JUDGMENT_UNAVAILABLE"], [2, "AI_SELECTED_UNKNOWN_CANDIDATE"]],
+  );
+});
+
+Deno.test("keeps selected places while retrying only unresolved guesses", async () => {
+  let rounds = 0;
+  const result = await resolvePlacesFromKakao("a b", [guess("a"), guess("b")], {
+    async search(query) {
+      return page([candidate(query, query)]);
+    },
+    async judge(_caption, items) {
+      rounds += 1;
+      if (rounds === 1) return [retry(0, ["correct-a"]), select(1, "b")];
+      assertEquals(items.map((item) => item.guessIndex), [0]);
+      return [select(0, "correct-a")];
+    },
+  });
+  assertEquals(result.matches.map((match) => match.guessIndex), [0, 1]);
+});
+
+Deno.test("bounds repeated retries and records NONE without another search", async () => {
+  let rounds = 0;
+  const result = await resolvePlacesFromKakao("a b", [guess("a"), guess("b")], {
+    async search() {
+      return page();
+    },
+    async judge(_caption, items) {
+      rounds += 1;
+      return items.map((item) =>
+        item.guessIndex === 0 ? retry(0, ["a"]) : {
+          guessIndex: 1,
           decision: "NONE",
           candidateId: null,
           retryQueries: [],
-          reason: "ADDRESS_CONFLICT",
-        }]),
-    });
-    assertEquals(nearbyCalls, 0);
-    assertEquals(result.failures.map((failure) => failure.reason), [
-      "ADDRESS_CONFLICT",
-    ]);
-  }
-});
-
-Deno.test("does not merge nearby candidates failing the address or name guard", async () => {
-  const source = guess("춘식당", "서울 강남구 도산대로23길 17", "서울");
-  const initial = candidate(
-    "initial",
-    "춘식당 부산점",
-    "부산 동래구 충렬대로 1",
-  );
-  const nearbyWrongAddress = candidate(
-    "nearby-wrong",
-    "춘식당 신사점",
-    "서울 강남구 도산대로23길 18",
-  );
-  const nearbyWrongName = candidate(
-    "nearby-unrelated",
-    "전혀다른식당",
-    "서울 강남구 도산대로23길 17",
-  );
-
-  const result = await resolvePlacesFromKakao("춘식당", [source], {
-    search: () => Promise.resolve([initial]),
-    geocodeAddress: () =>
-      Promise.resolve([{
-        latitude: 37.521,
-        longitude: 127.028,
-        roadAddress: "서울 강남구 도산대로23길 17",
-        address: "서울 강남구 신사동 561-17",
-      }]),
-    searchNearby: () => Promise.resolve([nearbyWrongAddress, nearbyWrongName]),
-    judge(_caption, items) {
-      assertEquals(items[0].candidates, [initial]);
-      return Promise.resolve([{
-        guessIndex: 0,
-        decision: "NONE",
-        candidateId: null,
-        retryQueries: [],
-        reason: "ADDRESS_CONFLICT",
-      }]);
+          reason: "AMBIGUOUS_SAME_NAME",
+        }
+      );
     },
   });
-
+  assertEquals(rounds, 3);
   assertEquals(result.failures.map((failure) => failure.reason), [
-    "ADDRESS_CONFLICT",
+    "NO_KAKAO_CANDIDATE_AFTER_EXPANSION",
+    "AMBIGUOUS_SAME_NAME",
   ]);
 });
 
-Deno.test("searches nearby when an initial exact-address tenant fails the name guard", async () => {
-  const source = guess("춘식당", "서울 강남구 도산대로23길 17", "서울");
-  const unrelatedTenant = candidate(
-    "other-tenant",
-    "전혀다른식당",
-    "서울 강남구 도산대로23길 17",
-  );
-  const exact = candidate(
-    "chunsik",
-    "춘식당",
-    "서울 강남구 도산대로23길 17",
-  );
-  let nearbyCalls = 0;
+Deno.test("preserves provider errors instead of treating outages as zero candidates", async () => {
+  const upstream = new KakaoPlaceSearchError("RATE_LIMIT", 429, true);
+  try {
+    await resolvePlacesFromKakao("a", [guess("a")], {
+      async search() {
+        throw upstream;
+      },
+      async judge() {
+        throw new Error("must not judge an outage");
+      },
+    });
+    throw new Error("expected provider error");
+  } catch (error) {
+    assert(error === upstream);
+  }
+});
 
-  const result = await resolvePlacesFromKakao("춘식당", [source], {
-    search: () => Promise.resolve([unrelatedTenant]),
-    geocodeAddress: () =>
-      Promise.resolve([{
-        latitude: 37.521,
-        longitude: 127.028,
-        roadAddress: "서울 강남구 도산대로23길 17",
-        address: "서울 강남구 신사동 561-17",
-      }]),
-    searchNearby: () => {
-      nearbyCalls += 1;
-      return Promise.resolve([exact]);
+Deno.test("does not call dependencies for an empty extraction", async () => {
+  const never = () => {
+    throw new Error("must not run");
+  };
+  assertEquals(
+    await resolvePlacesFromKakao("", [], { search: never, judge: never }),
+    { matches: [], failures: [] },
+  );
+});
+
+Deno.test("reads later nearby pages when a dense area hides the corrected place", async () => {
+  let rounds = 0;
+  const calls: string[] = [];
+  const correct = candidate("correct", "파파존스");
+  const result = await resolvePlacesFromKakao("파파죤스", [{
+    ...guess("파파죤스"),
+    address: "역삼동",
+  }], {
+    async geocodeAddress() {
+      return [{
+        latitude: 37.5,
+        longitude: 127,
+        address: "역삼동",
+        roadAddress: null,
+      }];
     },
-    judge(_caption, items) {
-      assertEquals(items[0].candidates, [exact, unrelatedTenant]);
-      return Promise.resolve([{
-        guessIndex: 0,
-        decision: "SELECT",
-        candidateId: "chunsik",
-        retryQueries: [],
-        reason: "MATCH",
-      }]);
+    async searchNearby(_query, _center, radius, currentPage) {
+      calls.push(radius + ":" + currentPage);
+      return currentPage === 1
+        ? page([candidate("other", "다른 장소")], false)
+        : page([correct]);
+    },
+    async search() {
+      return page();
+    },
+    async judge(_caption, items) {
+      rounds += 1;
+      if (rounds === 1) return [retry(0, ["파파죤스"])];
+      assert(
+        items[0].candidates.some((place) => place.kakaoPlaceId === "correct"),
+      );
+      return [select(0, "correct")];
     },
   });
-
-  assertEquals(nearbyCalls, 1);
-  assertEquals(result.matches.map((match) => match.place.kakaoPlaceId), [
-    "chunsik",
-  ]);
+  assertEquals(calls, ["500:1", "2000:1", "2000:2"]);
+  assertEquals(result.matches[0].place, correct);
 });
 
-Deno.test("rethrows unexpected address-centered search errors", async () => {
-  const source = guess("춘식당", "서울 강남구 도산대로23길 17", "서울");
-  try {
-    await resolvePlacesFromKakao("춘식당", [source], {
-      search: () => Promise.resolve([]),
-      geocodeAddress: () => Promise.reject(new TypeError("programming bug")),
-      searchNearby: () => Promise.resolve([]),
-      judge: () => Promise.resolve([]),
-    });
-  } catch (error) {
-    assertEquals(error instanceof TypeError, true);
-    assertEquals((error as Error).message, "programming bug");
-    return;
-  }
-  throw new Error("Expected an unexpected error to be rethrown");
-});
-
-Deno.test("geocodes one shared detailed address only once per resolution", async () => {
-  const sharedAddress = "서울 강남구 도산대로23길 17";
-  const sources = [
-    guess("춘식당", sharedAddress, "서울"),
-    guess("카페온", sharedAddress, "서울"),
-  ];
-  const chunsik = candidate("chunsik", "춘식당", sharedAddress);
-  const cafeOn = candidate("cafe-on", "카페온", sharedAddress);
-  let geocodeCalls = 0;
-  const nearbyCalls: string[] = [];
-
-  const result = await resolvePlacesFromKakao(
-    `춘식당 ${sharedAddress} / 카페온 ${sharedAddress}`,
-    sources,
-    {
-      search: () => Promise.resolve([]),
-      geocodeAddress: () => {
-        geocodeCalls += 1;
-        return Promise.resolve([{
-          latitude: 37.521,
-          longitude: 127.028,
-          roadAddress: sharedAddress,
-          address: "서울 강남구 신사동 561-17",
-        }]);
-      },
-      searchNearby(query) {
-        nearbyCalls.push(query);
-        return Promise.resolve(query === "춘식당" ? [chunsik] : [cafeOn]);
-      },
-      judge: () => Promise.resolve([]),
+Deno.test("keeps earlier corrected queries when the next retry widens the radius", async () => {
+  let rounds = 0;
+  const correct = candidate("correct", "보연희");
+  const result = await resolvePlacesFromKakao("버연희", [{
+    ...guess("버연희"),
+    address: "연희동",
+  }], {
+    async geocodeAddress() {
+      return [{
+        latitude: 37.5,
+        longitude: 127,
+        address: "연희동",
+        roadAddress: null,
+      }];
     },
-  );
-
-  assertEquals(geocodeCalls, 1);
-  assertEquals(nearbyCalls, ["춘식당", "카페온"]);
-  assertEquals(result.matches.map((match) => match.place.kakaoPlaceId), [
-    "chunsik",
-    "cafe-on",
-  ]);
+    async searchNearby(query, _center, radius) {
+      return page(query === "보연희" && radius === 5000 ? [correct] : []);
+    },
+    async search() {
+      return page();
+    },
+    async judge(_caption, items) {
+      rounds += 1;
+      if (rounds === 1) return [retry(0, ["보연희"])];
+      if (rounds === 2) return [retry(0, ["BOYEONHUI"])];
+      assertEquals(items[0].candidates, [correct]);
+      return [select(0, "correct")];
+    },
+  });
+  assertEquals(result.matches[0].place, correct);
 });

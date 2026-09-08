@@ -4,6 +4,7 @@ import {
   parseKakaoAddressCoordinates,
   parseKakaoPlaces,
   searchKakaoAddressCoordinates,
+  searchKakaoPlacePage,
   searchKakaoPlaces,
   searchKakaoPlacesNearAddress,
 } from "./kakao.ts";
@@ -208,7 +209,7 @@ Deno.test("geocodes a detailed address with the Kakao address endpoint", async (
   }]);
   assertEquals(url.pathname, "/v2/local/search/address.json");
   assertEquals(url.searchParams.get("query"), "서울 강남구 테헤란로1길 20");
-  assertEquals(url.searchParams.get("analyze_type"), "exact");
+  assertEquals(url.searchParams.get("analyze_type"), "similar");
   assertEquals(authorization, "KakaoAK test-key");
 
   await searchKakaoAddressCoordinates(
@@ -276,12 +277,12 @@ Deno.test("searches a place name near an address coordinate by distance", async 
   assertEquals(url.searchParams.get("query"), "동두천솥뚜껑삼겹살");
   assertEquals(url.searchParams.get("x"), "127.027621");
   assertEquals(url.searchParams.get("y"), "37.497942");
-  assertEquals(url.searchParams.get("radius"), "300");
+  assertEquals(url.searchParams.get("radius"), "500");
   assertEquals(url.searchParams.get("sort"), "distance");
   assertEquals(url.searchParams.get("size"), "15");
 });
 
-Deno.test("caps an address-nearby search radius at 500 meters", async () => {
+Deno.test("caps an address-nearby search radius at the Kakao 20km limit", async () => {
   let requestedUrl = "";
   const request = ((input: string | URL | Request) => {
     requestedUrl = String(input);
@@ -293,7 +294,48 @@ Deno.test("caps an address-nearby search radius at 500 meters", async () => {
     { latitude: 37.52, longitude: 127.03 },
     "key",
     request,
-    5000,
+    25000,
   );
-  assertEquals(new URL(requestedUrl).searchParams.get("radius"), "500");
+  assertEquals(new URL(requestedUrl).searchParams.get("radius"), "20000");
+});
+
+Deno.test("exposes next-page metadata and sends the requested keyword page", async () => {
+  let requestedUrl = "";
+  const request = ((input: string | URL | Request) => {
+    requestedUrl = String(input);
+    return Promise.resolve(
+      Response.json({
+        meta: { is_end: false },
+        documents: [{ id: "one", place_name: "장소", distance: "125" }],
+      }),
+    );
+  }) as typeof fetch;
+  const result = await searchKakaoPlacePage(
+    "장소",
+    "key",
+    { page: 2 },
+    request,
+  );
+  assertEquals(new URL(requestedUrl).searchParams.get("page"), "2");
+  assertEquals(result.isEnd, false);
+  assertEquals(result.places[0].distanceMeters, 125);
+});
+
+Deno.test("uses partial region coordinates as search anchors", () => {
+  assertEquals(
+    parseKakaoAddressCoordinates({
+      documents: [{
+        address_type: "REGION",
+        address_name: "서울 서대문구 연희동",
+        x: "126.93",
+        y: "37.57",
+      }],
+    }),
+    [{
+      latitude: 37.57,
+      longitude: 126.93,
+      roadAddress: null,
+      address: "서울 서대문구 연희동",
+    }],
+  );
 });

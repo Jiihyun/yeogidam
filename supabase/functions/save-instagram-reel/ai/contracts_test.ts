@@ -180,3 +180,49 @@ Deno.test("keeps more than ten complete candidate judgments", () => {
   assertEquals(result.length, 12);
   assertEquals(result.at(-1)?.guessIndex, 11);
 });
+
+Deno.test("preserves source fields and accepts corrected search names absent from the caption", () => {
+  const places = [{
+    placeName: "버연희",
+    searchNames: [" 보연희 ", "보연희", "BOYEONHUI"],
+    address: "서울 서대문구 연희맛로 17-63 2층",
+    searchAddress: "서울 서대문구 연희맛로 17-63",
+    addressType: "ROAD",
+    region: "연희동",
+  }, {
+    placeName: "파파죤스",
+    searchNames: ["파파존스", "Papa John's"],
+    address: null,
+    searchAddress: null,
+    addressType: "NONE",
+    region: null,
+  }];
+  const result = parsePlaceExtractionPayload({ places });
+  assertEquals(result[0].placeName, "버연희");
+  assertEquals(result[0].searchNames, ["보연희", "BOYEONHUI"]);
+  assertEquals(result[0].address, places[0].address);
+  assertEquals(result[0].searchAddress, places[0].searchAddress);
+  assertEquals(result[1].placeName, "파파죤스");
+  assertEquals(result[1].searchNames, ["파파존스", "Papa John's"]);
+});
+
+Deno.test("checks search helper field shapes without requiring name similarity", () => {
+  const place = {
+    placeName: "상호",
+    address: null,
+    addressType: "NONE",
+    region: null,
+  };
+  for (
+    const searchNames of ["상호", [null], [""], ["a", "b", "c", "d"], [
+      "a".repeat(81),
+    ]]
+  ) {
+    assertContractError(() =>
+      parsePlaceExtractionPayload({ places: [{ ...place, searchNames }] })
+    );
+  }
+  assertContractError(() =>
+    parsePlaceExtractionPayload({ places: [{ ...place, searchAddress: 42 }] })
+  );
+});

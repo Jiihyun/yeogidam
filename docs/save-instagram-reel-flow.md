@@ -7,6 +7,8 @@
 
 ## 1. 요청 계약
 
+앱↔서버의 기존 v1/v2 엔드포인트, 요청 필드, 응답 필드·타입, HTTP 상태 코드와 오류 형식은 유지한다. `searchNames`, `searchAddress` 등 검색 보조 필드는 서버 내부 AI 호출에서만 사용하며 앱 요청·응답에 추가하지 않는다. `PIPELINE_VERSION`은 서버 내부 추출 캐시 구분값이다.
+
 ```http
 POST /functions/v1/save-instagram-reel
 Authorization: Bearer <Supabase user JWT>
@@ -57,28 +59,28 @@ sequenceDiagram
         I-->>F: caption + thumbnail
         F->>AI: 전체 caption, places[] schema
         AI-->>F: 0..N 장소명·주소·지역
-        loop 원문에 근거가 있는 각 장소
-            F->>K: 장소명 키워드 검색
-            K-->>F: 0..15 후보 + Kakao place id
-            F->>F: Kakao place id 중복 제거
-            alt 후보 0개
-                F->>F: 장소별 실패 기록
-            else 후보 1개
-                F->>F: 즉시 선택
-            else 후보 2개 이상
-                F->>F: 주소·지역으로 유일 후보 확인
-                opt 위치만으로 하나를 못 고름
-                    F->>AI: 전체 caption + Kakao 후보
-                    AI-->>F: candidateId 또는 NONE
-                    F->>F: 전달한 candidateId인지 확인
-                end
+        loop Gemini가 추출한 각 장소
+            opt 주소 있음
+                F->>K: 검색용 주소 → 좌표, 주변에서 원문·보정 상호 검색
             end
-            opt 후보가 선택됨
-                F->>D: places upsert on kakao_place_id
-                F->>G: 대표 사진 조회
-                F->>S: 선택된 이미지 업로드
-                F->>D: worker reel_places 저장
-            end
+            F->>K: 원문·보정 상호 및 지역 조합 검색
+            K-->>F: 후보 + Kakao place id + 페이지 정보
+            F->>F: Kakao place id 중복만 제거
+        end
+        F->>AI: 전체 caption + 장소별 전체 Kakao 후보
+        AI-->>F: SELECT / RETRY / NONE
+        loop RETRY 항목만 최대 두 차례
+            F->>K: 보정 검색어 + 반경·페이지 확장
+            K-->>F: 추가 후보
+            F->>AI: 이전 후보와 추가 후보를 합쳐 다시 선택
+            AI-->>F: SELECT / RETRY / NONE
+        end
+        loop 선택된 각 후보
+            F->>F: 해당 장소에 전달한 candidateId인지 확인
+            F->>D: places upsert on kakao_place_id
+            F->>G: 대표 사진 조회
+            F->>S: 선택된 이미지 업로드
+            F->>D: worker reel_places 저장
         end
         F->>D: extraction 확정 + 연결된 모든 요청 구체화
     end
@@ -86,25 +88,31 @@ sequenceDiagram
 
 ## 3. Instagram 추출
 
-1. 캡션: HTML `og:description` → `name="description"` → `twitter:description`
-2. 보조 저장: `og:image`, `og:url`
+1. 모바일 Safari User-Agent로 공개 HTML을 요청한다.
+2. 캡션: HTML `og:description` → `name="description"` → `twitter:description`
+3. 썸네일: `twitter:image` → `og:image`. 두 태그가 모두 있으면 원본 비율을 유지하는 `twitter:image`를 우선한다.
+4. 보조 추출: `og:url`, title/description의 작성자 계정.
 
-릴스 URL의 HTML head가 유일한 캡션 입력이자 SSOT다. HTML 태그 배치 순서와 무관하게 위 description 우선순위를 적용하고, 큰따옴표·작은따옴표를 모두 처리하며 HTML entity를 디코딩한다. 한 번의 릴스 HTML 요청에서 description을 얻지 못하면 추가 Instagram 요청 없이 `IG_FETCH_FAILED`다.
+Supabase Edge Runtime 1.76.0은 함수가 설정한 User-Agent 뒤에도 실행 엔진·프로젝트 식별값을 자동으로 붙인다. 기존 `Twitterbot/1.0`에 이 접미사가 붙으면 Instagram이 축약 캡션과 가로로 잘린 `og:image`를 반환하는 문제가 재현됐다. 모바일 User-Agent는 같은 접미사가 붙어도 전체 캡션을 받았고, 잘린 응답에서도 `twitter:image`에는 정상 비율 이미지가 남아 있었다. [공식 변경 내역](https://github.com/supabase/edge-runtime/releases/tag/v1.76.0)
 
-Gemini 입력과 DB의 캡션 원문은 선택된 description 하나다. `og:title`과 `twitter:title`은 파싱하거나 저장하지 않는다. title과 description에 같은 전체 캡션이 반복되는 Instagram 응답에서 불필요한 데이터 보관과 중복 입력 가능성을 없앤다. 릴스 HTML 요청이 non-2xx이거나 description이 없으면 Gemini를 호출하지 않는다.
+릴스 URL의 HTML head가 유일한 캡션 입력이자 SSOT다. HTML 태그 배치 순서와 무관하게 위 description·image 우선순위를 적용하고, 큰따옴표·작은따옴표를 모두 처리하며 HTML entity를 디코딩한다. HTML 요청 실패는 `IG_FETCH_FAILED`, 한 번의 요청에서 description을 얻지 못하면 추가 Instagram 요청 없이 `IG_CAPTION_NOT_FOUND`다.
+
+Gemini 입력과 DB의 캡션 원문은 선택된 description 하나다. `og:title`과 `twitter:title`은 작성자 계정 추출에만 사용하고 캡션으로 저장하거나 AI에 중복 전달하지 않는다. 릴스 HTML 요청이 non-2xx이거나 description이 없으면 Gemini를 호출하지 않는다.
 
 레거시 스키마의 `reels.instagram_title` 컬럼은 기존 배포 호환을 위해 당분간 nullable 상태로 남겨 두지만 신규 처리와 동일 릴스 결과 재사용에서는 값을 쓰지 않는다. UI, 장소 매칭, 중복 판정, 재시도 어느 경로에서도 사용하지 않으며 다음 스키마 정리 때 제거할 수 있다.
 
-## 4. Gemini-first 다중 추출
+## 4. Gemini 추출과 검색용 상호 보정
 
-캡션 전체를 structured output으로 보낸다.
+캡션 전체를 structured output으로 보내 원문과 검색용 표현을 함께 받는다.
 
 ```json
 {
   "places": [
     {
-      "placeName": "보연희",
+      "placeName": "버연희",
+      "searchNames": ["보연희"],
       "address": "서울 서대문구 연희맛로 17-63 2층",
+      "searchAddress": "서울 서대문구 연희맛로 17-63",
       "addressType": "ROAD",
       "region": "연희동"
     }
@@ -112,43 +120,40 @@ Gemini 입력과 DB의 캡션 원문은 선택된 description 하나다. `og:tit
 }
 ```
 
-- 애플리케이션이 장소 개수를 제한하지 않고 Gemini가 반환한 유효 항목을 모두 처리
-- 여러 주소·장소는 별도 원소
-- 같은 장소의 도로명·지번 병기는 하나로 통합
-- 층·동·호를 포함한 상세주소 보존
-- 이름·주소·지역은 추론하지 않고 원문 문자열 복사
+- `placeName`, `address`는 원문의 상호와 상세주소를 보존한다.
+- `searchNames`는 오타·음차·영문·약칭·계정명에서 Gemini가 보정한 상호를 최대 3개 담는다. `버연희 → 보연희`, `파파죤스 → 파파존스`는 예시이며 코드의 치환 사전이 아니다. 원문에 없거나 여러 글자가 달라도 검색에 사용할 수 있다.
+- `searchAddress`는 도로명 건물번호 또는 지번까지 남긴 주소 검색용 표현이다. `region`은 해당 장소의 지역 문맥을 검색하기 좋은 표현으로 받는다.
+- 장소 개수에 애플리케이션 상한을 두지 않는다. 원문 순서로 추출하도록 요청하며, 최종 성공한 장소는 추출 인덱스 순서대로 저장한다.
+- 응답 형식은 검사하지만 원문 포함 여부·장소 주변 문자열·지점명 규칙으로 장소나 필드를 삭제하지 않는다. 정규식 주소는 관측용 로그와 로컬 스텁에서만 쓰며 Gemini의 장소·주소 연결을 변경하지 않는다.
+- 공급자 공통 JSON schema에는 새 검색 필드를 요구한다. 파서는 이전 형태와의 호환을 위해 검색 필드가 생략된 응답도 받을 수 있다.
 
-호출 후 각 필드가 실제로 캡션에 있는지 다시 검증한다. 장소명이 원문에 없으면 항목을 제거하고, 주소·지역이 원문에 없으면 해당 필드만 `null`로 둔다. 주소와 지역이 모두 없어도 원문에 실제 방문 장소로 언급된 장소명은 후속 Kakao 검색에 넘긴다.
+1차 추출은 캡션당 한 번이다. 후보 선택은 전체 장소를 묶어 한 번 수행하고, `RETRY` 항목만 최대 두 번 추가 선택한다. 공급자 장애 재시도·fallback을 제외하면 추출 1회 + 선택 최대 3회다.
 
-response schema와 응답 파서에는 장소 개수 상한을 두지 않는다. Gemini가 반환한 모든 유효 장소가 후속 Kakao 단계에 들어가며, 2차 후보 선택도 전체 대상 장소의 판단을 파싱한다. 다만 모델의 출력 토큰·컨텍스트 같은 공급자 한계나 모델 자체 누락 가능성까지 없어지는 것은 아니다.
+## 5. Kakao 후보 수집과 Gemini 선택
 
-현재 프롬프트는 원문 순서대로 반환하라고 명시하지 않는다. `reel_places.position`도 원문 절대 인덱스가 아니라 최종 매칭에 성공한 결과를 0부터 다시 센 순서다. 원문 1·3·5번째만 성공하면 position은 0·1·2가 된다.
+각 장소는 다음 검색 결과를 합친다.
 
-1차 장소 추출 Gemini는 캡션당 한 번 호출한다. 복수 Kakao 후보가 남은 장소가 있으면 해당 장소들을 묶어 2차 후보 선택 Gemini를 최대 한 번 추가 호출한다. 비용과 지연은 주로 각 결과에 대한 Kakao 검색, 필요한 2차 Gemini 판단, 새 장소의 Google 사진 조회, Storage 업로드에서 증가한다.
+1. 원문 상호와 `searchNames`의 보정 상호를 모두 검색한다.
+2. 지역이 있으면 각 상호에 지역을 붙인 검색도 수행한다.
+3. 주소가 있으면 `searchAddress`, 없거나 검색 결과가 없으면 원문 `address`를 Kakao 주소 API로 조회한다. `analyze_type=similar`를 사용하며 건물 이하 상세주소는 제거한다.
+4. 주소 검색의 상위 좌표 최대 두 개를 사용해 원문·보정 상호를 반경 500m, 거리순으로 검색한다. 주소 문자열의 정확 일치를 요구하지 않는다.
+5. Kakao ID 중복만 제거한다. 단일 후보도 Gemini가 확인하며, 여러 검색에서 모은 후보를 15개로 자르지 않는다. 후보 이름·도로명·지번·카테고리·좌표·검색 중심에서의 거리와 시도한 검색어를 제공한다.
 
-`address.ts`는 캡션의 도로명 주소를 `matchAll()`로 모두 수집하지만 현재는 shadow log에만 사용한다.
+Gemini의 판단은 다음과 같이 처리한다.
 
-## 5. Kakao 후보 생성과 선택
-
-각 `PlaceGuess`는 주소·지역 유무와 관계없이 `장소명` 하나로 Kakao 키워드 검색을 한 번 호출한다. 주소 문자열을 검색어에 섞거나, 결과가 없을 때 장소명으로 다시 검색하는 fallback은 없다. Kakao 응답은 정확도순 최대 15개이며, 같은 Kakao place id가 반복되면 첫 결과만 남긴다.
-
-HTTP 200 응답의 `documents: []`만 실제 후보 0개로 처리한다. Kakao가 401·403·429·5xx를 반환하거나 네트워크·응답 형식 오류가 발생하면 후보 0개로 바꾸지 않고 공급자 오류로 중단한다. 현재 별도 DB 실패 enum을 늘리지 않고 재시도 가능한 `UNKNOWN`으로 기록하며, `kakao_place_search_failed` 로그에 오류 종류·HTTP status·재시도 가능 여부를 남긴다.
-
-후보 선택 정책은 다음과 같다.
-
-| Kakao place id 중복 제거 후 후보 수 | 처리 |
+| 판단 | 처리 |
 |---|---|
-| 0개 | 해당 장소를 `NO_KAKAO_CANDIDATE`로 기록하고 저장하지 않음 |
-| 1개 | 이름·주소를 다시 비교하지 않고 즉시 `AUTO_MATCH` |
-| 2개 이상 | 캡션에서 추출한 주소·지역으로 정확히 하나만 특정되면 `AUTO_MATCH`; 그 외에는 원본 후보 전체를 2차 Gemini에 전달 |
+| `SELECT` | 해당 장소에 실제 전달한 Kakao ID이면 수용한다. 이름·주소·지점을 코드로 다시 검증하지 않는다. |
+| `RETRY` | 보정 검색어 최대 3개를 추가하고 반경을 2km, 다음에는 5km로 확장한다. 키워드와 주변 검색 모두 `is_end`를 확인하며 각각 2, 3페이지까지 확장한다. 이전 후보와 새 후보를 합쳐 Gemini에게 다시 선택시킨다. |
+| `NONE` | 장소별 실패 사유를 기록한다. |
 
-복수 후보의 위치 자동 선택은 **양성 일치**에만 쓴다. 파싱 가능한 행정구역 토큰, 도로명, 건물번호가 후보 주소와 정확히 맞아 하나만 남을 때만 자동 선택한다. 불완전하거나 파싱할 수 없는 위치, 일치 후보 0개, 일치 후보 2개 이상은 후보를 버리는 근거가 아니라 2차 Gemini로 넘기는 조건이다.
+검색어는 공백·중복·빈 문자열·80자 길이 제한만 처리한다. 원문 포함 여부, 한 글자 오타, 로마자 변환, 지점 접미사 같은 의미 검증을 하지 않는다. 마지막 선택에는 남은 검색 횟수 0을 전달하고, 모델이 다시 `RETRY`를 반환해도 종료한다.
 
-2차 Gemini는 전체 캡션과 최대 15개의 Kakao 후보를 함께 받는다. `@아이디`, 해시태그, 지점명, 지역 문맥, 한글·영문·음차·철자 차이를 종합해 전달된 `candidateId` 하나를 선택하거나 근거가 부족하면 `NONE`을 반환한다. 코드의 최종 가드는 Gemini가 새 장소를 만들어 내지 못하도록 선택 ID가 전달 후보 목록에 있는지만 확인하며, 이름이나 주소 규칙으로 그 판단을 다시 뒤집지 않는다.
+한 추출 요청 안에서 동일한 질의·페이지·좌표·반경 결과 및 주소 변환 결과를 재사용한다. 장소는 순서대로 처리하고 각 장소의 독립적인 검색은 최대 3개씩 동시 실행한다. 카카오 한 페이지는 최대 15개이며, 비용과 지연은 보정 상호 수·지역·주소 좌표 수와 실제 확장 횟수에 따라 증가한다.
 
-이전의 상호명 지점 접미사 규칙, 4글자 이상 한 글자 오타 규칙, 도로명 숫자 전치 허용, 상세주소 기반 장소명-only fallback, Gemini 선택 후 이름·다지역·도로·건물번호 재검증은 제거했다. 표기 차이와 문맥 판단은 2차 Gemini가 맡는다.
+HTTP 200의 빈 `documents`만 후보 0개다. 기본 키워드 검색의 인증·한도·네트워크·응답 오류는 공급자 오류로 유지한다. 보조 주소·주변 검색에서 발생한 Kakao 오류는 기록하고 기본 키워드 검색을 계속한다. 주소·이름 규칙과 별개로 API 응답 형식 및 전달 후보 ID 검사는 유지한다.
 
-현재 장소는 순차 처리하며, Gemini가 추출한 장소마다 Kakao 키워드 검색을 한 번 호출한다. 애플리케이션 개수 상한이 없으므로 요청 수는 추출 장소 수에 비례한다.
+현재 `PIPELINE_VERSION`은 10이다. 기존 버전의 완료 캐시를 새 요청에 재사용하지 않아 변경된 검색과 보정이 적용된다.
 
 ## 6. 저장과 중복
 
@@ -223,8 +228,8 @@ Naver 전용 `naver_place_id`, `naver_link`, `naver_thumbnail_url`은 Kakao 전�
 | `IG_FETCH_FAILED` | Instagram 요청 실패 또는 non-2xx 응답 |
 | `IG_CAPTION_NOT_FOUND` | HTML 응답은 성공했지만 description 메타데이터 없음 |
 | `PROVIDER_CONFIG_MISSING` | Gemini 또는 Kakao API 키 누락 |
-| `GEMINI_PLACE_NOT_FOUND` | Gemini 결과가 없거나 원문 검증 후 후보가 0개 |
-| `KAKAO_PLACE_NOT_FOUND` | Kakao 후보가 없거나 2차 Gemini가 선택하지 않아 저장할 장소가 0개 |
+| `GEMINI_PLACE_NOT_FOUND` | Gemini가 추출한 장소가 0개 |
+| `KAKAO_PLACE_NOT_FOUND` | Kakao 후보가 없거나 Gemini가 최종 선택하지 않아 저장할 장소가 0개 |
 | `PLACE_NOT_FOUND` | 이전 버전 호환용 일반 장소 탐색 실패 |
 | `UNKNOWN` | DB·Storage 또는 예상하지 못한 예외 |
 
@@ -235,6 +240,6 @@ Naver 전용 `naver_place_id`, `naver_link`, `naver_thumbnail_url`은 Kakao 전�
 - 동일 Kakao 장소 ID가 캡션에 반복되어 하나로 합쳐짐
 - 썸네일 제공자가 모두 실패하여 이미지 없이 장소만 저장됨
 
-운영에서 저장 개수가 예상보다 적으면 `instagram_description`의 장소 순서, Gemini `placeCount`, sanitized count, 장소별 Kakao `candidateCount`·`decision`, 2차 Gemini의 `NONE` 사유, 최종 `reel_places.position`을 차례로 확인한다.
+운영에서 저장 개수가 예상보다 적으면 `instagram_description`의 장소 순서, Gemini `extractedCount`·`correctedSearchNameCount`, 장소별 Kakao `round`·`queries`·`candidateCount`, Gemini의 `SELECT`·`RETRY`·`NONE` 사유, 최종 `reel_places.position`을 차례로 확인한다.
 
-상세 알고리즘, 정규식 조사, 실패 매트릭스는 [MVP 장소 매칭 보고서](mvp-place-matching-release-report.md)를 참고한다.
+이전 정규식 검증 방식의 조사·실패 매트릭스는 [MVP 장소 매칭 보고서](mvp-place-matching-release-report.md)에 보존한다. 현재 동작은 이 문서의 버전 10 흐름을 따른다.

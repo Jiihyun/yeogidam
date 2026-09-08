@@ -8,6 +8,10 @@ export interface InstagramMeta {
 }
 
 const INSTAGRAM_USERNAME = "[A-Za-z0-9._]{1,30}";
+// Supabase Edge Runtime 1.76.0은 지정한 UA에도 프로젝트 식별값을 덧붙인다.
+// 접미사가 붙은 Twitterbot UA는 축약 캡션을 받으므로 모바일 페이지를 요청한다.
+const INSTAGRAM_USER_AGENT =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const INSTAGRAM_ENGLISH_DATE =
   "(?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{1,2},\\s+\\d{4}";
 const INSTAGRAM_ENGAGEMENT_COUNT = "\\d[\\d.,]*[KMB]?";
@@ -106,9 +110,10 @@ export function parseInstagramMeta(html: string): InstagramMeta {
       parseInstagramAuthorUsername(openGraphDescription) ??
       parseInstagramAuthorUsername(genericDescription) ??
       parseInstagramAuthorUsername(twitterDescription),
+    // 같은 응답의 og:image가 가로로 잘려도 twitter:image는 원본 비율을 유지한다.
     thumbnailUrl: metaContent(html, [
-      { attribute: "property", value: "og:image" },
       { attribute: "name", value: "twitter:image" },
+      { attribute: "property", value: "og:image" },
     ]),
     canonicalUrl: metaContent(html, [
       { attribute: "property", value: "og:url" },
@@ -121,7 +126,7 @@ export async function fetchInstagramMeta(
   request: typeof fetch = fetch,
 ): Promise<InstagramMeta> {
   const headers = {
-    "User-Agent": "Twitterbot/1.0",
+    "User-Agent": INSTAGRAM_USER_AGENT,
     "Accept-Language": "ko,en;q=0.9",
   };
 
