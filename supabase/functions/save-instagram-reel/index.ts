@@ -18,6 +18,10 @@ import { fetchInstagramMeta } from "./instagram.ts";
 import { extractKoreanAddresses } from "./address.ts";
 import { hasServiceRoleCredential } from "./auth.ts";
 import {
+  type InternalReelRequest,
+  parseInternalReelRequest,
+} from "./internal_request.ts";
+import {
   buildKakaoMapURL,
   type KakaoPlace,
   searchKakaoAddressCoordinates,
@@ -176,8 +180,7 @@ export function createSaveInstagramReelHandler(
   requestedSaveMode: ReelSaveMode,
   functionName = "save-instagram-reel",
 ): (req: Request) => Promise<Response> {
-  return (req) =>
-    handleSaveInstagramReel(req, requestedSaveMode, functionName);
+  return (req) => handleSaveInstagramReel(req, requestedSaveMode, functionName);
 }
 
 async function handleSaveInstagramReel(
@@ -211,7 +214,7 @@ async function handleSaveInstagramReel(
           details: { field: "body" },
         });
       }
-      const batch = parseInternalPlaceBatchRequest(internalPayload);
+      const batch = parseInternalReelRequest(internalPayload);
       if (!batch) {
         return errorResponse("INVALID_REQUEST_BODY", requestId, {
           headers: cors,
@@ -220,6 +223,15 @@ async function handleSaveInstagramReel(
       }
 
       const admin = createClient(SUPABASE_URL, SERVICE);
+      if (batch.action === "retry_reel_processing") {
+        return await retryStalledReel(
+          admin,
+          batch,
+          requestedSaveMode,
+          functionName,
+          requestId,
+        );
+      }
       EdgeRuntime.waitUntil(
         processPlaceBatch(
           admin,
@@ -357,6 +369,72 @@ if (import.meta.main) {
   Deno.serve(createSaveInstagramReelHandler(AUTO_SAVE, "save-instagram-reel"));
 }
 
+// Reuse the original request's stale-worker claim so retries rotate the token
+// atomically and never create another user history record.
+async function retryStalledReel(
+  admin: SupabaseClient,
+  operation: InternalReelRequest,
+  requestedSaveMode: ReelSaveMode,
+  functionName: string,
+  requestId: string,
+): Promise<Response> {
+  const { data: extraction, error: extractionError } = await admin
+    .from("reel_extractions")
+    .select("id,processing_status,pipeline_version")
+    .eq("id", operation.extractionId)
+    .eq("worker_reel_id", operation.workerReelId)
+    .eq("processing_token", operation.processingToken)
+    .maybeSingle();
+  if (extractionError) return databaseErrorResponse(requestId, extractionError);
+  if (!extraction || extraction.processing_status !== "PROCESSING") {
+    return errorResponse("CONFLICT", requestId, { headers: cors });
+  }
+  const { data: worker, error: workerError } = await admin
+    .from("reels")
+    .select(
+      "user_id,request_id,instagram_url,instagram_shortcode,source,save_mode",
+    )
+    .eq("id", operation.workerReelId)
+    .eq("extraction_id", operation.extractionId)
+    .eq("processing_token", operation.processingToken)
+    .maybeSingle();
+  if (workerError) return databaseErrorResponse(requestId, workerError);
+  if (!worker?.request_id || worker.save_mode !== requestedSaveMode) {
+    return errorResponse("CONFLICT", requestId, { headers: cors });
+  }
+  const { data, error } = await admin.rpc("begin_reel_request", {
+    p_user_id: worker.user_id,
+    p_client_request_id: worker.request_id,
+    p_instagram_shortcode: worker.instagram_shortcode,
+    p_instagram_url: worker.instagram_url,
+    p_source: worker.source,
+    p_save_mode: worker.save_mode,
+    p_pipeline_version: extraction.pipeline_version,
+    p_stale_before: new Date(Date.now() - STALE_PROCESSING_MS).toISOString(),
+  });
+  const begun = parseBegunReelRequest(data);
+  if (error || !begun) return databaseErrorResponse(requestId, error);
+  if (!begun.shouldProcess) return begunReelResponse(begun, requestedSaveMode);
+  if (!begun.workerReelId) return databaseErrorResponse(requestId);
+  console.info(JSON.stringify({
+    event: "reel_processing_retry_dispatched",
+    extractionId: begun.extractionId,
+    workerReelId: begun.workerReelId,
+  }));
+  return scheduleOrProcess(
+    admin,
+    begun.reelId,
+    begun.workerReelId,
+    begun.extractionId,
+    worker.instagram_url,
+    begun.reused,
+    requestedSaveMode,
+    begun.saveMode,
+    begun.processingToken,
+    functionName,
+  );
+}
+
 async function scheduleOrProcess(
   admin: SupabaseClient,
   reelId: string,
@@ -417,12 +495,6 @@ function begunReelResponse(
 interface MatchedPlace {
   guess: PlaceGuess;
   place: KakaoPlace;
-}
-
-interface InternalPlaceBatchRequest {
-  extractionId: string;
-  workerReelId: string;
-  processingToken: string;
 }
 
 interface ClaimedPlaceJob {
@@ -701,32 +773,6 @@ interface PlaceBatchResult {
   continueInline: boolean;
 }
 
-function parseInternalPlaceBatchRequest(
-  value: unknown,
-): InternalPlaceBatchRequest | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return null;
-  }
-  const payload = value as Record<string, unknown>;
-  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  if (
-    payload.action !== "process_place_batch" ||
-    typeof payload.extractionId !== "string" ||
-    !uuid.test(payload.extractionId) ||
-    typeof payload.workerReelId !== "string" ||
-    !uuid.test(payload.workerReelId) ||
-    typeof payload.processingToken !== "string" ||
-    !uuid.test(payload.processingToken)
-  ) {
-    return null;
-  }
-  return {
-    extractionId: payload.extractionId,
-    workerReelId: payload.workerReelId,
-    processingToken: payload.processingToken,
-  };
-}
-
 function parseClaimedPlaceBatch(value: unknown): ClaimedPlaceBatch | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -791,9 +837,7 @@ async function processPlaceBatchesInline(
 
   return {
     status: result.status,
-    ...(placeIds.length > 0
-      ? { placeId: placeIds[0], placeIds }
-      : {}),
+    ...(placeIds.length > 0 ? { placeId: placeIds[0], placeIds } : {}),
   };
 }
 

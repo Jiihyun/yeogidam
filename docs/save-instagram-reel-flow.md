@@ -34,6 +34,11 @@ service-role JWT를 `Authorization`에 보내는 기존 내부 호출도 허용�
 일반 사용자 요청은 기존처럼 `Authorization`의 사용자 JWT를 `auth.getUser()`로
 검증한다. 두 릴스 함수의 `verify_jwt=true` 설정은 유지한다.
 
+서버 전용 `retry_reel_processing` 요청은 extraction·worker·처리 토큰을
+검증하고 기존 요청의 `begin_reel_request` 재선점 경로를 사용한다. 15분 이상
+진행이 멈춘 요청만 새 처리 토큰으로 재실행하며 요청 히스토리는 추가하지 않는다.
+저장된 배치가 있으면 이어서 처리하고, 없으면 추출부터 다시 진행한다.
+
 ## 2. 전체 순서
 
 ```mermaid
