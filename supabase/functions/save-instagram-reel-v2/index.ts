@@ -3,4 +3,6 @@
 import { createSaveInstagramReelHandler } from "../save-instagram-reel/index.ts";
 import { REVIEW_QUEUE } from "../save-instagram-reel/workflow.ts";
 
-Deno.serve(createSaveInstagramReelHandler(REVIEW_QUEUE));
+Deno.serve(
+  createSaveInstagramReelHandler(REVIEW_QUEUE, "save-instagram-reel-v2"),
+);

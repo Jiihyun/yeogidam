@@ -24,6 +24,7 @@ import {
 } from "./kakao.ts";
 import {
   type PlaceMatchFailure,
+  type PlaceMatchFailureRow,
   placeMatchFailureRow,
 } from "./match_failure.ts";
 import { resolvePlacesFromKakao } from "./place_resolution.ts";
@@ -172,13 +173,16 @@ const STUB_THUMBNAIL = {
 
 export function createSaveInstagramReelHandler(
   requestedSaveMode: ReelSaveMode,
+  functionName = "save-instagram-reel",
 ): (req: Request) => Promise<Response> {
-  return (req) => handleSaveInstagramReel(req, requestedSaveMode);
+  return (req) =>
+    handleSaveInstagramReel(req, requestedSaveMode, functionName);
 }
 
 async function handleSaveInstagramReel(
   req: Request,
   requestedSaveMode: ReelSaveMode,
+  functionName: string,
 ): Promise<Response> {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   const requestId = createRequestId();
@@ -196,6 +200,37 @@ async function handleSaveInstagramReel(
       /^Bearer\s+/i,
       "",
     );
+    if (token && token === SERVICE) {
+      let internalPayload: unknown;
+      try {
+        internalPayload = await req.json();
+      } catch {
+        return errorResponse("INVALID_REQUEST_BODY", requestId, {
+          headers: cors,
+          details: { field: "body" },
+        });
+      }
+      const batch = parseInternalPlaceBatchRequest(internalPayload);
+      if (!batch) {
+        return errorResponse("INVALID_REQUEST_BODY", requestId, {
+          headers: cors,
+          details: { field: "body" },
+        });
+      }
+
+      const admin = createClient(SUPABASE_URL, SERVICE);
+      EdgeRuntime.waitUntil(
+        processPlaceBatch(
+          admin,
+          batch.workerReelId,
+          batch.extractionId,
+          batch.processingToken,
+          functionName,
+          true,
+        ),
+      );
+      return json({ status: "PROCESSING" }, 202);
+    }
     if (!token) {
       return errorResponse("AUTH_REQUIRED", requestId, { headers: cors });
     }
@@ -304,6 +339,7 @@ async function handleSaveInstagramReel(
       requestedSaveMode,
       begun.saveMode,
       begun.processingToken,
+      functionName,
     );
   } catch (error) {
     console.error(JSON.stringify({
@@ -317,7 +353,7 @@ async function handleSaveInstagramReel(
 }
 
 if (import.meta.main) {
-  Deno.serve(createSaveInstagramReelHandler(AUTO_SAVE));
+  Deno.serve(createSaveInstagramReelHandler(AUTO_SAVE, "save-instagram-reel"));
 }
 
 async function scheduleOrProcess(
@@ -330,6 +366,7 @@ async function scheduleOrProcess(
   requestedSaveMode: ReelSaveMode,
   initialSaveMode: ReelSaveMode,
   processingToken: string,
+  functionName: string,
 ): Promise<Response> {
   const work = processReel(
     admin,
@@ -337,6 +374,7 @@ async function scheduleOrProcess(
     extractionId,
     processingToken,
     instagramUrl,
+    functionName,
   );
   if (Deno.env.get("PIPELINE_SYNC") === "1") {
     const result = await work;
@@ -361,7 +399,7 @@ async function scheduleOrProcess(
 }
 
 interface ProcessResult {
-  status: "COMPLETED" | "FAILED";
+  status: "COMPLETED" | "FAILED" | "PROCESSING";
   failureReason?: FailureReason;
   placeId?: string;
   placeIds?: string[];
@@ -380,18 +418,66 @@ interface MatchedPlace {
   place: KakaoPlace;
 }
 
+interface InternalPlaceBatchRequest {
+  extractionId: string;
+  workerReelId: string;
+  processingToken: string;
+}
+
+interface ClaimedPlaceJob {
+  position: number;
+  matched_place: MatchedPlace;
+  thumbnail_source_url: string | null;
+  instagram_description: string;
+  instagram_author_username: string | null;
+  instagram_thumbnail_url: string | null;
+  has_match_failures: boolean;
+  match_failures: PlaceMatchFailureRow[];
+}
+
+interface ClaimedPlaceBatch {
+  jobs: ClaimedPlaceJob[];
+  has_unfinished: boolean;
+}
+
 async function processReel(
   admin: SupabaseClient,
   workerReelId: string,
   extractionId: string,
   processingToken: string,
   instagramUrl: string,
+  functionName: string,
 ): Promise<ProcessResult> {
   const stub = Deno.env.get("STUB_PROVIDERS") === "1";
   const reelId = workerReelId;
   const failWorker = (reason: FailureReason) =>
     fail(admin, extractionId, workerReelId, processingToken, reason);
   try {
+    const { count: existingJobCount, error: existingJobsError } = await admin
+      .from("reel_extraction_place_jobs")
+      .select("position", { count: "exact", head: true })
+      .eq("extraction_id", extractionId);
+    if (existingJobsError) throw existingJobsError;
+    if ((existingJobCount ?? 0) > 0) {
+      if (Deno.env.get("PIPELINE_SYNC") === "1") {
+        return await processPlaceBatchesInline(
+          admin,
+          workerReelId,
+          extractionId,
+          processingToken,
+          functionName,
+        );
+      }
+      await dispatchPlaceBatch(
+        admin,
+        extractionId,
+        workerReelId,
+        processingToken,
+        functionName,
+      );
+      return { status: "PROCESSING" };
+    }
+
     // 1. Instagram HTML → og:*
     let meta;
     try {
@@ -540,42 +626,49 @@ async function processReel(
       return await failWorker("KAKAO_PLACE_NOT_FOUND");
     }
 
-    // 4. 선택된 모든 장소를 places/saved_places/reel_places에 순서대로 저장한다.
-    const placeIds: string[] = [];
-    for (const [position, match] of matchedPlaces.entries()) {
-      const placeId = await persistMatchedPlace(
-        admin,
-        reelId,
-        processingToken,
-        position,
-        match,
-        // 장소 썸네일의 인스타 폴백에도 정사각(og:image) 대신 원본 비율 주소를 쓴다.
-        thumbnailSource,
-        stub,
-      );
-      placeIds.push(placeId);
-    }
-
-    // 5. worker 결과를 immutable 공용 cache로 확정하고, 이 추출을 기다리는
-    // 모든 요청 히스토리와 사용자별 대기함/자동 저장을 한 transaction에서 맞춘다.
-    const { error: finalizeError } = await admin.rpc(
-      "finalize_reel_extraction",
+    // 후보와 원본 URL을 먼저 DB에 체크포인트로 저장한다. 썸네일 처리는
+    // 별도 Edge Function 실행에서 최대 5개씩 순차 진행하고, 각 결과를 즉시 저장한다.
+    const { error: enqueueError } = await admin.rpc(
+      "enqueue_reel_extraction_place_jobs",
       {
         p_extraction_id: extractionId,
         p_worker_reel_id: workerReelId,
         p_processing_token: processingToken,
-        // 일부 장소의 매칭이 실패한 성공 결과는 당시 히스토리에는 남기되,
-        // 다음 명시 요청이 새 extraction을 만들어 누락 장소를 다시 시도한다.
-        p_cacheable: matchFailures.length === 0,
+        p_instagram_description: meta.description,
+        p_instagram_author_username: meta.authorUsername,
+        p_instagram_thumbnail_url: reelThumbnailUrl,
+        p_has_match_failures: matchFailures.length > 0,
+        p_match_failures: matchFailures.map((failure) => ({
+          ...placeMatchFailureRow(reelId, failure),
+          processing_token: processingToken,
+        })),
+        p_jobs: matchedPlaces.map((matchedPlace, position) => ({
+          position,
+          matched_place: matchedPlace,
+          // 장소 썸네일의 인스타 폴백에도 정사각(og:image) 대신 원본 비율 주소를 쓴다.
+          thumbnail_source_url: thumbnailSource,
+        })),
       },
     );
-    if (finalizeError) throw finalizeError;
+    if (enqueueError) throw enqueueError;
 
-    return {
-      status: "COMPLETED",
-      placeId: placeIds[0],
-      placeIds,
-    };
+    if (Deno.env.get("PIPELINE_SYNC") === "1") {
+      return await processPlaceBatchesInline(
+        admin,
+        workerReelId,
+        extractionId,
+        processingToken,
+        functionName,
+      );
+    }
+    await dispatchPlaceBatch(
+      admin,
+      extractionId,
+      workerReelId,
+      processingToken,
+      functionName,
+    );
+    return { status: "PROCESSING" };
   } catch (error) {
     if (error instanceof AiProvidersExhaustedError) {
       console.error(JSON.stringify({
@@ -597,6 +690,284 @@ async function processReel(
       message: error instanceof Error ? error.message : String(error),
     }));
     return await failWorker("UNKNOWN");
+  }
+}
+
+interface PlaceBatchResult {
+  status: "COMPLETED" | "PROCESSING";
+  placeIds: string[];
+  processedCount: number;
+  continueInline: boolean;
+}
+
+function parseInternalPlaceBatchRequest(
+  value: unknown,
+): InternalPlaceBatchRequest | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const payload = value as Record<string, unknown>;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (
+    payload.action !== "process_place_batch" ||
+    typeof payload.extractionId !== "string" ||
+    !uuid.test(payload.extractionId) ||
+    typeof payload.workerReelId !== "string" ||
+    !uuid.test(payload.workerReelId) ||
+    typeof payload.processingToken !== "string" ||
+    !uuid.test(payload.processingToken)
+  ) {
+    return null;
+  }
+  return {
+    extractionId: payload.extractionId,
+    workerReelId: payload.workerReelId,
+    processingToken: payload.processingToken,
+  };
+}
+
+function parseClaimedPlaceBatch(value: unknown): ClaimedPlaceBatch | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const batch = value as Record<string, unknown>;
+  if (!Array.isArray(batch.jobs) || typeof batch.has_unfinished !== "boolean") {
+    return null;
+  }
+  return {
+    jobs: batch.jobs as ClaimedPlaceJob[],
+    has_unfinished: batch.has_unfinished,
+  };
+}
+
+async function dispatchPlaceBatch(
+  admin: SupabaseClient,
+  extractionId: string,
+  workerReelId: string,
+  processingToken: string,
+  functionName: string,
+): Promise<void> {
+  try {
+    const { error } = await admin.functions.invoke(functionName, {
+      body: {
+        action: "process_place_batch",
+        extractionId,
+        workerReelId,
+        processingToken,
+      },
+    });
+    if (error) throw error;
+  } catch (error) {
+    console.error(JSON.stringify({
+      event: "reel_place_batch_dispatch_failed",
+      extractionId,
+      workerReelId,
+      message: error instanceof Error ? error.message : String(error),
+    }));
+  }
+}
+
+async function processPlaceBatchesInline(
+  admin: SupabaseClient,
+  workerReelId: string,
+  extractionId: string,
+  processingToken: string,
+  functionName: string,
+): Promise<ProcessResult> {
+  const placeIds: string[] = [];
+  let result: PlaceBatchResult;
+  do {
+    result = await processPlaceBatch(
+      admin,
+      workerReelId,
+      extractionId,
+      processingToken,
+      functionName,
+      false,
+    );
+    placeIds.push(...result.placeIds);
+  } while (result.continueInline);
+
+  return {
+    status: result.status,
+    ...(placeIds.length > 0
+      ? { placeId: placeIds[0], placeIds }
+      : {}),
+  };
+}
+
+async function processPlaceBatch(
+  admin: SupabaseClient,
+  workerReelId: string,
+  extractionId: string,
+  processingToken: string,
+  functionName: string,
+  dispatchNextBatch: boolean,
+): Promise<PlaceBatchResult> {
+  try {
+    const { error: hydrationError } = await admin.rpc(
+      "hydrate_reel_extraction_place_results",
+      {
+        p_extraction_id: extractionId,
+        p_worker_reel_id: workerReelId,
+        p_processing_token: processingToken,
+      },
+    );
+    if (hydrationError) throw hydrationError;
+
+    const { data, error } = await admin.rpc(
+      "claim_reel_extraction_place_batch",
+      {
+        p_extraction_id: extractionId,
+        p_worker_reel_id: workerReelId,
+        p_processing_token: processingToken,
+        p_limit: 5,
+        p_lease_seconds: 300,
+      },
+    );
+    if (error) throw error;
+    const batch = parseClaimedPlaceBatch(data);
+    if (!batch) throw new Error("invalid_reel_place_batch_response");
+    console.info(JSON.stringify({
+      event: "reel_place_batch_claimed",
+      extractionId,
+      workerReelId,
+      count: batch.jobs.length,
+      positions: batch.jobs.map((job) => job.position),
+    }));
+    if (batch.jobs.length === 0) {
+      return {
+        status: batch.has_unfinished ? "PROCESSING" : "COMPLETED",
+        placeIds: [],
+        processedCount: 0,
+        continueInline: false,
+      };
+    }
+
+    const firstJob = batch.jobs[0];
+    const { data: worker, error: metadataError } = await admin
+      .from("reels")
+      .update({
+        instagram_description: firstJob.instagram_description,
+        instagram_author_username: firstJob.instagram_author_username,
+        instagram_thumbnail_url: firstJob.instagram_thumbnail_url,
+      })
+      .eq("id", workerReelId)
+      .eq("processing_token", processingToken)
+      .select("id")
+      .maybeSingle();
+    if (metadataError) throw metadataError;
+    if (!worker) throw new Error("stale_reel_processing_attempt");
+
+    if (firstJob.match_failures.length > 0) {
+      const { error: failuresError } = await admin
+        .from("reel_place_match_failures")
+        .upsert(
+          firstJob.match_failures.map((failure) => ({
+            ...failure,
+            reel_id: workerReelId,
+            processing_token: processingToken,
+          })),
+          { onConflict: "reel_id,guess_index" },
+        );
+      if (failuresError) throw failuresError;
+    }
+
+    const placeIds: string[] = [];
+    let processedCount = 0;
+    let hasUnfinished = batch.has_unfinished;
+    for (const job of batch.jobs) {
+      try {
+        const placeId = await persistMatchedPlace(
+          admin,
+          workerReelId,
+          processingToken,
+          job.position,
+          job.matched_place,
+          job.thumbnail_source_url,
+          Deno.env.get("STUB_PROVIDERS") === "1",
+        );
+        placeIds.push(placeId);
+        const { data: remaining, error: completionError } = await admin.rpc(
+          "complete_reel_extraction_place_job",
+          {
+            p_extraction_id: extractionId,
+            p_worker_reel_id: workerReelId,
+            p_processing_token: processingToken,
+            p_position: job.position,
+            p_place_id: placeId,
+          },
+        );
+        if (completionError) throw completionError;
+        if (typeof remaining !== "boolean") {
+          throw new Error("invalid_reel_place_job_completion_response");
+        }
+        hasUnfinished = remaining;
+        processedCount += 1;
+        console.info(JSON.stringify({
+          event: "reel_place_thumbnail_job_completed",
+          extractionId,
+          workerReelId,
+          position: job.position,
+          placeId,
+        }));
+      } catch (error) {
+        const { error: releaseError } = await admin.rpc(
+          "release_reel_extraction_place_job",
+          {
+            p_extraction_id: extractionId,
+            p_worker_reel_id: workerReelId,
+            p_processing_token: processingToken,
+            p_position: job.position,
+            p_error: error instanceof Error ? error.message : String(error),
+          },
+        );
+        console.error(JSON.stringify({
+          event: "reel_place_thumbnail_job_failed",
+          extractionId,
+          workerReelId,
+          position: job.position,
+          message: error instanceof Error ? error.message : String(error),
+          releaseError: releaseError?.message,
+        }));
+        return {
+          status: "PROCESSING",
+          placeIds,
+          processedCount,
+          continueInline: false,
+        };
+      }
+    }
+
+    const result: PlaceBatchResult = {
+      status: hasUnfinished ? "PROCESSING" : "COMPLETED",
+      placeIds,
+      processedCount,
+      continueInline: hasUnfinished && processedCount === batch.jobs.length,
+    };
+    if (dispatchNextBatch && result.continueInline) {
+      await dispatchPlaceBatch(
+        admin,
+        extractionId,
+        workerReelId,
+        processingToken,
+        functionName,
+      );
+    }
+    return result;
+  } catch (error) {
+    console.error(JSON.stringify({
+      event: "reel_place_batch_failed",
+      extractionId,
+      workerReelId,
+      message: error instanceof Error ? error.message : String(error),
+    }));
+    return {
+      status: "PROCESSING",
+      placeIds: [],
+      processedCount: 0,
+      continueInline: false,
+    };
   }
 }
 
