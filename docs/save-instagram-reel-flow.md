@@ -28,6 +28,12 @@ Content-Type: application/json
 
 새 추출을 시작하거나 진행 중인 공용 추출에 합류하면 `202`와 `reelId`를 반환한다. 현재 파이프라인 버전의 완료 캐시를 즉시 재사용하면 `200`, `status: COMPLETED`, `placeIds`를 반환한다. 화면은 신규 추출과 캐시 재사용을 구분해 표시하지 않는다.
 
+내부 장소 배치 호출은 `apikey` 헤더의 값이 서버의
+`SUPABASE_SERVICE_ROLE_KEY`와 정확히 일치할 때만 허용한다. 레거시
+service-role JWT를 `Authorization`에 보내는 기존 내부 호출도 허용한다.
+일반 사용자 요청은 기존처럼 `Authorization`의 사용자 JWT를 `auth.getUser()`로
+검증한다. 두 릴스 함수의 `verify_jwt=true` 설정은 유지한다.
+
 ## 2. 전체 순서
 
 ```mermaid

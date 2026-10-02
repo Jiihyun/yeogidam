@@ -16,6 +16,7 @@ import { sendGeminiRuntimeDiscordAlert } from "./ai/runtime_alerts.ts";
 import type { PlaceGuess } from "./ai/types.ts";
 import { fetchInstagramMeta } from "./instagram.ts";
 import { extractKoreanAddresses } from "./address.ts";
+import { hasServiceRoleCredential } from "./auth.ts";
 import {
   buildKakaoMapURL,
   type KakaoPlace,
@@ -200,7 +201,7 @@ async function handleSaveInstagramReel(
       /^Bearer\s+/i,
       "",
     );
-    if (token && token === SERVICE) {
+    if (hasServiceRoleCredential(req.headers, SERVICE)) {
       let internalPayload: unknown;
       try {
         internalPayload = await req.json();
