@@ -202,3 +202,24 @@ Deno.test("fails when Instagram returns a non-success response", async () => {
 
   assertEquals(message, "instagram fetch failed: 403");
 });
+
+Deno.test("원본의 하이픈 날짜 작성자 형식을 인식해 지정 작성자의 미디어 분기에 연결한다", () => {
+  assertEquals(
+    parseInstagramAuthorUsername(
+      "100 likes, 2 comments - with_sol_mate - October 10, 2026: 장소 추천",
+    ),
+    "with_sol_mate",
+  );
+  assertEquals(
+    parseInstagramAuthorUsername("with_sol_mate — October 10, 2026: 장소 추천"),
+    "with_sol_mate",
+  );
+});
+
+Deno.test("원본처럼 따옴표 없는 메타 속성을 읽고 twitter 이미지를 우선한다", () => {
+  const meta = parseInstagramMeta(
+    '<meta name=description content="카페"><meta property="og:image" content="https://cdn/og.jpg"><meta name="twitter:image" content="https://cdn/twitter.jpg">',
+  );
+  assertEquals(meta.description, "카페");
+  assertEquals(meta.thumbnailUrl, "https://cdn/twitter.jpg");
+});

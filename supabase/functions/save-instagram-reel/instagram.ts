@@ -1,4 +1,5 @@
 // Instagram 공개 페이지 HTML head에서 링크 미리보기 메타데이터를 추출한다.
+import { mediaHttp } from "./media_http.ts";
 
 export interface InstagramMeta {
   description: string | null;
@@ -8,10 +9,10 @@ export interface InstagramMeta {
 }
 
 const INSTAGRAM_USERNAME = "[A-Za-z0-9._]{1,30}";
-// Supabase Edge Runtime 1.76.0은 지정한 UA에도 프로젝트 식별값을 덧붙인다.
-// 접미사가 붙은 Twitterbot UA는 축약 캡션을 받으므로 모바일 페이지를 요청한다.
-const INSTAGRAM_USER_AGENT =
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+// Edge Runtime이 UA에 접미사를 추가해도 전체 캡션을 받도록 모바일 페이지를 요청한다.
+export const INSTAGRAM_USER_AGENT =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) " +
+  "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const INSTAGRAM_ENGLISH_DATE =
   "(?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{1,2},\\s+\\d{4}";
 const INSTAGRAM_ENGAGEMENT_COUNT = "\\d[\\d.,]*[KMB]?";
@@ -21,11 +22,15 @@ const AUTHOR_PREFIX_PATTERNS = [
     "i",
   ),
   new RegExp(
-    `^\\s*@?(${INSTAGRAM_USERNAME})\\s*-\\s*${INSTAGRAM_ENGLISH_DATE}\\s*:`,
+    `^\\s*@?(${INSTAGRAM_USERNAME})\\s*[-–—]\\s*${INSTAGRAM_ENGLISH_DATE}\\s*:`,
     "i",
   ),
   new RegExp(
-    `^\\s*${INSTAGRAM_ENGAGEMENT_COUNT}\\s+likes?,\\s*${INSTAGRAM_ENGAGEMENT_COUNT}\\s+comments?\\s*-\\s*@?(${INSTAGRAM_USERNAME})\\s+on\\s+${INSTAGRAM_ENGLISH_DATE}\\s*:`,
+    `^\\s*${INSTAGRAM_ENGAGEMENT_COUNT}\\s+likes?,\\s*${INSTAGRAM_ENGAGEMENT_COUNT}\\s+comments?\\s*[-–—]\\s*@?(${INSTAGRAM_USERNAME})\\s+on\\s+${INSTAGRAM_ENGLISH_DATE}\\s*:`,
+    "i",
+  ),
+  new RegExp(
+    `^\\s*${INSTAGRAM_ENGAGEMENT_COUNT}\\s+likes?,\\s*${INSTAGRAM_ENGAGEMENT_COUNT}\\s+comments?\\s*[-–—]\\s*@?(${INSTAGRAM_USERNAME})\\s*[-–—]\\s*${INSTAGRAM_ENGLISH_DATE}\\s*:`,
     "i",
   ),
 ];
@@ -61,9 +66,9 @@ function decodeHtml(s: string): string {
 
 function attribute(tag: string, name: string): string | null {
   const match = tag.match(
-    new RegExp(`\\b${name}\\s*=\\s*(["'])(.*?)\\1`, "is"),
+    new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "is"),
   );
-  return match?.[2] ?? null;
+  return match?.[1] ?? match?.[2] ?? match?.[3] ?? null;
 }
 
 function metaContent(
@@ -110,7 +115,6 @@ export function parseInstagramMeta(html: string): InstagramMeta {
       parseInstagramAuthorUsername(openGraphDescription) ??
       parseInstagramAuthorUsername(genericDescription) ??
       parseInstagramAuthorUsername(twitterDescription),
-    // 같은 응답의 og:image가 가로로 잘려도 twitter:image는 원본 비율을 유지한다.
     thumbnailUrl: metaContent(html, [
       { attribute: "name", value: "twitter:image" },
       { attribute: "property", value: "og:image" },
@@ -130,13 +134,21 @@ export async function fetchInstagramMeta(
     "Accept-Language": "ko,en;q=0.9",
   };
 
-  const res = await request(url, {
-    headers: {
-      ...headers,
+  return await mediaHttp(
+    request,
+    url,
+    {
+      headers: {
+        ...headers,
+      },
+      redirect: "follow",
     },
-    redirect: "follow",
-  });
-  if (!res.ok) throw new Error(`instagram fetch failed: ${res.status}`);
-  const html = await res.text();
-  return parseInstagramMeta(html);
+    30_000,
+    async (res) => {
+      if (!res.ok) throw new Error(`instagram fetch failed: ${res.status}`);
+      const html = await res.text();
+      if (!html.trim()) throw new Error("instagram page empty");
+      return parseInstagramMeta(html);
+    },
+  );
 }

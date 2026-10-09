@@ -8,31 +8,23 @@
 
 import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 import { createRequestId, errorResponse } from "../_shared/error_code.ts";
-import { AiConfigError, AiProvidersExhaustedError } from "./ai/errors.ts";
-import { createPlaceAiClient } from "./ai/factory.ts";
-import { sanitizeAiRuntimeLogDetails } from "./ai/log_sanitizer.ts";
-import type { AiLog, PlaceAiClient } from "./ai/provider.ts";
-import { sendGeminiRuntimeDiscordAlert } from "./ai/runtime_alerts.ts";
+import { AiConfigError } from "./ai/errors.ts";
 import type { PlaceGuess } from "./ai/types.ts";
 import { fetchInstagramMeta } from "./instagram.ts";
-import { extractKoreanAddresses } from "./address.ts";
 import { hasServiceRoleCredential } from "./auth.ts";
 import {
   type InternalReelRequest,
   parseInternalReelRequest,
 } from "./internal_request.ts";
-import {
-  buildKakaoMapURL,
-  type KakaoPlace,
-  searchKakaoAddressCoordinates,
-  searchKakaoPlacePage,
-} from "./kakao.ts";
+import { buildKakaoMapURL, type KakaoPlace } from "./kakao.ts";
 import {
   type PlaceMatchFailure,
   type PlaceMatchFailureRow,
   placeMatchFailureRow,
 } from "./match_failure.ts";
-import { resolvePlacesFromKakao } from "./place_resolution.ts";
+import { analyzeInstagramPlaces } from "./source_analysis.ts";
+import { createSourceGeminiClient } from "./source_gemini.ts";
+import { searchSourceKakaoPlaces } from "./source_kakao.ts";
 import { findGooglePlacePhoto } from "./google.ts";
 import {
   fetchEmbedDisplayUrl,
@@ -94,60 +86,8 @@ type FailureReason =
   | "PLACE_NOT_FOUND"
   | "UNKNOWN";
 
-function aiFailureReason(error: AiProvidersExhaustedError): FailureReason {
-  const finalAttempt = error.attempts.at(-1);
-  if (
-    finalAttempt?.kind === "AUTH" || finalAttempt?.kind === "BAD_REQUEST"
-  ) return "PROVIDER_CONFIG_MISSING";
-  if (
-    finalAttempt?.kind === "CONTENT_BLOCKED" ||
-    finalAttempt?.kind === "CANCELLED"
-  ) {
-    // 기존 DB/iOS 계약의 비재시도 장소 분석 실패 코드를 호환용으로 쓴다.
-    return "GEMINI_PLACE_NOT_FOUND";
-  }
-  return "UNKNOWN";
-}
-
 const STALE_PROCESSING_MS = 15 * 60 * 1000;
-const PIPELINE_VERSION = 10;
-
-function createAiRuntimeLog(reelId: string): AiLog {
-  return (event, details) => {
-    console.info(JSON.stringify({
-      event,
-      reelId,
-      ...sanitizeAiRuntimeLogDetails(details),
-    }));
-    const delivery = sendGeminiRuntimeDiscordAlert(event, details, {
-      webhookUrl: Deno.env.get("DISCORD_GEMINI_ALERT_WEBHOOK_URL"),
-      log: (alertEvent, alertDetails) => {
-        console.info(JSON.stringify({
-          event: alertEvent,
-          reelId,
-          ...alertDetails,
-        }));
-      },
-    }).catch((error) => {
-      console.error(JSON.stringify({
-        event: "ai_runtime_discord_alert_unexpected_failure",
-        reelId,
-        sourceEvent: event,
-        errorName: error instanceof Error ? error.name : "unknown",
-      }));
-    });
-    try {
-      EdgeRuntime.waitUntil(delivery);
-    } catch (error) {
-      console.error(JSON.stringify({
-        event: "ai_runtime_discord_alert_scheduling_failed",
-        reelId,
-        sourceEvent: event,
-        errorName: error instanceof Error ? error.name : "unknown",
-      }));
-    }
-  };
-}
+const PIPELINE_VERSION = 11;
 
 // 로컬 검증 전용 스텁 (STUB_PROVIDERS=1 일 때만 사용). AI/Kakao 키 없이
 // 파이프라인 전체(추출→매칭→저장→썸네일)를 결정적으로 검증하기 위한 것.
@@ -597,7 +537,7 @@ async function processReel(
     if (!metadataReel) throw new Error("stale_reel_processing_attempt");
 
     const caption = meta.description;
-    if (!caption) {
+    if (!caption?.trim()) {
       console.error(JSON.stringify({
         event: "instagram_caption_not_found",
         reelId,
@@ -607,87 +547,42 @@ async function processReel(
       return await failWorker("IG_CAPTION_NOT_FOUND");
     }
 
-    // 2. 정규식 주소는 관측용으로만 남기고 AI의 장소·주소 연결을 변경하지 않는다.
-    const regexAddresses = extractKoreanAddresses(caption);
-    console.info(JSON.stringify({
-      event: "regex_addresses_shadow",
-      reelId,
-      addresses: regexAddresses,
-    }));
-
-    // 3. AI가 전체 캡션에서 장소와 검색용 보정 표기를 구조화한다.
-    const kakaoKey = Deno.env.get("KAKAO_REST_API_KEY");
-    if (!stub && !kakaoKey) {
-      return await failWorker("PROVIDER_CONFIG_MISSING");
-    }
+    // 2. 2026-Yeogidam의 캡션/원본 미디어 분석과 첫 유효 Kakao 결과 선택.
+    const kakaoKey = Deno.env.get("KAKAO_REST_API_KEY")?.trim();
+    if (!stub && !kakaoKey) return await failWorker("PROVIDER_CONFIG_MISSING");
 
     let matchedPlaces: MatchedPlace[] = [];
     const matchFailures: PlaceMatchFailure[] = [];
+    let analysisFailure: FailureReason | null = null;
     if (stub) {
       matchedPlaces = [{
         guess: {
           placeName: STUB_PLACE.name,
-          address: regexAddresses[0] ?? null,
-          addressType: regexAddresses.length > 0 ? "ROAD" : "NONE",
+          address: STUB_PLACE.roadAddress,
+          addressType: "ROAD",
           region: "성동구",
         },
         place: STUB_PLACE,
       }];
     } else {
-      let ai: PlaceAiClient;
-      try {
-        ai = createPlaceAiClient(Deno.env, {
-          log: createAiRuntimeLog(reelId),
-        });
-      } catch (error) {
-        if (error instanceof AiConfigError) {
-          console.error(JSON.stringify({
-            event: "ai_provider_config_invalid",
-            reelId,
-            message: error.message,
-          }));
-          return await failWorker("PROVIDER_CONFIG_MISSING");
-        }
-        throw error;
-      }
-
-      const extraction = await ai.extractPlaces(caption);
-      const guesses = extraction.data;
-      console.info(JSON.stringify({
-        event: "ai_place_guesses_extracted",
-        reelId,
-        provider: extraction.provider,
-        model: extraction.model,
-        fallbackUsed: extraction.fallbackUsed,
-        extractedCount: guesses.length,
-        correctedSearchNameCount: guesses.reduce(
-          (count, guess) => count + (guess.searchNames?.length ?? 0),
-          0,
-        ),
-      }));
-      if (guesses.length === 0) {
-        return await failWorker("GEMINI_PLACE_NOT_FOUND");
-      }
-
-      const resolution = await resolvePlacesFromKakao(caption, guesses, {
-        search: (query, page) =>
-          searchKakaoPlacePage(query, kakaoKey!, { page }),
-        geocodeAddress: (address) =>
-          searchKakaoAddressCoordinates(address, kakaoKey!),
-        searchNearby: (query, center, radiusMeters, page) =>
-          searchKakaoPlacePage(query, kakaoKey!, {
-            center,
-            radiusMeters,
-            page,
-          }),
-        judge: async (reviewCaption, items) =>
-          (await ai.judgeKakaoCandidates(reviewCaption, items)).data,
-        log: (event, details) => {
-          console.info(JSON.stringify({ event, reelId, ...details }));
-        },
+      const ai = createSourceGeminiClient({
+        apiKey: Deno.env.get("GEMINI_API_KEY")?.trim() ?? "",
+        model: Deno.env.get("GEMINI_MODEL")?.trim() ?? "",
+      });
+      const resolution = await analyzeInstagramPlaces({
+        instagramUrl,
+        caption,
+        authorUsername: meta.authorUsername,
+      }, {
+        extractCaption: (value) => ai.extractCaption(value),
+        extractMedia: (value, url) => ai.extractMedia(value, url),
+        search: (query) => searchSourceKakaoPlaces(query, kakaoKey!),
+        log: (event, details) =>
+          console.info(JSON.stringify({ event, reelId, ...details })),
       });
       matchedPlaces = resolution.matches;
       matchFailures.push(...resolution.failures);
+      analysisFailure = resolution.failureReason;
     }
     await persistPlaceMatchFailures(
       admin,
@@ -695,6 +590,7 @@ async function processReel(
       processingToken,
       matchFailures,
     );
+    if (analysisFailure) return await failWorker(analysisFailure);
     if (matchedPlaces.length === 0) {
       return await failWorker("KAKAO_PLACE_NOT_FOUND");
     }
@@ -743,19 +639,8 @@ async function processReel(
     );
     return { status: "PROCESSING" };
   } catch (error) {
-    if (error instanceof AiProvidersExhaustedError) {
-      console.error(JSON.stringify({
-        event: "ai_pipeline_failed",
-        reelId,
-        attempts: error.attempts.map((attempt) => ({
-          provider: attempt.provider,
-          operation: attempt.operation,
-          kind: attempt.kind,
-          status: attempt.status,
-          model: attempt.model,
-        })),
-      }));
-      return await failWorker(aiFailureReason(error));
+    if (error instanceof AiConfigError) {
+      return await failWorker("PROVIDER_CONFIG_MISSING");
     }
     console.error(JSON.stringify({
       event: "reel_processing_failed",

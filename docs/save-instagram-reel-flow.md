@@ -4,10 +4,11 @@
 - 구현: `supabase/functions/save-instagram-reel`
 - 처리: 접수는 동기, 장소 추출·저장은 비동기
 - 장소 자연키: Kakao Local API `id`
+- 파이프라인 버전: `11` - 2026-Yeogidam의 장소 분석 이식
 
 ## 1. 요청 계약
 
-앱↔서버의 기존 v1/v2 엔드포인트, 요청 필드, 응답 필드·타입, HTTP 상태 코드와 오류 형식은 유지한다. `searchNames`, `searchAddress` 등 검색 보조 필드는 서버 내부 AI 호출에서만 사용하며 앱 요청·응답에 추가하지 않는다. `PIPELINE_VERSION`은 서버 내부 추출 캐시 구분값이다.
+앱↔서버의 기존 v1/v2 엔드포인트, 요청 필드, 응답 필드·타입, HTTP 상태 코드와 오류 형식은 유지한다. 장소명 보정과 위치 출처 단서는 서버 내부 분석에서만 사용하며 앱 요청·응답에 추가하지 않는다. `PIPELINE_VERSION`은 서버 내부 추출 캐시 구분값이다.
 
 ```http
 POST /functions/v1/save-instagram-reel
@@ -68,103 +69,133 @@ sequenceDiagram
         F-->>U: 202 + reelId
         F->>I: 릴스 HTML head meta
         I-->>F: caption + thumbnail
-        F->>AI: 전체 caption, places[] schema
-        AI-->>F: 0..N 장소명·주소·지역
-        loop Gemini가 추출한 각 장소
-            opt 주소 있음
-                F->>K: 검색용 주소 → 좌표, 주변에서 원문·보정 상호 검색
+        alt 작성자가 with_sol_mate
+            F->>I: 이미지·영상 원본 목록 조회 및 다운로드
+            F->>AI: 파일 업로드 + 전체 caption 통합 분석
+        else 일반 작성자
+            F->>AI: caption + 공개 프로필 URL, URL Context
+            opt 추출 장소가 0개
+                F->>I: 이미지·영상 원본 목록 조회 및 다운로드
+                F->>AI: 파일 업로드 + caption 통합 분석
             end
-            F->>K: 원문·보정 상호 및 지역 조합 검색
-            K-->>F: 후보 + Kakao place id + 페이지 정보
-            F->>F: Kakao place id 중복만 제거
         end
-        F->>AI: 전체 caption + 장소별 전체 Kakao 후보
-        AI-->>F: SELECT / RETRY / NONE
-        loop RETRY 항목만 최대 두 차례
-            F->>K: 보정 검색어 + 반경·페이지 확장
-            K-->>F: 추가 후보
-            F->>AI: 이전 후보와 추가 후보를 합쳐 다시 선택
-            AI-->>F: SELECT / RETRY / NONE
+        AI-->>F: 장소별 원문명·보정명·계정·위치 출처·업종
+        F->>F: Gemini 파일과 로컬 원본 정리
+        loop 추출된 각 장소
+            F->>K: 보정명 또는 원문명 + 우선 지역, 첫 페이지 15개
+            K-->>F: 유효 장소 목록
+            opt 유효 장소 목록이 비어 있음
+                F->>K: 이름만으로 재검색
+                K-->>F: 유효 장소 목록
+            end
+            F->>F: 첫 유효 장소 선택 + Kakao ID 중복 제거
         end
-        loop 선택된 각 후보
-            F->>F: 해당 장소에 전달한 candidateId인지 확인
+        F->>D: 확정 장소와 썸네일 원본 URL 체크포인트 저장
+        loop 최대 5개씩 저장 작업 처리
             F->>D: places upsert on kakao_place_id
             F->>G: 대표 사진 조회
             F->>S: 선택된 이미지 업로드
             F->>D: worker reel_places 저장
         end
-        F->>D: extraction 확정 + 연결된 모든 요청 구체화
+        F->>D: 마지막 저장 작업 완료 시 extraction 확정 + 요청 구체화
     end
 ```
 
 ## 3. Instagram 추출
 
-1. 모바일 Safari User-Agent로 공개 HTML을 요청한다.
-2. 캡션: HTML `og:description` → `name="description"` → `twitter:description`
-3. 썸네일: `twitter:image` → `og:image`. 두 태그가 모두 있으면 원본 비율을 유지하는 `twitter:image`를 우선한다.
-4. 보조 추출: `og:url`, title/description의 작성자 계정.
+캡션은 공개 HTML의 `og:description`, `description`, `twitter:description` 순서로
+읽는다. 원본과 같은 iPhone Safari User-Agent를 사용한다. 작성자는
+`twitter:title`, `og:title`, 각 description의 작성자 표기를 차례로 확인하며,
+본문의 첫 @멘션을 작성자로 추측하지 않는다. title은 작성자 파싱에만 사용하고
+DB에는 저장하지 않는다. 메타데이터 미리보기는 `twitter:image`, `og:image`
+순서이며 `/p/` 원본 비율 썸네일 보강과 Storage 저장은 기존 흐름을 유지한다.
 
-Supabase Edge Runtime 1.76.0은 함수가 설정한 User-Agent 뒤에도 실행 엔진·프로젝트 식별값을 자동으로 붙인다. 기존 `Twitterbot/1.0`에 이 접미사가 붙으면 Instagram이 축약 캡션과 가로로 잘린 `og:image`를 반환하는 문제가 재현됐다. 모바일 User-Agent는 같은 접미사가 붙어도 전체 캡션을 받았고, 잘린 응답에서도 `twitter:image`에는 정상 비율 이미지가 남아 있었다. [공식 변경 내역](https://github.com/supabase/edge-runtime/releases/tag/v1.76.0)
+캡션 자체가 없거나 공백이면 `IG_CAPTION_NOT_FOUND`로 중단한다. 캡션 추출
+결과의 장소가 0개인 경우와 캡션 자체가 없는 경우를 구분한다.
 
-릴스 URL의 HTML head가 유일한 캡션 입력이자 SSOT다. HTML 태그 배치 순서와 무관하게 위 description·image 우선순위를 적용하고, 큰따옴표·작은따옴표를 모두 처리하며 HTML entity를 디코딩한다. HTML 요청 실패는 `IG_FETCH_FAILED`, 한 번의 요청에서 description을 얻지 못하면 추가 Instagram 요청 없이 `IG_CAPTION_NOT_FOUND`다.
+미디어 분석이 필요하면 `instagram_media.ts`가 embed 페이지의 포함 데이터를
+먼저 읽고, 원본이 없으면 공개 페이지와 공개 GraphQL 응답을 확인한다. 대상
+shortcode의 이미지·영상만 사용하며 캐러셀의 모든 항목을 원래 순서로 보존한다.
+릴스는 영상 원본 한 개를 요구하고, 영상 대신 썸네일을 분석하지 않는다.
 
-Gemini 입력과 DB의 캡션 원문은 선택된 description 하나다. `og:title`과 `twitter:title`은 작성자 계정 추출에만 사용하고 캡션으로 저장하거나 AI에 중복 전달하지 않는다. 릴스 HTML 요청이 non-2xx이거나 description이 없으면 Gemini를 호출하지 않는다.
+원본과 동일하게 최대 20개, 파일당 100MiB, 전체 200MiB를 허용하며 MIME과
+실제 다운로드 크기를 검사한다. Instagram CDN의 HTTPS URL만 허용한다.
+리다이렉트도 CDN 검증을 통과해야 한다. 파일은 `/tmp`에 스트리밍으로 저장하고
+다운로드 실패와 분석 종료 시 정리한다.
 
-레거시 스키마의 `reels.instagram_title` 컬럼은 기존 배포 호환을 위해 당분간 nullable 상태로 남겨 두지만 신규 처리와 동일 릴스 결과 재사용에서는 값을 쓰지 않는다. UI, 장소 매칭, 중복 판정, 재시도 어느 경로에서도 사용하지 않으며 다음 스키마 정리 때 제거할 수 있다.
+## 4. Gemini 단서 추출
 
-## 4. Gemini 추출과 검색용 상호 보정
+분석 규칙과 두 프롬프트는 `2026-Yeogidam`의 `GeminiPlaceNameExtractor`에서
+이식했다. 일반 작성자는 캡션을 먼저 분석하고 장소가 없으면 원본 미디어를
+분석한다. `with_sol_mate` 작성자는 처음부터 캡션·미디어를 통합 분석한다.
+캡션 분석 오류나 카카오 매칭 실패를 미디어 분석 조건으로 사용하지 않는다.
 
-캡션 전체를 structured output으로 보내 원문과 검색용 표현을 함께 받는다.
+내부 응답은 다음과 같다. 외부 API 요청·응답에 이 필드를 추가하지 않는다.
 
 ```json
 {
-  "places": [
-    {
-      "placeName": "버연희",
-      "searchNames": ["보연희"],
-      "address": "서울 서대문구 연희맛로 17-63 2층",
-      "searchAddress": "서울 서대문구 연희맛로 17-63",
-      "addressType": "ROAD",
-      "region": "연희동"
-    }
-  ]
+  "places": [{
+    "nameInCaption": "영상 속 카페",
+    "nameSearchHint": "검색할 정식 명칭",
+    "accountHints": ["@cafe_account"],
+    "locationHints": [{
+      "type": "ADDRESS",
+      "value": "서울 성동구 왕십리로 10",
+      "basis": "VIDEO"
+    }],
+    "categoryHint": "카페"
+  }]
 }
 ```
 
-- `placeName`, `address`는 원문의 상호와 상세주소를 보존한다.
-- `searchNames`는 오타·음차·영문·약칭·계정명에서 Gemini가 보정한 상호를 최대 3개 담는다. `버연희 → 보연희`, `파파죤스 → 파파존스`는 예시이며 코드의 치환 사전이 아니다. 원문에 없거나 여러 글자가 달라도 검색에 사용할 수 있다.
-- `searchAddress`는 도로명 건물번호 또는 지번까지 남긴 주소 검색용 표현이다. `region`은 해당 장소의 지역 문맥을 검색하기 좋은 표현으로 받는다.
-- 장소 개수에 애플리케이션 상한을 두지 않는다. 원문 순서로 추출하도록 요청하며, 최종 성공한 장소는 추출 인덱스 순서대로 저장한다.
-- 응답 형식은 검사하지만 원문 포함 여부·장소 주변 문자열·지점명 규칙으로 장소나 필드를 삭제하지 않는다. 정규식 주소는 관측용 로그와 로컬 스텁에서만 쓰며 Gemini의 장소·주소 연결을 변경하지 않는다.
-- 공급자 공통 JSON schema에는 새 검색 필드를 요구한다. 파서는 이전 형태와의 호환을 위해 검색 필드가 생략된 응답도 받을 수 있다.
+위치 출처는 `CAPTION`, `INFERRED`, `VIDEO`, `IMAGE`다. 캡션에 없는 위치라는
+이유로 영상·이미지·프로필 단서를 제거하거나 정규식 주소를 보강하지 않는다.
+장소의 최초 등장 순서와 장소별 정보 분리·중복 제거 규칙은 원본 프롬프트를
+따른다. 장소 개수 상한은 내부 응답 스키마에 두지 않는다.
 
-1차 추출은 캡션당 한 번이다. 후보 선택은 전체 장소를 묶어 한 번 수행하고, `RETRY` 항목만 최대 두 번 추가 선택한다. 공급자 장애 재시도·fallback을 제외하면 추출 1회 + 선택 최대 3회다.
+캡션의 @멘션에서 중복 없는 공개 프로필 URL을 만들어 함께 전달하고,
+`URL Context`로 장소 계정과 연결된 공식 페이지를 확인하도록 요청한다.
+실제로 접근하지 못한 프로필 내용은 생성하지 않도록 프롬프트에서 제한한다.
 
-## 5. Kakao 후보 수집과 Gemini 선택
+캡션 분석은 `/v1/interactions`, 미디어 분석은
+`/v1beta/models/{model}:generateContent`를 사용한다. 미디어를 Files API로
+업로드한다. Deno 스트림은 Content-Length를 전송하지 않으므로 메모리에 최대
+8MiB만 올려 resumable offset과 서버의 조각 단위에 맞춰 순차 전송한다. 마지막
+조각에서 finalize하고 최대 2분 동안 ACTIVE 상태를 기다린 뒤 높은 미디어 해상도로
+분석한다. 성공·실패 모두 업로드 파일 삭제와 로컬 파일 정리를 시도한다.
+캡션 요청 제한은 20초, 미디어 관련 HTTP 요청은 120초, 다운로드는 30초다.
 
-각 장소는 다음 검색 결과를 합친다.
+원본처럼 Gemini 단일 key/model을 사용한다. 기존 공급자 전환·키 fallback·2차
+후보 판단 모듈은 새 분석 경로에서 호출하지 않는다. `GEMINI_API_KEY`,
+`GEMINI_MODEL`은 필수이고 기본 모델을 임의로 지정하지 않는다.
 
-1. 원문 상호와 `searchNames`의 보정 상호를 모두 검색한다.
-2. 지역이 있으면 각 상호에 지역을 붙인 검색도 수행한다.
-3. 주소가 있으면 `searchAddress`, 없거나 검색 결과가 없으면 원문 `address`를 Kakao 주소 API로 조회한다. `analyze_type=similar`를 사용하며 건물 이하 상세주소는 제거한다.
-4. 주소 검색의 상위 좌표 최대 두 개를 사용해 원문·보정 상호를 반경 500m, 거리순으로 검색한다. 주소 문자열의 정확 일치를 요구하지 않는다.
-5. Kakao ID 중복만 제거한다. 단일 후보도 Gemini가 확인하며, 여러 검색에서 모은 후보를 15개로 자르지 않는다. 후보 이름·도로명·지번·카테고리·좌표·검색 중심에서의 거리와 시도한 검색어를 제공한다.
+## 5. Kakao 검색과 선택
 
-Gemini의 판단은 다음과 같이 처리한다.
+`source_analysis.ts`와 `source_kakao.ts`가 원본 `KakaoPlaceSearcher`를 이식한다.
 
-| 판단 | 처리 |
+1. `nameSearchHint`가 있으면 검색명으로 사용하고, 없으면 `nameInCaption`을 사용한다.
+2. 주소에서 지역을 뽑을 수 있으면 캡션, 영상, 이미지, 추론 주소 순으로 확인한다.
+   주소 내부에서는 마지막 읍·면·동, 마지막 구·군, 마지막 시 순으로 선택한다.
+3. 주소에서 지역을 얻지 못하면 영상, 이미지, 추론, 캡션 지역 순으로 선택한다.
+4. 검색명에 지역이 이미 포함되어 있으면 반복해서 붙이지 않는다.
+5. 이름 + 지역으로 첫 페이지 최대 15개를 검색한다. 유효 장소가 없으면 이름만으로 검색한다.
+6. 처음 유효 결과가 나온 검색의 첫 장소를 선택한다. 이름·주소 재검증이나 2차 AI 판단은 없다.
+
+카카오 ID, 명칭, 지번 주소, 유효 좌표가 없는 항목은 원본처럼 건너뛴다.
+응답 항목이 있는데 전부 불완전하면 분석 오류이며 빈 검색 결과로 바꾸지 않는다.
+HTTP·네트워크·응답 형식 오류도 중단한다. 카카오 요청 제한은 5초다.
+확정 장소는 카카오 ID로 중복 제거하고 성공한 장소의 입력 순서를 유지한다.
+모든 장소가 검색되지 않으면 `KAKAO_PLACE_NOT_FOUND`로 연결한다.
+
+원본 Java 클래스와 이식 파일의 대응은 다음과 같다.
+
+| 원본 | 이식 파일 |
 |---|---|
-| `SELECT` | 해당 장소에 실제 전달한 Kakao ID이면 수용한다. 이름·주소·지점을 코드로 다시 검증하지 않는다. |
-| `RETRY` | 보정 검색어 최대 3개를 추가하고 반경을 2km, 다음에는 5km로 확장한다. 키워드와 주변 검색 모두 `is_end`를 확인하며 각각 2, 3페이지까지 확장한다. 이전 후보와 새 후보를 합쳐 Gemini에게 다시 선택시킨다. |
-| `NONE` | 장소별 실패 사유를 기록한다. |
-
-검색어는 공백·중복·빈 문자열·80자 길이 제한만 처리한다. 원문 포함 여부, 한 글자 오타, 로마자 변환, 지점 접미사 같은 의미 검증을 하지 않는다. 마지막 선택에는 남은 검색 횟수 0을 전달하고, 모델이 다시 `RETRY`를 반환해도 종료한다.
-
-한 추출 요청 안에서 동일한 질의·페이지·좌표·반경 결과 및 주소 변환 결과를 재사용한다. 장소는 순서대로 처리하고 각 장소의 독립적인 검색은 최대 3개씩 동시 실행한다. 카카오 한 페이지는 최대 15개이며, 비용과 지연은 보정 상호 수·지역·주소 좌표 수와 실제 확장 횟수에 따라 증가한다.
-
-HTTP 200의 빈 `documents`만 후보 0개다. 기본 키워드 검색의 인증·한도·네트워크·응답 오류는 공급자 오류로 유지한다. 보조 주소·주변 검색에서 발생한 Kakao 오류는 기록하고 기본 키워드 검색을 계속한다. 주소·이름 규칙과 별개로 API 응답 형식 및 전달 후보 ID 검사는 유지한다.
-
-현재 `PIPELINE_VERSION`은 10이다. 기존 버전의 완료 캐시를 새 요청에 재사용하지 않아 변경된 검색과 보정이 적용된다.
+| MediaExtractionPipeline, KakaoPlaceSearcher의 검색어 규칙 | source_analysis.ts |
+| KakaoPlaceSearcher의 요청·유효 장소 파싱 | source_kakao.ts |
+| InstagramMediaSourceReader, InstagramMediaDownloader | instagram_media.ts |
+| GeminiPlaceNameExtractor, GeminiFileClient | source_gemini.ts |
+| 캡션·미디어 프롬프트 | source_prompts.ts |
 
 ## 6. 저장과 중복
 
@@ -173,7 +204,7 @@ HTTP 200의 빈 `documents`만 후보 0개다. 기본 키워드 검색의 인증
 - `places.id`: 내부 UUID
 - `kakao_place_id`: 외부 자연키
 - `kakao_place_url`: `https://map.kakao.com/link/map/{id}`
-- `source_address`: Instagram 원문의 상세주소
+- `source_address`: 캡션·영상·이미지 등에서 얻은 주소 단서를 기존 필드에 문자열로 저장한다
 - `road_address`, `address`, 좌표, 전화, 카테고리: Kakao 정규화 결과
 
 `reels`는 추출 결과 자체가 아니라 사용자 요청 히스토리다. 사용자가 명시적으로 다시 공유하면 같은 사용자·shortcode라도 새 행이 생기고, 네트워크 재전송만 같은 `clientRequestId`로 한 행에 수렴한다. 각 요청은 `extraction_id`로 공용 추출 attempt를 참조하며 기존 앱 호환을 위해 `reels.place_id`는 해당 결과의 첫 장소를 계속 가리킨다.
@@ -251,6 +282,6 @@ Naver 전용 `naver_place_id`, `naver_link`, `naver_thumbnail_url`은 Kakao 전�
 - 동일 Kakao 장소 ID가 캡션에 반복되어 하나로 합쳐짐
 - 썸네일 제공자가 모두 실패하여 이미지 없이 장소만 저장됨
 
-운영에서 저장 개수가 예상보다 적으면 `instagram_description`의 장소 순서, Gemini `extractedCount`·`correctedSearchNameCount`, 장소별 Kakao `round`·`queries`·`candidateCount`, Gemini의 `SELECT`·`RETRY`·`NONE` 사유, 최종 `reel_places.position`을 차례로 확인한다.
+운영에서 저장 개수가 예상보다 적으면 캡션과 미디어의 장소, `source_place_hints_extracted`의 단서, `source_kakao_search`의 검색어·유효 후보 수, 최종 `reel_places.position`과 저장 작업 상태를 차례로 확인한다.
 
-이전 정규식 검증 방식의 조사·실패 매트릭스는 [MVP 장소 매칭 보고서](mvp-place-matching-release-report.md)에 보존한다. 현재 동작은 이 문서의 버전 10 흐름을 따른다.
+이전 정규식 검증 방식의 조사·실패 매트릭스는 [MVP 장소 매칭 보고서](mvp-place-matching-release-report.md)에 보존한다. 현재 동작은 이 문서의 버전 11 흐름을 따른다.
