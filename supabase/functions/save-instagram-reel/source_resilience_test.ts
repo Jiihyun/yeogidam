@@ -66,6 +66,15 @@ function keyOf(init?: RequestInit): string {
   return new Headers(init?.headers).get("x-goog-api-key") ?? "";
 }
 
+// 실제 Interactions API가 무료 등급 분당 한도에서 준 429 본문이다(2026-10-13 확인). details가 없다.
+const INTERACTIONS_RPM_BODY = {
+  error: {
+    message:
+      "Rate limit exceeded for model gemini-3.5-flash-lite (limit: 15 requests per minute on Free Tier). Please retry in 48s or upgrade your tier at https://ai.dev/rate-limit.",
+    code: "too_many_requests",
+  },
+};
+
 // 이벤트를 차례로 디스코드 알림에 넘겨, 실제로 보낸 알림 제목만 모은다.
 async function postedTitles(
   events: { event: string; details: Record<string, unknown> }[],
@@ -540,4 +549,61 @@ Deno.test("선불 잔액 소진 문구가 담긴 429도 결제 잔액 소진으�
   equal(await postedTitles(events), [
     "[CRITICAL] Gemini Primary 결제 잔액 소진",
   ]);
+});
+
+Deno.test("Interactions API의 분당 한도 429는 문장으로 RPM을 가리고 전환을 알린다", async () => {
+  const events: { event: string; details: Record<string, unknown> }[] = [];
+  const client = createSourceGeminiClient(config, {
+    state: createGeminiApiKeyStateStore(),
+    now: () => 0,
+    sleep: async () => {},
+    log: (event, details) => events.push({ event, details }),
+    fetch: async (_url, init) =>
+      keyOf(init) === "primary"
+        ? response(INTERACTIONS_RPM_BODY, 429, { "Retry-After": "48" })
+        : captionResponse(),
+  });
+  equal(await client.extractCaption("카페"), [hint]);
+  const cooldown =
+    events.find((item) => item.event === "ai_gemini_api_key_cooldown_started")!
+      .details;
+  equal(
+    [cooldown.quotaKind, cooldown.quotaScope, cooldown.cooldownMs],
+    ["RPM", "MINUTE", 48_000],
+  );
+  equal(await postedTitles(events), ["[WARN] Gemini Primary → Fallback 전환"]);
+});
+
+Deno.test("같은 순간에 몰린 429는 한 사건으로 보고 쿨다운을 늘리지 않는다", async () => {
+  const events: { event: string; details: Record<string, unknown> }[] = [];
+  let waiting = 0;
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => release = resolve);
+  const client = createSourceGeminiClient(config, {
+    state: createGeminiApiKeyStateStore(),
+    now: () => 0,
+    sleep: async () => {},
+    log: (event, details) => events.push({ event, details }),
+    fetch: async (_url, init) => {
+      if (keyOf(init) !== "primary") return captionResponse();
+      // 네 요청이 모두 앞 key를 고른 뒤에 한꺼번에 429를 받게 한다.
+      waiting += 1;
+      if (waiting === 4) release();
+      await gate;
+      return response({}, 429);
+    },
+  });
+  const results = await Promise.all(
+    Array.from({ length: 4 }, () => client.extractCaption("카페")),
+  );
+  equal(results, [[hint], [hint], [hint], [hint]]);
+  // 네 요청 모두 쿨다운 이벤트를 남기지만 단계는 1분에 머물고, 같은 쿨다운을 가리킨다.
+  const cooldowns = events.filter((item) =>
+    item.event === "ai_gemini_api_key_cooldown_started"
+  );
+  equal(
+    cooldowns.map((item) => [item.details.cooldownMs, item.details.retryAt]),
+    Array(4).fill([60_000, new Date(60_000).toISOString()]),
+  );
+  equal(await postedTitles(events), ["[WARN] Gemini Primary UNKNOWN 429"]);
 });

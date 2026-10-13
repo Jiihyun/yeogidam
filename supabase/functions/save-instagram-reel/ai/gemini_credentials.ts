@@ -312,8 +312,20 @@ function rateLimitMetadata(
       quotaIds: [],
     };
   }
-  const details = record(record(payload)?.error)?.details;
+  const error = record(record(payload)?.error);
+  const details = error?.details;
   if (!Array.isArray(details)) {
+    // Interactions API의 429는 details 없이 "limit: 15 requests per minute" 같은 문장만 준다.
+    const kind = typeof error?.message === "string"
+      ? quotaKindForSignal(error.message)
+      : null;
+    if (kind) {
+      return {
+        quotaScope: quotaScopeForSignals([], new Set([kind])),
+        quotaKind: kind,
+        quotaIds: [],
+      };
+    }
     return {
       quotaScope: "UNKNOWN",
       quotaKind: "UNKNOWN",
@@ -798,7 +810,12 @@ export function createGeminiCredentialPool(
       failure.errorBodyStatus,
     );
     const keyState = state.cooldowns.get(stateKey(apiKeyIndex, model));
-    const unknownRateLimitStrikes = metadata.quotaKind === "UNKNOWN"
+    // 쿨다운 중인 key는 고르지 않으므로, 이미 쿨다운이 걸려 있으면 같은 순간에 몰린 요청이 함께 받은
+    // 429다. 이때는 분류하지 못한 429의 단계를 올리지 않는다.
+    const concurrent = keyState !== undefined &&
+      keyState.cooldownUntilMs > failedAt;
+    const unknownRateLimitStrikes = metadata.quotaKind === "UNKNOWN" &&
+        !concurrent
       ? (keyState?.unknownRateLimitStrikes ?? 0) + 1
       : keyState?.unknownRateLimitStrikes ?? 0;
     const cooldown = effectiveCooldown(
@@ -808,8 +825,11 @@ export function createGeminiCredentialPool(
       unknownRateLimitStrikes,
     );
     const candidateCooldownUntilMs = failedAt + cooldown.cooldownMs;
+    // 몰린 429가 같은 종류면 앞 요청이 건 쿨다운을 그대로 써서 알림이 한 사건으로 묶이게 한다.
+    // 더 긴 쿨다운(예: 분당 한도 중에 일일 한도)이 오면 그쪽으로 늘린다.
     const retainedCooldown = keyState !== undefined &&
-        keyState.cooldownUntilMs > candidateCooldownUntilMs
+        (keyState.cooldownUntilMs > candidateCooldownUntilMs ||
+          (concurrent && keyState.quotaKind === metadata.quotaKind))
       ? keyState
       : null;
     const effectiveCooldownUntilMs = retainedCooldown
