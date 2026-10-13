@@ -104,7 +104,7 @@ for (const mode of [AUTO_SAVE, REVIEW_QUEUE]) {
           equal(body?.p_client_request_id, ids.request);
           equal(body?.p_source, "url_input");
           equal(body?.p_save_mode, mode);
-          equal(body?.p_pipeline_version, 12);
+          equal(body?.p_pipeline_version, 13);
           return Response.json({
             reel_id: ids.reel,
             worker_reel_id: scenario === "cache" ? null : ids.worker,
