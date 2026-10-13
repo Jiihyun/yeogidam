@@ -90,127 +90,6 @@ function responseText(
   return { text: text || null, refused };
 }
 
-export interface OpenAiStructuredRequest {
-  operation: AiOperation;
-  model: string;
-  instructions?: string;
-  input: string;
-  schemaName: string;
-  schema: unknown;
-}
-
-/** Responses API에 JSON 스키마를 강제해 묻고, 실패는 공급자 오류 종류로 바꿔 던진다. */
-export async function requestOpenAiStructuredText(
-  request: typeof fetch,
-  credentials: { apiKey: string; timeoutMs: number },
-  call: OpenAiStructuredRequest,
-): Promise<{ payload: unknown; text: string }> {
-  const { operation, model } = call;
-  let response: Response;
-  let payload: unknown | null;
-  try {
-    const result = await fetchJsonWithTimeout(
-      request,
-      "https://api.openai.com/v1/responses",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${credentials.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model,
-          ...(call.instructions === undefined
-            ? {}
-            : { instructions: call.instructions }),
-          input: call.input,
-          store: false,
-          text: {
-            format: {
-              type: "json_schema",
-              name: call.schemaName,
-              strict: true,
-              schema: call.schema,
-            },
-          },
-        }),
-      },
-      credentials.timeoutMs,
-    );
-    response = result.response;
-    payload = result.payload;
-  } catch (cause) {
-    if (cause instanceof AiRequestTimeoutError) {
-      throw new AiProviderError("openai", operation, "TIMEOUT", {
-        model,
-        retryable: true,
-        cause,
-      });
-    }
-    if (cause instanceof AiResponseJsonError) {
-      throw new AiProviderError(
-        "openai",
-        operation,
-        "INVALID_RESPONSE",
-        { model, retryable: true, cause },
-      );
-    }
-    throw new AiProviderError("openai", operation, "NETWORK", {
-      model,
-      retryable: true,
-      cause,
-    });
-  }
-  if (!response.ok) {
-    throw aiHttpError("openai", operation, model, response.status);
-  }
-
-  const root = record(payload);
-  if (root?.status === "failed" || record(root?.error)) {
-    throw new AiProviderError("openai", operation, "UPSTREAM", {
-      status: response.status,
-      model,
-      retryable: true,
-    });
-  }
-  if (root?.status === "cancelled") {
-    throw new AiProviderError("openai", operation, "CANCELLED", {
-      status: response.status,
-      model,
-      retryable: false,
-    });
-  }
-  if (root?.status === "incomplete") {
-    const incompleteReason = record(root.incomplete_details)?.reason;
-    const contentFiltered = incompleteReason === "content_filter";
-    throw new AiProviderError(
-      "openai",
-      operation,
-      contentFiltered ? "CONTENT_BLOCKED" : "INVALID_RESPONSE",
-      {
-        status: response.status,
-        model,
-        retryable: !contentFiltered,
-      },
-    );
-  }
-
-  const result = responseText(payload);
-  if (!result.text) {
-    throw new AiProviderError(
-      "openai",
-      operation,
-      result.refused ? "CONTENT_BLOCKED" : "INVALID_RESPONSE",
-      {
-        status: response.status,
-        model,
-        retryable: !result.refused,
-      },
-    );
-  }
-  return { payload, text: result.text };
-}
-
 export function createOpenAiProvider(
   config: OpenAiProviderConfig,
   dependencies: OpenAiProviderDependencies = {},
@@ -224,13 +103,107 @@ export function createOpenAiProvider(
     schemaName: string,
     schema: unknown,
   ): Promise<{ payload: unknown; text: string }> {
-    return await requestOpenAiStructuredText(request, config, {
-      operation,
-      model,
-      input: prompt,
-      schemaName,
-      schema,
-    });
+    let response: Response;
+    let payload: unknown | null;
+    try {
+      const result = await fetchJsonWithTimeout(
+        request,
+        "https://api.openai.com/v1/responses",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${config.apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model,
+            input: prompt,
+            store: false,
+            text: {
+              format: {
+                type: "json_schema",
+                name: schemaName,
+                strict: true,
+                schema,
+              },
+            },
+          }),
+        },
+        config.timeoutMs,
+      );
+      response = result.response;
+      payload = result.payload;
+    } catch (cause) {
+      if (cause instanceof AiRequestTimeoutError) {
+        throw new AiProviderError("openai", operation, "TIMEOUT", {
+          model,
+          retryable: true,
+          cause,
+        });
+      }
+      if (cause instanceof AiResponseJsonError) {
+        throw new AiProviderError(
+          "openai",
+          operation,
+          "INVALID_RESPONSE",
+          { model, retryable: true, cause },
+        );
+      }
+      throw new AiProviderError("openai", operation, "NETWORK", {
+        model,
+        retryable: true,
+        cause,
+      });
+    }
+
+    if (!response.ok) {
+      throw aiHttpError("openai", operation, model, response.status);
+    }
+
+    const root = record(payload);
+    if (root?.status === "failed" || record(root?.error)) {
+      throw new AiProviderError("openai", operation, "UPSTREAM", {
+        status: response.status,
+        model,
+        retryable: true,
+      });
+    }
+    if (root?.status === "cancelled") {
+      throw new AiProviderError("openai", operation, "CANCELLED", {
+        status: response.status,
+        model,
+        retryable: false,
+      });
+    }
+    if (root?.status === "incomplete") {
+      const incompleteReason = record(root.incomplete_details)?.reason;
+      const contentFiltered = incompleteReason === "content_filter";
+      throw new AiProviderError(
+        "openai",
+        operation,
+        contentFiltered ? "CONTENT_BLOCKED" : "INVALID_RESPONSE",
+        {
+          status: response.status,
+          model,
+          retryable: !contentFiltered,
+        },
+      );
+    }
+
+    const result = responseText(payload);
+    if (!result.text) {
+      throw new AiProviderError(
+        "openai",
+        operation,
+        result.refused ? "CONTENT_BLOCKED" : "INVALID_RESPONSE",
+        {
+          status: response.status,
+          model,
+          retryable: !result.refused,
+        },
+      );
+    }
+    return { payload, text: result.text };
   }
 
   return {

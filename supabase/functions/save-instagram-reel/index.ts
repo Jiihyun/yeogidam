@@ -8,11 +8,7 @@
 
 import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 import { createRequestId, errorResponse } from "../_shared/error_code.ts";
-import {
-  AiConfigError,
-  AiProviderError,
-  AiProvidersExhaustedError,
-} from "./ai/errors.ts";
+import { AiConfigError, AiProviderError } from "./ai/errors.ts";
 import { sanitizeAiRuntimeLogDetails } from "./ai/log_sanitizer.ts";
 import type { AiLog } from "./ai/provider.ts";
 import { sendGeminiRuntimeDiscordAlert } from "./ai/runtime_alerts.ts";
@@ -30,9 +26,7 @@ import {
   placeMatchFailureRow,
 } from "./match_failure.ts";
 import { analyzeInstagramPlaces } from "./source_analysis.ts";
-import { createSourceCaptionFallback } from "./source_fallback.ts";
 import { createSourceGeminiClient } from "./source_gemini.ts";
-import { createSourceOpenAiClient } from "./source_openai.ts";
 import { searchSourceKakaoPlaces } from "./source_kakao.ts";
 import { findGooglePlacePhoto } from "./google.ts";
 import {
@@ -97,15 +91,6 @@ type FailureReason =
 
 const STALE_PROCESSING_MS = 15 * 60 * 1000;
 const PIPELINE_VERSION = 11;
-const OPENAI_CAPTION_TIMEOUT_MS = 20_000;
-
-function lastProviderFailure(error: unknown): AiProviderError | null {
-  if (error instanceof AiProviderError) return error;
-  if (error instanceof AiProvidersExhaustedError) {
-    return error.attempts.at(-1) ?? null;
-  }
-  return null;
-}
 
 // v10과 같은 기준이다. 키나 요청이 잘못되면 설정 오류, 안전 차단은 장소 없음, 나머지는 UNKNOWN이다.
 function aiFailureReason(failure: AiProviderError): FailureReason {
@@ -170,25 +155,6 @@ function geminiFallbackApiKeys(primaryApiKey: string): string[] {
     );
   }
   return keys;
-}
-
-// 캡션 분석 폴백은 PLACE_AI_FALLBACK_PROVIDER가 openai이고 키와 모델이 모두 있을 때만 켠다.
-// 폴백 설정이 틀려도 Gemini 경로는 그대로 돌게 하고 설정 오류만 로그로 남긴다.
-function captionFallbackClient(log: AiLog) {
-  const provider = Deno.env.get("PLACE_AI_FALLBACK_PROVIDER")?.trim()
-    .toLowerCase();
-  if (provider !== "openai") return null;
-  try {
-    return createSourceOpenAiClient({
-      apiKey: Deno.env.get("OPENAI_API_KEY")?.trim() ?? "",
-      model: Deno.env.get("OPENAI_MODEL")?.trim() ?? "",
-      timeoutMs: OPENAI_CAPTION_TIMEOUT_MS,
-    });
-  } catch (error) {
-    if (!(error instanceof AiConfigError)) throw error;
-    log("ai_provider_config_invalid", { provider: "openai" });
-    return null;
-  }
 }
 
 // 로컬 검증 전용 스텁 (STUB_PROVIDERS=1 일 때만 사용). AI/Kakao 키 없이
@@ -674,17 +640,12 @@ async function processReel(
         model: Deno.env.get("GEMINI_MODEL")?.trim() ?? "",
         fallbackApiKeys: geminiFallbackApiKeys(geminiApiKey),
       }, { log: aiLog });
-      const extractCaption = createSourceCaptionFallback(
-        ai,
-        captionFallbackClient(aiLog),
-        aiLog,
-      );
       const resolution = await analyzeInstagramPlaces({
         instagramUrl,
         caption,
         authorUsername: meta.authorUsername,
       }, {
-        extractCaption,
+        extractCaption: (value) => ai.extractCaption(value),
         extractMedia: (value, url) => ai.extractMedia(value, url),
         search: (query) => searchSourceKakaoPlaces(query, kakaoKey!),
         log: (event, details) =>
@@ -752,21 +713,12 @@ async function processReel(
     if (error instanceof AiConfigError) {
       return await failWorker("PROVIDER_CONFIG_MISSING");
     }
-    const failure = lastProviderFailure(error);
+    const failure = error instanceof AiProviderError ? error : null;
     console.error(JSON.stringify({
       event: "reel_processing_failed",
       reelId,
       message: error instanceof Error ? error.message : String(error),
-      ...(error instanceof AiProvidersExhaustedError
-        ? {
-          attempts: error.attempts.map((attempt) => ({
-            provider: attempt.provider,
-            operation: attempt.operation,
-            kind: attempt.kind,
-            status: attempt.status,
-          })),
-        }
-        : failure
+      ...(failure
         ? {
           provider: failure.provider,
           operation: failure.operation,

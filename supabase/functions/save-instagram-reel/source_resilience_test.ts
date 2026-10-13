@@ -1,5 +1,5 @@
-// Gemini 실패에 버티는 장치: 같은 키 재시도, 429 예비 키 전환, 캡션 OpenAI 폴백.
-import { AiProviderError, AiProvidersExhaustedError } from "./ai/errors.ts";
+// Gemini 실패에 버티는 장치: 같은 키 재시도, 429 예비 키 전환, 과부하 전환과 알림.
+import { AiProviderError } from "./ai/errors.ts";
 import { createGeminiApiKeyStateStore } from "./ai/gemini_credentials.ts";
 import {
   createInMemoryRuntimeAlertDedupe,
@@ -7,14 +7,7 @@ import {
   sendGeminiRuntimeDiscordAlert,
 } from "./ai/runtime_alerts.ts";
 import type { SourcePlaceHint } from "./source_analysis.ts";
-import { createSourceCaptionFallback } from "./source_fallback.ts";
-import {
-  createSourceGeminiClient,
-  SOURCE_HINTS_SCHEMA,
-  sourceCaptionInput,
-} from "./source_gemini.ts";
-import { createSourceOpenAiClient } from "./source_openai.ts";
-import { SOURCE_CAPTION_INSTRUCTION } from "./source_prompts.ts";
+import { createSourceGeminiClient } from "./source_gemini.ts";
 
 function equal(actual: unknown, expected: unknown): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -325,139 +318,6 @@ for (
   });
 }
 
-const geminiFailure = (kind: "UPSTREAM" | "AUTH") =>
-  new AiProviderError("gemini", "SOURCE_CAPTION_ANALYSIS", kind, {
-    model: "test-model",
-    retryable: kind !== "AUTH",
-  });
-
-Deno.test("캡션 분석이 일시적 사유로 실패하면 OpenAI로 다시 묻는다", async () => {
-  const events: { event: string; details: Record<string, unknown> }[] = [];
-  const extract = createSourceCaptionFallback(
-    {
-      name: "gemini",
-      extractCaption: () => Promise.reject(geminiFailure("UPSTREAM")),
-    },
-    { name: "openai", extractCaption: async () => [hint] },
-    (event, details) => events.push({ event, details }),
-  );
-  equal(await extract("카페"), [hint]);
-  equal(events, [
-    {
-      event: "ai_provider_fallback_started",
-      details: {
-        operation: "SOURCE_CAPTION_ANALYSIS",
-        fromProvider: "gemini",
-        toProvider: "openai",
-        failureKind: "UPSTREAM",
-      },
-    },
-    {
-      event: "ai_provider_fallback_completed",
-      details: {
-        operation: "SOURCE_CAPTION_ANALYSIS",
-        provider: "openai",
-        resultCount: 1,
-      },
-    },
-  ]);
-});
-
-Deno.test("인증 오류는 설정 문제라 OpenAI로 넘기지 않는다", async () => {
-  let fallbackCalls = 0;
-  const failure = geminiFailure("AUTH");
-  const extract = createSourceCaptionFallback(
-    { name: "gemini", extractCaption: () => Promise.reject(failure) },
-    {
-      name: "openai",
-      extractCaption: async () => {
-        fallbackCalls++;
-        return [hint];
-      },
-    },
-  );
-  equal(await rejection(extract("카페")) === failure, true);
-  equal(fallbackCalls, 0);
-});
-
-Deno.test("OpenAI까지 실패하면 두 시도를 모두 담아 실패한다", async () => {
-  const primary = geminiFailure("UPSTREAM");
-  const secondary = new AiProviderError(
-    "openai",
-    "SOURCE_CAPTION_ANALYSIS",
-    "TIMEOUT",
-    { model: "gpt", retryable: true },
-  );
-  const extract = createSourceCaptionFallback(
-    { name: "gemini", extractCaption: () => Promise.reject(primary) },
-    { name: "openai", extractCaption: () => Promise.reject(secondary) },
-  );
-  const error = await rejection(extract("카페"));
-  equal(
-    error instanceof AiProvidersExhaustedError &&
-      error.attempts.map((attempt) => attempt.kind),
-    ["UPSTREAM", "TIMEOUT"],
-  );
-});
-
-Deno.test("폴백이 설정되지 않으면 Gemini 오류를 그대로 던진다", async () => {
-  const failure = geminiFailure("UPSTREAM");
-  const extract = createSourceCaptionFallback(
-    { name: "gemini", extractCaption: () => Promise.reject(failure) },
-    null,
-  );
-  equal(await rejection(extract("카페")) === failure, true);
-});
-
-Deno.test("OpenAI 캡션 분석은 Gemini와 같은 지시와 스키마로 Responses API를 부른다", async () => {
-  const client = createSourceOpenAiClient(
-    { apiKey: "openai-key", model: "gpt-test", timeoutMs: 1_000 },
-    {
-      fetch: async (url, init) => {
-        equal(String(url), "https://api.openai.com/v1/responses");
-        equal(
-          new Headers(init?.headers).get("Authorization"),
-          "Bearer openai-key",
-        );
-        equal(JSON.parse(String(init?.body)), {
-          model: "gpt-test",
-          instructions: SOURCE_CAPTION_INSTRUCTION,
-          input: sourceCaptionInput("추천 @cafe"),
-          store: false,
-          text: {
-            format: {
-              type: "json_schema",
-              name: "source_place_hints",
-              strict: true,
-              schema: SOURCE_HINTS_SCHEMA,
-            },
-          },
-        });
-        return response({
-          status: "completed",
-          output_text: JSON.stringify({ places: [hint] }),
-        });
-      },
-    },
-  );
-  equal(await client.extractCaption("추천 @cafe"), [hint]);
-});
-
-Deno.test("OpenAI가 스키마에 맞지 않게 답하면 INVALID_RESPONSE로 실패한다", async () => {
-  const client = createSourceOpenAiClient(
-    { apiKey: "openai-key", model: "gpt-test", timeoutMs: 1_000 },
-    {
-      fetch: async () =>
-        response({ status: "completed", output_text: '{"places":[{}]}' }),
-    },
-  );
-  const error = await rejection(client.extractCaption("카페"));
-  equal(
-    error instanceof AiProviderError && [error.provider, error.kind],
-    ["openai", "INVALID_RESPONSE"],
-  );
-});
-
 Deno.test("뒤에 key가 있으면 503에서 재시도 없이 넘기고, 그 key는 60초 뒤에 다시 먼저 쓴다", async () => {
   let clock = 0;
   const keys: string[] = [];
@@ -573,5 +433,50 @@ Deno.test("과부하가 이어져도 회복 전까지 같은 사건이라 디스
   equal(posted, [
     "[WARN] Gemini key 1 과부하 → key 2",
     "[RECOVERED] Gemini key 1 과부하 해소",
+  ]);
+});
+
+Deno.test("앞 key가 429면 뒤 key로 넘기고 디스코드에 전환과 복귀를 한 번씩 알린다", async () => {
+  let clock = 0;
+  let primaryLimited = true;
+  const keys: string[] = [];
+  const events: { event: string; details: Record<string, unknown> }[] = [];
+  const client = createSourceGeminiClient(config, {
+    state: createGeminiApiKeyStateStore(),
+    now: () => clock,
+    sleep: async () => {},
+    log: (event, details) => events.push({ event, details }),
+    fetch: async (_url, init) => {
+      keys.push(keyOf(init));
+      return keyOf(init) === "primary" && primaryLimited
+        ? response(RPM_QUOTA_BODY, 429)
+        : captionResponse();
+    },
+  });
+  await client.extractCaption("카페");
+  await client.extractCaption("카페");
+  clock = 61_000;
+  primaryLimited = false;
+  await client.extractCaption("카페");
+  // 쿨다운 동안은 앞 key를 건너뛰고, 쿨다운이 끝나면 다시 앞 key를 먼저 쓴다.
+  equal(keys, ["primary", "fallback", "fallback", "primary"]);
+
+  const posted: string[] = [];
+  const dedupe = createInMemoryRuntimeAlertDedupe();
+  const transitionQueue = createInMemoryRuntimeAlertTransitionQueue();
+  for (const { event, details } of events) {
+    await sendGeminiRuntimeDiscordAlert(event, details, {
+      webhookUrl: "https://discord.com/api/webhooks/test/token",
+      dedupe,
+      transitionQueue,
+      fetch: async (_url, init) => {
+        posted.push(JSON.parse(String(init?.body)).embeds[0].title);
+        return new Response(null, { status: 204 });
+      },
+    });
+  }
+  equal(posted, [
+    "[WARN] Gemini Primary → Fallback 전환",
+    "[RECOVERED] Gemini Fallback → Primary 복귀",
   ]);
 });
