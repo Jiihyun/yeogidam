@@ -31,7 +31,7 @@ export type AiErrorBodyStatus =
   | "READ_TIMEOUT"
   | "READ_FAILED";
 
-interface BoundedErrorJson {
+export interface BoundedErrorJson {
   payload: unknown | null;
   status: AiErrorBodyStatus;
 }
@@ -74,7 +74,8 @@ function cancelReader(
   void reader.cancel().catch(() => undefined);
 }
 
-async function readBoundedErrorJson(
+/** 429 같은 오류 본문을 크기 상한 안에서만 읽는다. 원문은 쿼터 분류에만 쓴다. */
+export async function readBoundedErrorJson(
   response: Response,
   signal: AbortSignal,
 ): Promise<BoundedErrorJson> {
