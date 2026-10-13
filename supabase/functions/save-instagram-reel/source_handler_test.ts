@@ -29,6 +29,7 @@ for (const mode of [AUTO_SAVE, REVIEW_QUEUE]) {
       "processing",
       "partial",
       "resume",
+      "caption-fallback",
     ] as const
   ) {
     Deno.test(`API와 저장 계약을 유지한다: ${mode} / ${scenario}`, async () => {
@@ -38,9 +39,16 @@ for (const mode of [AUTO_SAVE, REVIEW_QUEUE]) {
         SUPABASE_SERVICE_ROLE_KEY: "test-service",
         STUB_PROVIDERS: "0",
         PIPELINE_SYNC: "1",
-        GEMINI_API_KEY: "test-key",
+        // 429 시나리오의 키 쿨다운이 프로세스 공용 상태에 남으므로 시나리오마다 키를 나눈다.
+        GEMINI_API_KEY: `test-key-${mode}-${scenario}`,
         GEMINI_MODEL: "test-model",
         KAKAO_REST_API_KEY: "test-kakao",
+        // Gemini 캡션 분석이 끝내 실패한 시나리오에서만 OpenAI 폴백을 켠다.
+        PLACE_AI_FALLBACK_PROVIDER: scenario === "caption-fallback"
+          ? "openai"
+          : "",
+        OPENAI_API_KEY: "test-openai-key",
+        OPENAI_MODEL: "test-openai-model",
       };
       const saved = new Map(
         Object.keys(env).map((key) => [key, Deno.env.get(key)]),
@@ -82,6 +90,7 @@ for (const mode of [AUTO_SAVE, REVIEW_QUEUE]) {
         }
         : null;
       let analysisCalls = 0;
+      let openAiCalls = 0;
       let mediaCalls = 0;
       let searchCalls = 0;
       const unexpected: string[] = [];
@@ -183,6 +192,9 @@ for (const mode of [AUTO_SAVE, REVIEW_QUEUE]) {
           if (scenario === "provider-error") {
             return new Response(null, { status: 429 });
           }
+          if (scenario === "caption-fallback") {
+            return Response.json({ status: "in_progress", steps: [] });
+          }
           const hint = {
             nameInCaption: "카페",
             nameSearchHint: "정식 카페명",
@@ -211,6 +223,28 @@ for (const mode of [AUTO_SAVE, REVIEW_QUEUE]) {
                 },
               ],
             }],
+          });
+        }
+        if (url.hostname === "api.openai.com") {
+          openAiCalls++;
+          equal(url.pathname, "/v1/responses");
+          equal(body?.model, "test-openai-model");
+          equal(body?.store, false);
+          return Response.json({
+            status: "completed",
+            output_text: JSON.stringify({
+              places: [{
+                nameInCaption: "카페",
+                nameSearchHint: "정식 카페명",
+                accountHints: [],
+                locationHints: [{
+                  type: "REGION",
+                  value: "성수",
+                  basis: "INFERRED",
+                }],
+                categoryHint: "카페",
+              }],
+            }),
           });
         }
         if (url.hostname === "dapi.kakao.com") {
@@ -359,6 +393,7 @@ for (const mode of [AUTO_SAVE, REVIEW_QUEUE]) {
           ["cache", "processing", "resume"].includes(scenario) ? 0 : 1,
         );
         equal(mediaCalls, scenario === "media" ? 1 : 0);
+        equal(openAiCalls, scenario === "caption-fallback" ? 1 : 0);
         if (scenario === "resume") {
           equal(searchCalls, 0);
           equal(

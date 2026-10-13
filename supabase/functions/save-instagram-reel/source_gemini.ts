@@ -1,11 +1,21 @@
 // 2026-Yeogidam GeminiPlaceNameExtractor / GeminiFileClient의 이식.
-import { AiConfigError } from "./ai/errors.ts";
+// 모델 호출이 잠시 실패하면 같은 키로 다시 보내고, 429면 예비 키로 넘긴다.
+import { AiConfigError, aiHttpError, AiProviderError } from "./ai/errors.ts";
+import {
+  createGeminiCredentialPool,
+  type GeminiApiKeyStateStore,
+  GeminiHttpStatusError,
+  retryAfterMs,
+} from "./ai/gemini_credentials.ts";
+import { readBoundedErrorJson } from "./ai/http.ts";
+import type { AiLog } from "./ai/provider.ts";
+import type { AiOperation } from "./ai/types.ts";
 import {
   type DownloadedInstagramMedia,
   downloadInstagramMedia,
   removeDownloadedMedia,
 } from "./instagram_media.ts";
-import { mediaHttp, sourceJson } from "./media_http.ts";
+import { mediaHttp } from "./media_http.ts";
 import type { SourcePlaceHint } from "./source_analysis.ts";
 import {
   SOURCE_CAPTION_INSTRUCTION,
@@ -18,6 +28,14 @@ const CAPTION_TIMEOUT_MS = 20_000;
 const MEDIA_TIMEOUT_MS = 120_000;
 const PROCESSING_TIMEOUT_MS = 120_000;
 const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
+// 모델이 잠시 과부하(5xx)이거나 응답이 늦으면 같은 키로 다시 보낸다. 업로드는 다시 보내지 않는다.
+const TRANSIENT_RETRY_DELAYS_MS = [1_000, 3_000];
+const TRANSIENT_STATUSES = new Set([408, 500, 502, 503, 504]);
+const MAX_RETRY_AFTER_MS = 10_000;
+// 한 건의 처리가 Edge Function 실행 한도(유료 400초)를 넘지 않도록 재시도와 키 전환에 쓸 시간을 묶는다.
+// 인스타 읽기 30초, 캡션 75초, OpenAI 폴백 20초, 미디어 240초를 더해도 400초 안에 든다.
+const CAPTION_BUDGET_MS = 75_000;
+const MEDIA_BUDGET_MS = 240_000;
 
 // Deno의 ReadableStream 요청은 Content-Length를 전송하지 않는다.
 // 크기가 알려진 작은 버퍼를 순차 전송해 원본의 resumable 프로토콜을 유지한다.
@@ -68,7 +86,12 @@ export async function uploadSourceMediaBytes(
         async (response) => {
           if (!response.ok) {
             await response.body?.cancel();
-            throw new Error(`source_analysis_http_${response.status}`);
+            throw new GeminiHttpStatusError(
+              response,
+              null,
+              undefined,
+              `source_analysis_http_${response.status}`,
+            );
           }
           if (final) return await response.json();
           await response.body?.cancel();
@@ -187,6 +210,84 @@ export function sourceCaptionInput(caption: string): string {
     handles.map((handle) => `https://www.instagram.com/${handle}/`).join("\n");
 }
 
+// Gemini의 JSON 응답을 읽는다. 성공이 아니면 상태 코드를 담아 던지고, 429 본문은 쿼터 분류에만 쓰도록 상한 안에서 읽는다.
+async function geminiJson(
+  request: typeof fetch,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<unknown> {
+  return await mediaHttp(
+    request,
+    url,
+    init,
+    timeoutMs,
+    async (response, signal) => {
+      if (!response.ok) {
+        const errorBody = response.status === 429
+          ? await readBoundedErrorJson(response, signal)
+          : null;
+        if (!errorBody) await response.body?.cancel();
+        throw new GeminiHttpStatusError(
+          response,
+          errorBody?.payload ?? null,
+          errorBody?.status,
+          `source_analysis_http_${response.status}`,
+        );
+      }
+      return await response.json();
+    },
+  );
+}
+
+function isRequestTimeout(error: unknown): boolean {
+  return error instanceof Error &&
+    (error.message === "source_analysis_request_timeout" ||
+      error.message === "source_gemini_file_processing_timeout");
+}
+
+/**
+ * 분석 실패를 공급자 오류 종류로 바꿔, 폴백 판단과 로그가 v10과 같은 기준을 쓰게 한다.
+ * 인스타그램 원본을 받지 못한 오류처럼 Gemini와 무관한 오류는 그대로 둔다.
+ */
+export function sourceGeminiFailure(
+  operation: AiOperation,
+  model: string,
+  error: unknown,
+): unknown {
+  if (error instanceof AiProviderError || error instanceof AiConfigError) {
+    return error;
+  }
+  if (error instanceof GeminiHttpStatusError) {
+    return aiHttpError("gemini", operation, model, error.status);
+  }
+  if (isRequestTimeout(error)) {
+    return new AiProviderError("gemini", operation, "TIMEOUT", {
+      model,
+      retryable: true,
+      cause: error,
+    });
+  }
+  if (error instanceof TypeError) {
+    return new AiProviderError("gemini", operation, "NETWORK", {
+      model,
+      retryable: true,
+      cause: error,
+    });
+  }
+  if (
+    error instanceof SyntaxError ||
+    (error instanceof Error && error.message.startsWith("source_gemini_"))
+  ) {
+    return new AiProviderError("gemini", operation, "INVALID_RESPONSE", {
+      model,
+      retryable: true,
+      cause: error,
+    });
+  }
+  return error;
+}
+
 function captionOutput(payload: unknown): string {
   const response = object(payload);
   if (response.status !== "completed" || !Array.isArray(response.steps)) {
@@ -231,6 +332,7 @@ function mediaOutput(payload: unknown): string {
 export interface SourceGeminiConfig {
   apiKey: string;
   model: string;
+  fallbackApiKeys?: readonly string[];
 }
 export interface SourceGeminiDependencies {
   fetch?: typeof fetch;
@@ -238,6 +340,8 @@ export interface SourceGeminiDependencies {
   remove?: typeof removeDownloadedMedia;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
+  log?: AiLog;
+  state?: GeminiApiKeyStateStore;
 }
 
 interface UploadedFile {
@@ -259,15 +363,69 @@ export function createSourceGeminiClient(
   const sleep = dependencies.sleep ??
     ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = dependencies.now ?? Date.now;
-  const headers = { "x-goog-api-key": config.apiKey };
+  const credentials = createGeminiCredentialPool(
+    [config.apiKey, ...(config.fallbackApiKeys ?? [])],
+    { log: dependencies.log, now, state: dependencies.state },
+  );
 
-  async function deleteFile(name: string): Promise<void> {
+  function headersFor(apiKey: string): Record<string, string> {
+    return { "x-goog-api-key": apiKey };
+  }
+
+  function transientRetryDelay(error: unknown, retry: number): number | null {
+    if (retry >= TRANSIENT_RETRY_DELAYS_MS.length) return null;
+    const delayMs = TRANSIENT_RETRY_DELAYS_MS[retry];
+    if (error instanceof GeminiHttpStatusError) {
+      if (!TRANSIENT_STATUSES.has(error.status)) return null;
+      const hintedMs = retryAfterMs(error.response, now()) ?? 0;
+      return Math.min(Math.max(delayMs, hintedMs), MAX_RETRY_AFTER_MS);
+    }
+    return error instanceof TypeError || isRequestTimeout(error)
+      ? delayMs
+      : null;
+  }
+
+  // 같은 키로 다시 보낼 오류이고 남은 시간 안에 한 번 더 기다릴 수 있을 때만 다시 보낸다.
+  async function withTransientRetry<T>(
+    operation: AiOperation,
+    deadlineMs: number,
+    requestTimeoutMs: number,
+    call: () => Promise<T>,
+  ): Promise<T> {
+    for (let retry = 0;; retry++) {
+      try {
+        return await call();
+      } catch (error) {
+        const delayMs = transientRetryDelay(error, retry);
+        if (
+          delayMs === null || now() + delayMs + requestTimeoutMs > deadlineMs
+        ) throw error;
+        const failure = sourceGeminiFailure(operation, config.model, error);
+        dependencies.log?.("ai_provider_retry_scheduled", {
+          operation,
+          provider: "gemini",
+          model: config.model,
+          ...(failure instanceof AiProviderError
+            ? { failureKind: failure.kind }
+            : {}),
+          ...(error instanceof GeminiHttpStatusError
+            ? { status: error.status }
+            : {}),
+          attemptCount: retry + 1,
+          durationMs: delayMs,
+        });
+        await sleep(delayMs);
+      }
+    }
+  }
+
+  async function deleteFile(name: string, apiKey: string): Promise<void> {
     if (!/^files\/[A-Za-z0-9_-]+$/.test(name)) return;
     try {
       await mediaHttp(
         request,
         `${BASE}/v1beta/${name}`,
-        { method: "DELETE", headers },
+        { method: "DELETE", headers: headersFor(apiKey) },
         MEDIA_TIMEOUT_MS,
         async (response) => {
           await response.body?.cancel();
@@ -283,6 +441,7 @@ export function createSourceGeminiClient(
 
   async function upload(
     media: DownloadedInstagramMedia,
+    apiKey: string,
   ): Promise<UploadedFile> {
     let name: string | null = null;
     try {
@@ -292,7 +451,7 @@ export function createSourceGeminiClient(
         {
           method: "POST",
           headers: {
-            ...headers,
+            ...headersFor(apiKey),
             "Content-Type": "application/json",
             "X-Goog-Upload-Protocol": "resumable",
             "X-Goog-Upload-Command": "start",
@@ -308,9 +467,15 @@ export function createSourceGeminiClient(
             response.headers.get("X-Goog-Upload-Chunk-Granularity") ?? "1",
           );
           await response.body?.cancel();
-          if (!response.ok || !location) {
-            throw new Error("source_gemini_upload_start_failed");
+          if (!response.ok) {
+            throw new GeminiHttpStatusError(
+              response,
+              null,
+              undefined,
+              "source_gemini_upload_start_failed",
+            );
           }
+          if (!location) throw new Error("source_gemini_upload_start_failed");
           const url = new URL(location);
           if (
             url.origin !== BASE || url.username || url.password
@@ -341,10 +506,10 @@ export function createSourceGeminiClient(
         }
         await sleep(1000);
         file = object(
-          await sourceJson(
+          await geminiJson(
             request,
             `${BASE}/v1beta/${name}`,
-            { headers },
+            { headers: headersFor(apiKey) },
             MEDIA_TIMEOUT_MS,
           ),
         );
@@ -354,79 +519,144 @@ export function createSourceGeminiClient(
       }
       return { name, uri: file.uri, mimeType: media.mimeType };
     } catch (error) {
-      if (name) await deleteFile(name);
+      if (name) await deleteFile(name, apiKey);
       throw error;
     }
   }
 
   return {
+    name: "gemini" as const,
     async extractCaption(caption: string): Promise<SourcePlaceHint[]> {
       if (!caption.trim()) throw new Error("source_gemini_caption_empty");
-      const payload = await sourceJson(request, `${BASE}/v1/interactions`, {
-        method: "POST",
-        headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: config.model,
-          store: false,
-          system_instruction: SOURCE_CAPTION_INSTRUCTION,
-          input: sourceCaptionInput(caption),
-          tools: [{ type: "url_context" }],
-          response_format: {
-            type: "text",
-            mime_type: "application/json",
-            schema: SOURCE_HINTS_SCHEMA,
-          },
-        }),
-      }, CAPTION_TIMEOUT_MS);
-      return parseSourcePlaceHints(JSON.parse(captionOutput(payload)));
+      const operation = "SOURCE_CAPTION_ANALYSIS";
+      const deadlineMs = now() + CAPTION_BUDGET_MS;
+      try {
+        return await credentials.run(
+          operation,
+          config.model,
+          (apiKey) =>
+            withTransientRetry(
+              operation,
+              deadlineMs,
+              CAPTION_TIMEOUT_MS,
+              async () => {
+                const payload = await geminiJson(
+                  request,
+                  `${BASE}/v1/interactions`,
+                  {
+                    method: "POST",
+                    headers: {
+                      ...headersFor(apiKey),
+                      "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify({
+                      model: config.model,
+                      store: false,
+                      system_instruction: SOURCE_CAPTION_INSTRUCTION,
+                      input: sourceCaptionInput(caption),
+                      tools: [{ type: "url_context" }],
+                      response_format: {
+                        type: "text",
+                        mime_type: "application/json",
+                        schema: SOURCE_HINTS_SCHEMA,
+                      },
+                    }),
+                  },
+                  CAPTION_TIMEOUT_MS,
+                );
+                return parseSourcePlaceHints(
+                  JSON.parse(captionOutput(payload)),
+                );
+              },
+            ),
+        );
+      } catch (error) {
+        throw sourceGeminiFailure(operation, config.model, error);
+      }
     },
     async extractMedia(
       caption: string,
       url: string,
     ): Promise<SourcePlaceHint[]> {
       if (!caption.trim()) throw new Error("source_gemini_caption_empty");
+      const operation = "SOURCE_MEDIA_ANALYSIS";
+      const deadlineMs = now() + MEDIA_BUDGET_MS;
       const downloaded = await download(url, request);
-      const uploaded: UploadedFile[] = [];
       try {
-        for (const media of downloaded) uploaded.push(await upload(media));
-        const payload = await sourceJson(
-          request,
-          `${BASE}/v1beta/models/${
-            encodeURIComponent(config.model)
-          }:generateContent`,
-          {
-            method: "POST",
-            headers: { ...headers, "Content-Type": "application/json" },
-            body: JSON.stringify({
-              systemInstruction: {
-                parts: [{ text: SOURCE_MEDIA_INSTRUCTION }],
-              },
-              contents: [{
-                role: "user",
-                parts: [
-                  { text: sourceCaptionInput(caption) },
-                  ...uploaded.map((file) => ({
-                    fileData: { fileUri: file.uri, mimeType: file.mimeType },
-                  })),
-                ],
-              }],
-              tools: [{ urlContext: {} }],
-              generationConfig: {
-                responseMimeType: "application/json",
-                responseJsonSchema: SOURCE_HINTS_SCHEMA,
-                mediaResolution: "MEDIA_RESOLUTION_HIGH",
-              },
-            }),
+        // 올린 파일은 그 키의 구글 프로젝트에 묶이므로, 키를 바꾸면 같은 원본을 새 키로 다시 올린다.
+        // 다른 키로 다시 올릴 때만 남은 시간을 보고, 첫 시도는 예전과 같이 진행한다.
+        let keyAttempts = 0;
+        return await credentials.run(
+          operation,
+          config.model,
+          async (apiKey) => {
+            if (keyAttempts++ > 0 && now() + MEDIA_TIMEOUT_MS > deadlineMs) {
+              throw new AiProviderError("gemini", operation, "TIMEOUT", {
+                model: config.model,
+                retryable: true,
+              });
+            }
+            const uploaded: UploadedFile[] = [];
+            try {
+              for (const media of downloaded) {
+                uploaded.push(await upload(media, apiKey));
+              }
+              return await withTransientRetry(
+                operation,
+                deadlineMs,
+                MEDIA_TIMEOUT_MS,
+                async () => {
+                  const payload = await geminiJson(
+                    request,
+                    `${BASE}/v1beta/models/${
+                      encodeURIComponent(config.model)
+                    }:generateContent`,
+                    {
+                      method: "POST",
+                      headers: {
+                        ...headersFor(apiKey),
+                        "Content-Type": "application/json",
+                      },
+                      body: JSON.stringify({
+                        systemInstruction: {
+                          parts: [{ text: SOURCE_MEDIA_INSTRUCTION }],
+                        },
+                        contents: [{
+                          role: "user",
+                          parts: [
+                            { text: sourceCaptionInput(caption) },
+                            ...uploaded.map((file) => ({
+                              fileData: {
+                                fileUri: file.uri,
+                                mimeType: file.mimeType,
+                              },
+                            })),
+                          ],
+                        }],
+                        tools: [{ urlContext: {} }],
+                        generationConfig: {
+                          responseMimeType: "application/json",
+                          responseJsonSchema: SOURCE_HINTS_SCHEMA,
+                          mediaResolution: "MEDIA_RESOLUTION_HIGH",
+                        },
+                      }),
+                    },
+                    MEDIA_TIMEOUT_MS,
+                  );
+                  return parseSourcePlaceHints(
+                    JSON.parse(mediaOutput(payload)),
+                  );
+                },
+              );
+            } finally {
+              for (const file of uploaded) await deleteFile(file.name, apiKey);
+            }
           },
-          MEDIA_TIMEOUT_MS,
         );
-        return parseSourcePlaceHints(JSON.parse(mediaOutput(payload)));
+      } catch (error) {
+        throw sourceGeminiFailure(operation, config.model, error);
       } finally {
-        try {
-          for (const file of uploaded) await deleteFile(file.name);
-        } finally {
-          await remove(downloaded);
-        }
+        await remove(downloaded);
       }
     },
   };

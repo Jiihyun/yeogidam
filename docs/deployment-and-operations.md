@@ -42,8 +42,13 @@ REST API 키의 호출 허용 IP를 설정하면 보안은 강화되지만, 기�
 Edge Function에 필요한 사용자 설정 secret:
 
 ```text
-GEMINI_API_KEY               필수, Gemini 단일 API key
+GEMINI_API_KEY               필수, Gemini 주 API key
 GEMINI_MODEL                 필수, 캡션·미디어에 같은 모델 사용
+GEMINI_API_KEY_FALLBACKS     선택, 쉼표로 나눈 예비 key. 429일 때 순서대로 넘긴다
+PLACE_AI_FALLBACK_PROVIDER   선택, openai이면 캡션 분석이 끝내 실패할 때 OpenAI로 다시 묻는다
+OPENAI_API_KEY               PLACE_AI_FALLBACK_PROVIDER=openai일 때 필요
+OPENAI_MODEL                 PLACE_AI_FALLBACK_PROVIDER=openai일 때 필요
+DISCORD_GEMINI_ALERT_WEBHOOK_URL  선택, 운영에만 등록. Gemini key 전환과 소진, 인증 오류, 복구 알림
 KAKAO_REST_API_KEY
 GOOGLE_PLACES_API_KEY
 PUBLIC_SUPABASE_URL          선택, Storage 공개 URL 기준
@@ -124,18 +129,38 @@ GET /functions/v1/app-update-policy?platform=ios&appVersion=1.0
 
 ### 장소 분석 설정
 
-분석 버전 11은 `2026-Yeogidam`의 Gemini 단일 key/model 방식을 사용한다.
-`GEMINI_API_KEY`와 `GEMINI_MODEL`을 모두 등록해야 한다. 값이 없으면 기존
-`PROVIDER_CONFIG_MISSING` 실패 코드로 처리한다. 모델 기본값은 없다.
+분석 버전 11은 `2026-Yeogidam`의 Gemini 분석 방식을 사용하고, Gemini가 실패할 때
+버티는 장치를 더했다. `GEMINI_API_KEY`와 `GEMINI_MODEL`을 모두 등록해야 한다.
+값이 없으면 기존 `PROVIDER_CONFIG_MISSING` 실패 코드로 처리한다. 모델 기본값은 없다.
 
 캡션 분석은 Interactions API와 URL Context, 미디어 분석은 Files API와
 `generateContent`를 사용한다. 사용할 모델이 이 요청 형식을 지원하는지
 배포 환경에서 확인한다. 요청 제한은 캡션 20초, 미디어 관련 HTTP 120초,
 원본 다운로드 30초, 카카오 5초다. 업로드 파일의 준비 대기는 최대 2분이다.
 
-기존 `PLACE_AI_*`, `GEMINI_API_KEY_FALLBACKS`, `GEMINI_MATCH_MODEL`, `OPENAI_*`
-secret이 남아 있어도 새 장소 분석 경로는 사용하지 않는다. 공급자 전환이나
-key fallback으로 원본과 다른 분석 흐름을 만들지 않는다.
+Gemini 호출이 실패하면 다음 순서로 버틴다.
+
+1. 500, 502, 503, 504, 408, 요청 시간 초과, 네트워크 오류는 같은 key로 1초, 3초 뒤에
+   두 번 더 보낸다. `Retry-After`가 오면 따르되 10초를 넘기지 않는다. 한 건이 Edge
+   Function 실행 한도(유료 400초)를 넘지 않도록 캡션은 75초, 미디어는 240초 안에서만
+   다시 보낸다. 파일 업로드는 다시 보내지 않는다.
+2. 429면 그 key를 쿨다운하고 `GEMINI_API_KEY_FALLBACKS`의 다음 key로 넘긴다. 미디어는
+   업로드한 파일이 key의 Google 프로젝트에 묶이므로 새 key로 다시 올리고, 앞 key의 파일은
+   앞 key로 지운다. Gemini 한도는 API key가 아니라 프로젝트 단위라서 예비 key는 다른
+   프로젝트의 key여야 효과가 있다. 쿨다운과 전환 규칙은 v10과 같은
+   `ai/gemini_credentials.ts`가 맡는다.
+3. 캡션 분석은 위 두 단계로도 실패하면 `PLACE_AI_FALLBACK_PROVIDER=openai`일 때
+   `OPENAI_MODEL`에 같은 지시와 스키마로 다시 묻는다(`source_fallback.ts`,
+   `source_openai.ts`). 폴백 조건은 v10과 같이 한도 초과, 시간 초과, 네트워크 오류,
+   서버 오류, 응답 형식 오류이고 인증 오류는 넘기지 않는다. OpenAI API는 영상 파일을
+   받지 않으므로 미디어 분석은 넘기지 않으며, URL Context가 없어 @멘션 프로필을 열어
+   보지 못한다.
+4. key 쿨다운, 예비 key 전환, 전체 key 소진, 인증 오류, 복구는
+   `DISCORD_GEMINI_ALERT_WEBHOOK_URL`로 v10과 같은 형식의 Discord 알림을 보낸다.
+
+실패 사유는 v10과 같이 인증 오류와 잘못된 요청을 `PROVIDER_CONFIG_MISSING`, 안전
+차단을 `GEMINI_PLACE_NOT_FOUND`, 나머지를 `UNKNOWN`으로 남긴다. 재시도와 폴백은
+분석에 성공한 결과를 바꾸지 않으므로 파이프라인 버전은 11을 유지한다.
 
 미디어 원본은 `/tmp`에 스트리밍으로 저장하며 파일당 100MiB, 전체 200MiB,
 최대 20개로 제한한다. 업로드는 최대 8MiB의 조각으로 나눠 Content-Length와
@@ -463,6 +488,8 @@ JSON 로그로 남긴다. 새 분석 경로는 기존 `ai_provider_*`,
 - [ ] 개발 프로젝트의 `gemini-quota-discord`는 배포만 유지하고 Discord secret·Monitoring 연결·시험 호출은 하지 않았는지 확인
 - [ ] 릴스 처리 Function secrets 등록 및 테스트 (개발 Discord secret 제외)
 - [ ] `GEMINI_API_KEY`, `GEMINI_MODEL`이 모두 등록됐는지 확인
+- [ ] 예비 key를 쓰면 `GEMINI_API_KEY_FALLBACKS`가 다른 Google 프로젝트의 key인지 확인
+- [ ] 캡션 OpenAI 폴백을 쓰면 `PLACE_AI_FALLBACK_PROVIDER=openai`, `OPENAI_API_KEY`, `OPENAI_MODEL` 확인
 - [ ] Gemini key/model 변경 후 캡션·미디어 분석과 URL Context 요청이 정상인지 확인
 - [ ] Kakao Local API 실제 후보의 `id`·`place_url` 확인
 - [ ] Anonymous sign-in 활성화
