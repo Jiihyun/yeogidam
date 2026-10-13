@@ -257,6 +257,8 @@ for (
     const keyConfig = failure === "overload-last-key" ? singleKey : config;
     const client = createSourceGeminiClient(keyConfig, {
       state: createGeminiApiKeyStateStore(),
+      // key마다 다시 올리는 Files API 경로를 검사하므로 인라인을 끈다.
+      inlineMediaMaxBytes: 0,
       download: async () => [{ path, size: 3, mimeType: "video/mp4" }],
       remove: async () => {
         await Deno.remove(path);

@@ -9,6 +9,7 @@ import {
   retryAfterMs,
 } from "./ai/gemini_credentials.ts";
 import { readBoundedErrorJson } from "./ai/http.ts";
+import { encodeBase64 } from "jsr:@std/encoding@1/base64";
 import type { AiLog } from "./ai/provider.ts";
 import type { AiOperation } from "./ai/types.ts";
 import {
@@ -29,6 +30,10 @@ const CAPTION_TIMEOUT_MS = 20_000;
 const MEDIA_TIMEOUT_MS = 120_000;
 const PROCESSING_TIMEOUT_MS = 120_000;
 const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
+// 원본 합계가 이 크기 이하면 Files API 대신 요청 본문에 base64로 싣는다. Gemini 인라인 한도는 요청 전체
+// 100MB 미만이고, base64로 3분의 1쯤 커진 본문이 Edge Function 메모리(256MB)에 올라가므로 여유를 둔다.
+// 길이가 아니라 크기로 가르므로 1분이 넘는 릴스도 이 크기 안이면 인라인으로 간다.
+const INLINE_MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 // 모델이 잠시 과부하(5xx)이거나 응답이 늦으면 같은 키로 다시 보낸다. 업로드는 다시 보내지 않는다.
 const TRANSIENT_RETRY_DELAYS_MS = [1_000, 3_000];
 const TRANSIENT_STATUSES = new Set([408, 500, 502, 503, 504]);
@@ -299,6 +304,24 @@ export function sourceGeminiFailure(
   return error;
 }
 
+function mediaRequestBody(caption: string, mediaParts: unknown[]) {
+  return {
+    systemInstruction: {
+      parts: [{ text: SOURCE_MEDIA_INSTRUCTION }],
+    },
+    contents: [{
+      role: "user",
+      parts: [{ text: sourceCaptionInput(caption) }, ...mediaParts],
+    }],
+    tools: [{ urlContext: {} }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseJsonSchema: SOURCE_HINTS_SCHEMA,
+      mediaResolution: "MEDIA_RESOLUTION_HIGH",
+    },
+  };
+}
+
 function captionOutput(payload: unknown): string {
   const response = object(payload);
   if (response.status !== "completed" || !Array.isArray(response.steps)) {
@@ -353,6 +376,7 @@ export interface SourceGeminiDependencies {
   now?: () => number;
   log?: AiLog;
   state?: GeminiApiKeyStateStore;
+  inlineMediaMaxBytes?: number;
 }
 
 interface UploadedFile {
@@ -374,6 +398,8 @@ export function createSourceGeminiClient(
   const sleep = dependencies.sleep ??
     ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = dependencies.now ?? Date.now;
+  const inlineMediaMaxBytes = dependencies.inlineMediaMaxBytes ??
+    INLINE_MEDIA_MAX_BYTES;
   const credentials = createGeminiCredentialPool(
     [config.apiKey, ...(config.fallbackApiKeys ?? [])],
     {
@@ -608,8 +634,22 @@ export function createSourceGeminiClient(
       const deadlineMs = now() + MEDIA_BUDGET_MS;
       const downloaded = await download(url, request);
       try {
-        // 올린 파일은 그 키의 구글 프로젝트에 묶이므로, 키를 바꾸면 같은 원본을 새 키로 다시 올린다.
-        // 다른 키로 다시 올릴 때만 남은 시간을 보고, 첫 시도는 예전과 같이 진행한다.
+        // 원본이 작으면 요청 본문에 실어 보내 업로드와 ACTIVE 대기, 삭제를 건너뛴다. 이때는 파일이
+        // key에 묶이지 않아 key를 바꿔도 다시 올리지 않는다. 크면 Files API로 올리고, 올린 파일은
+        // 그 key의 구글 프로젝트에 묶이므로 key를 바꾸면 같은 원본을 새 key로 다시 올린다.
+        const totalBytes = downloaded.reduce(
+          (sum, media) => sum + media.size,
+          0,
+        );
+        const inlineParts = totalBytes <= inlineMediaMaxBytes
+          ? await Promise.all(downloaded.map(async (media) => ({
+            inlineData: {
+              mimeType: media.mimeType,
+              data: encodeBase64(await Deno.readFile(media.path)),
+            },
+          })))
+          : null;
+        // 다른 key로 다시 보낼 때만 남은 시간을 보고, 첫 시도는 예전과 같이 진행한다.
         let keyAttempts = 0;
         return await credentials.run(
           operation,
@@ -621,12 +661,8 @@ export function createSourceGeminiClient(
                 retryable: true,
               });
             }
-            const uploaded: UploadedFile[] = [];
-            try {
-              for (const media of downloaded) {
-                uploaded.push(await upload(media, apiKey));
-              }
-              return await withTransientRetry(
+            const analyze = (mediaParts: unknown[]) =>
+              withTransientRetry(
                 operation,
                 deadlineMs,
                 MEDIA_TIMEOUT_MS,
@@ -643,29 +679,9 @@ export function createSourceGeminiClient(
                         ...headersFor(apiKey),
                         "Content-Type": "application/json",
                       },
-                      body: JSON.stringify({
-                        systemInstruction: {
-                          parts: [{ text: SOURCE_MEDIA_INSTRUCTION }],
-                        },
-                        contents: [{
-                          role: "user",
-                          parts: [
-                            { text: sourceCaptionInput(caption) },
-                            ...uploaded.map((file) => ({
-                              fileData: {
-                                fileUri: file.uri,
-                                mimeType: file.mimeType,
-                              },
-                            })),
-                          ],
-                        }],
-                        tools: [{ urlContext: {} }],
-                        generationConfig: {
-                          responseMimeType: "application/json",
-                          responseJsonSchema: SOURCE_HINTS_SCHEMA,
-                          mediaResolution: "MEDIA_RESOLUTION_HIGH",
-                        },
-                      }),
+                      body: JSON.stringify(
+                        mediaRequestBody(caption, mediaParts),
+                      ),
                     },
                     MEDIA_TIMEOUT_MS,
                   );
@@ -674,6 +690,16 @@ export function createSourceGeminiClient(
                   );
                 },
               );
+            if (inlineParts) return await analyze(inlineParts);
+
+            const uploaded: UploadedFile[] = [];
+            try {
+              for (const media of downloaded) {
+                uploaded.push(await upload(media, apiKey));
+              }
+              return await analyze(uploaded.map((file) => ({
+                fileData: { fileUri: file.uri, mimeType: file.mimeType },
+              })));
             } finally {
               for (const file of uploaded) await deleteFile(file.name, apiKey);
             }
