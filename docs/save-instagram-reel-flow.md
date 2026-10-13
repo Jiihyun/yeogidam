@@ -165,12 +165,13 @@ shortcode의 이미지·영상만 사용하며 캐러셀의 모든 항목을 원
 분석한다. 성공·실패 모두 업로드 파일 삭제와 로컬 파일 정리를 시도한다.
 캡션 요청 제한은 20초, 미디어 관련 HTTP 요청은 120초, 다운로드는 30초다.
 
-원본처럼 Gemini 모델 하나로 분석하되, 실패에 버티는 장치를 더했다. 일시적 오류는
-같은 key로 두 번 더 보내고, 429는 `GEMINI_API_KEY_FALLBACKS`의 다음 key로 넘기며,
-캡션 분석이 끝내 실패하면 설정된 경우 OpenAI로 다시 묻는다. 미디어 분석은 OpenAI가
-영상을 받지 않아 Gemini 안에서만 버틴다. 2차 후보 판단 모듈은 새 분석 경로에서
-호출하지 않는다. `GEMINI_API_KEY`, `GEMINI_MODEL`은 필수이고 기본 모델을 임의로
-지정하지 않는다. 자세한 규칙은 `deployment-and-operations.md`의 장소 분석 설정에 있다.
+원본처럼 Gemini 모델 하나로 분석하되, 실패에 버티는 장치를 더했다. 일시적 오류가 나면
+뒤에 key가 있을 때는 바로 다음 key로 넘기고(오류를 낸 key는 60초 동안 뒤로 미룸),
+마지막 key에서만 같은 key로 두 번 더 보낸다. 429는 `GEMINI_API_KEY_FALLBACKS`의 다음
+key로 넘긴다. 캡션 분석이 끝내 실패하면 설정된 경우 OpenAI로 다시 묻고, 미디어 분석은
+OpenAI가 영상을 받지 않아 Gemini 안에서만 버틴다. 2차 후보 판단 모듈은 새 분석
+경로에서 호출하지 않는다. `GEMINI_API_KEY`, `GEMINI_MODEL`은 필수이고 기본 모델을
+임의로 지정하지 않는다. 자세한 규칙은 `deployment-and-operations.md`의 장소 분석 설정에 있다.
 
 ## 5. Kakao 검색과 선택
 

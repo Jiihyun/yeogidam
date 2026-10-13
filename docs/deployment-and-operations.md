@@ -140,23 +140,28 @@ GET /functions/v1/app-update-policy?platform=ios&appVersion=1.0
 
 Gemini 호출이 실패하면 다음 순서로 버틴다.
 
-1. 500, 502, 503, 504, 408, 요청 시간 초과, 네트워크 오류는 같은 key로 1초, 3초 뒤에
-   두 번 더 보낸다. `Retry-After`가 오면 따르되 10초를 넘기지 않는다. 한 건이 Edge
-   Function 실행 한도(유료 400초)를 넘지 않도록 캡션은 75초, 미디어는 240초 안에서만
-   다시 보낸다. 파일 업로드는 다시 보내지 않는다.
-2. 429면 그 key를 쿨다운하고 `GEMINI_API_KEY_FALLBACKS`의 다음 key로 넘긴다. 미디어는
+1. 500, 502, 503, 504, 408, 요청 시간 초과, 네트워크 오류가 나면, 뒤에 쓸 key가 있을 때는
+   같은 key로 재시도하지 않고 바로 다음 key로 넘긴다. 오류를 낸 key는 60초 동안 다른 key보다
+   뒤로 미루고, 60초가 지나면 다시 먼저 쓴다. 무료 key를 앞에, 결제 key를 맨 뒤에 두면
+   무료 등급이 혼잡할 때만 결제 key가 요청을 받는다.
+2. 마지막 key에서는 같은 key로 1초, 3초 뒤에 두 번 더 보낸다. `Retry-After`가 오면 따르되
+   10초를 넘기지 않는다. 한 건이 Edge Function 실행 한도(유료 400초)를 넘지 않도록 캡션은
+   75초, 미디어는 240초 안에서만 다시 보낸다. 파일 업로드는 같은 key로 다시 보내지 않는다.
+3. 429면 그 key를 쿨다운하고 `GEMINI_API_KEY_FALLBACKS`의 다음 key로 넘긴다. 미디어는
    업로드한 파일이 key의 Google 프로젝트에 묶이므로 새 key로 다시 올리고, 앞 key의 파일은
    앞 key로 지운다. Gemini 한도는 API key가 아니라 프로젝트 단위라서 예비 key는 다른
    프로젝트의 key여야 효과가 있다. 쿨다운과 전환 규칙은 v10과 같은
    `ai/gemini_credentials.ts`가 맡는다.
-3. 캡션 분석은 위 두 단계로도 실패하면 `PLACE_AI_FALLBACK_PROVIDER=openai`일 때
+4. 캡션 분석은 위 단계로도 실패하면 `PLACE_AI_FALLBACK_PROVIDER=openai`일 때
    `OPENAI_MODEL`에 같은 지시와 스키마로 다시 묻는다(`source_fallback.ts`,
    `source_openai.ts`). 폴백 조건은 v10과 같이 한도 초과, 시간 초과, 네트워크 오류,
    서버 오류, 응답 형식 오류이고 인증 오류는 넘기지 않는다. OpenAI API는 영상 파일을
    받지 않으므로 미디어 분석은 넘기지 않으며, URL Context가 없어 @멘션 프로필을 열어
    보지 못한다.
-4. key 쿨다운, 예비 key 전환, 전체 key 소진, 인증 오류, 복구는
-   `DISCORD_GEMINI_ALERT_WEBHOOK_URL`로 v10과 같은 형식의 Discord 알림을 보낸다.
+5. key 쿨다운, 예비 key 전환, 전체 key 소진, 인증 오류, 복구는
+   `DISCORD_GEMINI_ALERT_WEBHOOK_URL`로 v10과 같은 형식의 Discord 알림을 보낸다. 일시적
+   오류로 다음 key를 쓰기 시작할 때와 그 key가 다시 성공할 때도 한 번씩 알린다. 회복되기
+   전까지는 같은 사건으로 묶여 같은 인스턴스에서 다시 울리지 않는다.
 
 실패 사유는 v10과 같이 인증 오류와 잘못된 요청을 `PROVIDER_CONFIG_MISSING`, 안전
 차단을 `GEMINI_PLACE_NOT_FOUND`, 나머지를 `UNKNOWN`으로 남긴다. 재시도와 폴백은

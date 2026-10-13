@@ -76,6 +76,12 @@ export interface GeminiCredentialAttempt {
   serviceIncidentId: number | null;
 }
 
+/** 일시적 오류(503 등)로 잠시 건너뛰는 key. 같은 사건은 복구될 때까지 같은 번호를 쓴다. */
+export interface GeminiOverloadState {
+  incidentId: number;
+  cooldownUntilMs: number;
+}
+
 export interface GeminiApiKeyStateStore {
   cooldowns: Map<string, GeminiApiKeyCooldownState>;
   unavailableServices: Map<string, GeminiServiceUnavailableState>;
@@ -83,6 +89,8 @@ export interface GeminiApiKeyStateStore {
   nextCooldownGeneration: number;
   nextServiceIncidentId: number;
   nextAuthIncidentId: number;
+  overloads: Map<string, GeminiOverloadState>;
+  nextOverloadIncidentId: number;
 }
 
 const sharedGeminiApiKeyState: GeminiApiKeyStateStore = {
@@ -92,6 +100,8 @@ const sharedGeminiApiKeyState: GeminiApiKeyStateStore = {
   nextCooldownGeneration: 1,
   nextServiceIncidentId: 1,
   nextAuthIncidentId: 1,
+  overloads: new Map(),
+  nextOverloadIncidentId: 1,
 };
 const ADAPTIVE_COOLDOWN_MS = [60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
 const LOS_ANGELES_DATE_TIME = new Intl.DateTimeFormat("en-GB", {
@@ -113,6 +123,8 @@ export function createGeminiApiKeyStateStore(): GeminiApiKeyStateStore {
     nextCooldownGeneration: 1,
     nextServiceIncidentId: 1,
     nextAuthIncidentId: 1,
+    overloads: new Map(),
+    nextOverloadIncidentId: 1,
   };
 }
 
@@ -465,10 +477,26 @@ export class GeminiHttpStatusError extends Error {
   }
 }
 
+/**
+ * 일시적 오류에서 key를 넘기는 규칙. 뒤에 쓸 key가 있으면 같은 key로 재시도하지 않고 바로 넘기고,
+ * 그 key는 cooldownMs 동안 다른 key보다 뒤로 미룬다. 넘기지 않으면 v10처럼 429에서만 key를 바꾼다.
+ */
+export interface GeminiOverloadPolicy {
+  cooldownMs: number;
+  isOverload(error: unknown): boolean;
+}
+
 export interface GeminiCredentialPoolDependencies {
   log?: AiLog;
   now?: () => number;
   state?: GeminiApiKeyStateStore;
+  overload?: GeminiOverloadPolicy;
+}
+
+/** call에 넘기는 시도 정보. 마지막 key일 때만 같은 key로 재시도하게 할 수 있다. */
+export interface GeminiCredentialCall {
+  credentialSlot: number;
+  isLastCredential: boolean;
 }
 
 export interface GeminiCredentialPool {
@@ -481,7 +509,7 @@ export interface GeminiCredentialPool {
   run<T>(
     operation: AiOperation,
     model: string,
-    call: (apiKey: string) => Promise<T>,
+    call: (apiKey: string, attempt: GeminiCredentialCall) => Promise<T>,
   ): Promise<T>;
 }
 
@@ -518,11 +546,25 @@ export function createGeminiCredentialPool(
     model: string,
     attemptedApiKeys: ReadonlySet<number>,
   ): GeminiCredentialAttempt | null {
+    return eligibleAttempt(model, attemptedApiKeys, true) ??
+      eligibleAttempt(model, attemptedApiKeys, false);
+  }
+
+  function eligibleAttempt(
+    model: string,
+    attemptedApiKeys: ReadonlySet<number>,
+    skipOverloaded: boolean,
+  ): GeminiCredentialAttempt | null {
     const startedAtMs = now();
     for (let apiKeyIndex = 0; apiKeyIndex < apiKeys.length; apiKeyIndex += 1) {
       if (attemptedApiKeys.has(apiKeyIndex)) continue;
       const cooldown = state.cooldowns.get(stateKey(apiKeyIndex, model));
       if (cooldown && cooldown.cooldownUntilMs > startedAtMs) continue;
+      if (
+        skipOverloaded &&
+        (state.overloads.get(stateKey(apiKeyIndex, model))?.cooldownUntilMs ??
+            0) > startedAtMs
+      ) continue;
 
       const fallbackTransitionGenerations = new Map<number, number>();
       for (
@@ -780,12 +822,66 @@ export function createGeminiCredentialPool(
     });
   }
 
+  function startOverloadCooldown(
+    operation: AiOperation,
+    model: string,
+    apiKeyIndex: number,
+    cause: unknown,
+    policy: GeminiOverloadPolicy,
+    attemptedApiKeys: ReadonlySet<number>,
+  ): void {
+    const overloadStateKey = stateKey(apiKeyIndex, model);
+    const existing = state.overloads.get(overloadStateKey);
+    const incidentId = existing?.incidentId ?? state.nextOverloadIncidentId++;
+    const cooldownUntilMs = now() + policy.cooldownMs;
+    state.overloads.set(overloadStateKey, { incidentId, cooldownUntilMs });
+    const next = nextEligibleAttempt(model, attemptedApiKeys);
+    dependencies.log?.("ai_gemini_api_key_overloaded", {
+      operation,
+      model,
+      credentialRole: credentialRole(apiKeyIndex),
+      credentialSlot: apiKeyIndex + 1,
+      ...(next
+        ? {
+          toCredentialRole: credentialRole(next.apiKeyIndex),
+          toCredentialSlot: next.apiKeyIndex + 1,
+        }
+        : {}),
+      credentialCount: apiKeys.length,
+      ...(cause instanceof GeminiHttpStatusError
+        ? { status: cause.status }
+        : {}),
+      incidentId,
+      cooldownMs: policy.cooldownMs,
+      retryAt: new Date(cooldownUntilMs).toISOString(),
+    });
+  }
+
+  function recordOverloadRecovery(
+    operation: AiOperation,
+    model: string,
+    apiKeyIndex: number,
+  ): void {
+    const overloadStateKey = stateKey(apiKeyIndex, model);
+    const overload = state.overloads.get(overloadStateKey);
+    if (!overload) return;
+    state.overloads.delete(overloadStateKey);
+    dependencies.log?.("ai_gemini_api_key_overload_recovered", {
+      operation,
+      model,
+      credentialRole: credentialRole(apiKeyIndex),
+      credentialSlot: apiKeyIndex + 1,
+      incidentId: overload.incidentId,
+      recoveredAt: new Date(now()).toISOString(),
+    });
+  }
+
   return {
     credentialCount: apiKeys.length,
     async run<T>(
       operation: AiOperation,
       model: string,
-      call: (apiKey: string) => Promise<T>,
+      call: (apiKey: string, attempt: GeminiCredentialCall) => Promise<T>,
     ): Promise<T> {
       const attemptedApiKeys = new Set<number>();
       let lastRateLimitError: AiProviderError | null = null;
@@ -807,10 +903,28 @@ export function createGeminiCredentialPool(
         attemptedApiKeys.add(apiKeyIndex);
         lastAttemptedApiKeyIndex = apiKeyIndex;
 
+        const isLastCredential =
+          nextEligibleAttempt(model, attemptedApiKeys) === null;
+
         let value: T;
         try {
-          value = await call(apiKeys[apiKeyIndex]);
+          value = await call(apiKeys[apiKeyIndex], {
+            credentialSlot: apiKeyIndex + 1,
+            isLastCredential,
+          });
         } catch (cause) {
+          const overload = dependencies.overload;
+          if (overload && !isLastCredential && overload.isOverload(cause)) {
+            startOverloadCooldown(
+              operation,
+              model,
+              apiKeyIndex,
+              cause,
+              overload,
+              attemptedApiKeys,
+            );
+            continue;
+          }
           if (!(cause instanceof GeminiHttpStatusError)) throw cause;
           const error = aiHttpError("gemini", operation, model, cause.status);
           if (cause.status === 401 || cause.status === 403) {
@@ -822,6 +936,7 @@ export function createGeminiCredentialPool(
           continue;
         }
         recordSuccessfulCredential(operation, model, attempt);
+        recordOverloadRecovery(operation, model, apiKeyIndex);
         return value;
       }
     },

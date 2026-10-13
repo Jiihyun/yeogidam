@@ -4,6 +4,7 @@ import { AiConfigError, aiHttpError, AiProviderError } from "./ai/errors.ts";
 import {
   createGeminiCredentialPool,
   type GeminiApiKeyStateStore,
+  type GeminiCredentialCall,
   GeminiHttpStatusError,
   retryAfterMs,
 } from "./ai/gemini_credentials.ts";
@@ -32,6 +33,9 @@ const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 const TRANSIENT_RETRY_DELAYS_MS = [1_000, 3_000];
 const TRANSIENT_STATUSES = new Set([408, 500, 502, 503, 504]);
 const MAX_RETRY_AFTER_MS = 10_000;
+// 뒤에 쓸 key가 있으면 일시적 오류에서 같은 key로 재시도하지 않고 바로 넘긴다. 무료 key의 혼잡(503)을
+// 결제 key가 받게 하려는 것이고, 오류를 낸 key는 60초 동안 뒤로 미룬 뒤 다시 먼저 쓴다.
+const OVERLOAD_COOLDOWN_MS = 60_000;
 // 한 건의 처리가 Edge Function 실행 한도(유료 400초)를 넘지 않도록 재시도와 키 전환에 쓸 시간을 묶는다.
 // 인스타 읽기 30초, 캡션 75초, OpenAI 폴백 20초, 미디어 240초를 더해도 400초 안에 든다.
 const CAPTION_BUDGET_MS = 75_000;
@@ -246,6 +250,13 @@ function isRequestTimeout(error: unknown): boolean {
       error.message === "source_gemini_file_processing_timeout");
 }
 
+function isTransientFailure(error: unknown): boolean {
+  if (error instanceof GeminiHttpStatusError) {
+    return TRANSIENT_STATUSES.has(error.status);
+  }
+  return error instanceof TypeError || isRequestTimeout(error);
+}
+
 /**
  * 분석 실패를 공급자 오류 종류로 바꿔, 폴백 판단과 로그가 v10과 같은 기준을 쓰게 한다.
  * 인스타그램 원본을 받지 못한 오류처럼 Gemini와 무관한 오류는 그대로 둔다.
@@ -365,24 +376,36 @@ export function createSourceGeminiClient(
   const now = dependencies.now ?? Date.now;
   const credentials = createGeminiCredentialPool(
     [config.apiKey, ...(config.fallbackApiKeys ?? [])],
-    { log: dependencies.log, now, state: dependencies.state },
+    {
+      log: dependencies.log,
+      now,
+      state: dependencies.state,
+      overload: {
+        cooldownMs: OVERLOAD_COOLDOWN_MS,
+        isOverload: isTransientFailure,
+      },
+    },
   );
 
   function headersFor(apiKey: string): Record<string, string> {
     return { "x-goog-api-key": apiKey };
   }
 
-  function transientRetryDelay(error: unknown, retry: number): number | null {
-    if (retry >= TRANSIENT_RETRY_DELAYS_MS.length) return null;
+  function transientRetryDelay(
+    error: unknown,
+    retry: number,
+    maxRetries: number,
+  ): number | null {
+    if (retry >= maxRetries || !isTransientFailure(error)) return null;
     const delayMs = TRANSIENT_RETRY_DELAYS_MS[retry];
-    if (error instanceof GeminiHttpStatusError) {
-      if (!TRANSIENT_STATUSES.has(error.status)) return null;
-      const hintedMs = retryAfterMs(error.response, now()) ?? 0;
-      return Math.min(Math.max(delayMs, hintedMs), MAX_RETRY_AFTER_MS);
-    }
-    return error instanceof TypeError || isRequestTimeout(error)
-      ? delayMs
-      : null;
+    if (!(error instanceof GeminiHttpStatusError)) return delayMs;
+    const hintedMs = retryAfterMs(error.response, now()) ?? 0;
+    return Math.min(Math.max(delayMs, hintedMs), MAX_RETRY_AFTER_MS);
+  }
+
+  // 마지막 key일 때만 같은 key로 재시도한다. 뒤에 key가 있으면 키 관리가 바로 다음 key로 넘긴다.
+  function retriesFor(attempt: GeminiCredentialCall): number {
+    return attempt.isLastCredential ? TRANSIENT_RETRY_DELAYS_MS.length : 0;
   }
 
   // 같은 키로 다시 보낼 오류이고 남은 시간 안에 한 번 더 기다릴 수 있을 때만 다시 보낸다.
@@ -390,13 +413,14 @@ export function createSourceGeminiClient(
     operation: AiOperation,
     deadlineMs: number,
     requestTimeoutMs: number,
+    maxRetries: number,
     call: () => Promise<T>,
   ): Promise<T> {
     for (let retry = 0;; retry++) {
       try {
         return await call();
       } catch (error) {
-        const delayMs = transientRetryDelay(error, retry);
+        const delayMs = transientRetryDelay(error, retry, maxRetries);
         if (
           delayMs === null || now() + delayMs + requestTimeoutMs > deadlineMs
         ) throw error;
@@ -534,11 +558,12 @@ export function createSourceGeminiClient(
         return await credentials.run(
           operation,
           config.model,
-          (apiKey) =>
+          (apiKey, attempt) =>
             withTransientRetry(
               operation,
               deadlineMs,
               CAPTION_TIMEOUT_MS,
+              retriesFor(attempt),
               async () => {
                 const payload = await geminiJson(
                   request,
@@ -589,7 +614,7 @@ export function createSourceGeminiClient(
         return await credentials.run(
           operation,
           config.model,
-          async (apiKey) => {
+          async (apiKey, attempt) => {
             if (keyAttempts++ > 0 && now() + MEDIA_TIMEOUT_MS > deadlineMs) {
               throw new AiProviderError("gemini", operation, "TIMEOUT", {
                 model: config.model,
@@ -605,6 +630,7 @@ export function createSourceGeminiClient(
                 operation,
                 deadlineMs,
                 MEDIA_TIMEOUT_MS,
+                retriesFor(attempt),
                 async () => {
                   const payload = await geminiJson(
                     request,
