@@ -82,6 +82,12 @@ export interface GeminiOverloadState {
   cooldownUntilMs: number;
 }
 
+/** 선불 잔액이 떨어져 잠시 건너뛰는 key. 같은 사건은 다시 성공할 때까지 같은 번호를 쓴다. */
+export interface GeminiBillingState {
+  incidentId: number;
+  cooldownUntilMs: number;
+}
+
 export interface GeminiApiKeyStateStore {
   cooldowns: Map<string, GeminiApiKeyCooldownState>;
   unavailableServices: Map<string, GeminiServiceUnavailableState>;
@@ -91,6 +97,8 @@ export interface GeminiApiKeyStateStore {
   nextAuthIncidentId: number;
   overloads: Map<string, GeminiOverloadState>;
   nextOverloadIncidentId: number;
+  billingDepleted: Map<string, GeminiBillingState>;
+  nextBillingIncidentId: number;
 }
 
 const sharedGeminiApiKeyState: GeminiApiKeyStateStore = {
@@ -102,8 +110,12 @@ const sharedGeminiApiKeyState: GeminiApiKeyStateStore = {
   nextAuthIncidentId: 1,
   overloads: new Map(),
   nextOverloadIncidentId: 1,
+  billingDepleted: new Map(),
+  nextBillingIncidentId: 1,
 };
 const ADAPTIVE_COOLDOWN_MS = [60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
+// 선불 잔액이 떨어진 key는 충전될 때까지 실패하므로 이 시간 동안 부르지 않고, 지나면 한 번 다시 써 본다.
+const BILLING_COOLDOWN_MS = 10 * 60_000;
 const LOS_ANGELES_DATE_TIME = new Intl.DateTimeFormat("en-GB", {
   timeZone: "America/Los_Angeles",
   year: "numeric",
@@ -125,6 +137,8 @@ export function createGeminiApiKeyStateStore(): GeminiApiKeyStateStore {
     nextAuthIncidentId: 1,
     overloads: new Map(),
     nextOverloadIncidentId: 1,
+    billingDepleted: new Map(),
+    nextBillingIncidentId: 1,
   };
 }
 
@@ -182,6 +196,15 @@ function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+// 선불 잔액이 떨어지면 Gemini는 402를 주고, 같은 문구를 담은 429를 준 사례도 있다.
+function isBillingDepleted(failure: GeminiHttpStatusError): boolean {
+  if (failure.status === 402) return true;
+  if (failure.status !== 429) return false;
+  const message = record(record(failure.payload)?.error)?.message;
+  return typeof message === "string" &&
+    /prepayment credits are depleted/i.test(message);
 }
 
 interface GeminiRateLimitMetadata {
@@ -504,7 +527,8 @@ export interface GeminiCredentialPool {
   /**
    * 쓸 수 있는 키를 순서대로 골라 call을 실행한다. call이 429를 GeminiHttpStatusError로
    * 알리면 그 키를 쿨다운하고 다음 키로 다시 부르며, 401과 403은 인증 사고로 기록하고
-   * 그대로 실패시킨다. 그 밖의 오류는 키를 바꾸지 않고 그대로 던진다.
+   * 그대로 실패시킨다. 402나 선불 잔액 소진 문구의 429는 그 키를 잠시 건너뛰고 다음 키로
+   * 부른다. 그 밖의 오류는 키를 바꾸지 않고 그대로 던진다.
    */
   run<T>(
     operation: AiOperation,
@@ -560,6 +584,10 @@ export function createGeminiCredentialPool(
       if (attemptedApiKeys.has(apiKeyIndex)) continue;
       const cooldown = state.cooldowns.get(stateKey(apiKeyIndex, model));
       if (cooldown && cooldown.cooldownUntilMs > startedAtMs) continue;
+      if (
+        (state.billingDepleted.get(stateKey(apiKeyIndex, model))
+          ?.cooldownUntilMs ?? 0) > startedAtMs
+      ) continue;
       if (
         skipOverloaded &&
         (state.overloads.get(stateKey(apiKeyIndex, model))?.cooldownUntilMs ??
@@ -857,6 +885,57 @@ export function createGeminiCredentialPool(
     });
   }
 
+  function startBillingCooldown(
+    operation: AiOperation,
+    model: string,
+    apiKeyIndex: number,
+    status: number,
+    attemptedApiKeys: ReadonlySet<number>,
+  ): void {
+    const billingStateKey = stateKey(apiKeyIndex, model);
+    const existing = state.billingDepleted.get(billingStateKey);
+    const incidentId = existing?.incidentId ?? state.nextBillingIncidentId++;
+    const cooldownUntilMs = now() + BILLING_COOLDOWN_MS;
+    state.billingDepleted.set(billingStateKey, { incidentId, cooldownUntilMs });
+    const next = nextEligibleAttempt(model, attemptedApiKeys);
+    dependencies.log?.("ai_gemini_api_key_billing_depleted", {
+      operation,
+      model,
+      credentialRole: credentialRole(apiKeyIndex),
+      credentialSlot: apiKeyIndex + 1,
+      ...(next
+        ? {
+          toCredentialRole: credentialRole(next.apiKeyIndex),
+          toCredentialSlot: next.apiKeyIndex + 1,
+        }
+        : {}),
+      credentialCount: apiKeys.length,
+      status,
+      incidentId,
+      cooldownMs: BILLING_COOLDOWN_MS,
+      retryAt: new Date(cooldownUntilMs).toISOString(),
+    });
+  }
+
+  function recordBillingRecovery(
+    operation: AiOperation,
+    model: string,
+    apiKeyIndex: number,
+  ): void {
+    const billingStateKey = stateKey(apiKeyIndex, model);
+    const billing = state.billingDepleted.get(billingStateKey);
+    if (!billing) return;
+    state.billingDepleted.delete(billingStateKey);
+    dependencies.log?.("ai_gemini_api_key_billing_recovered", {
+      operation,
+      model,
+      credentialRole: credentialRole(apiKeyIndex),
+      credentialSlot: apiKeyIndex + 1,
+      incidentId: billing.incidentId,
+      recoveredAt: new Date(now()).toISOString(),
+    });
+  }
+
   function recordOverloadRecovery(
     operation: AiOperation,
     model: string,
@@ -926,6 +1005,22 @@ export function createGeminiCredentialPool(
             continue;
           }
           if (!(cause instanceof GeminiHttpStatusError)) throw cause;
+          if (isBillingDepleted(cause)) {
+            lastRateLimitError = new AiProviderError(
+              "gemini",
+              operation,
+              "QUOTA_EXCEEDED",
+              { status: cause.status, model, retryable: true },
+            );
+            startBillingCooldown(
+              operation,
+              model,
+              apiKeyIndex,
+              cause.status,
+              attemptedApiKeys,
+            );
+            continue;
+          }
           const error = aiHttpError("gemini", operation, model, cause.status);
           if (cause.status === 401 || cause.status === 403) {
             recordAuthFailure(operation, model, apiKeyIndex, cause.status);
@@ -937,6 +1032,7 @@ export function createGeminiCredentialPool(
         }
         recordSuccessfulCredential(operation, model, attempt);
         recordOverloadRecovery(operation, model, apiKeyIndex);
+        recordBillingRecovery(operation, model, apiKeyIndex);
         return value;
       }
     },

@@ -66,6 +66,27 @@ function keyOf(init?: RequestInit): string {
   return new Headers(init?.headers).get("x-goog-api-key") ?? "";
 }
 
+// 이벤트를 차례로 디스코드 알림에 넘겨, 실제로 보낸 알림 제목만 모은다.
+async function postedTitles(
+  events: { event: string; details: Record<string, unknown> }[],
+): Promise<string[]> {
+  const posted: string[] = [];
+  const dedupe = createInMemoryRuntimeAlertDedupe();
+  const transitionQueue = createInMemoryRuntimeAlertTransitionQueue();
+  for (const { event, details } of events) {
+    await sendGeminiRuntimeDiscordAlert(event, details, {
+      webhookUrl: "https://discord.com/api/webhooks/test/token",
+      dedupe,
+      transitionQueue,
+      fetch: async (_url, init) => {
+        posted.push(JSON.parse(String(init?.body)).embeds[0].title);
+        return new Response(null, { status: 204 });
+      },
+    });
+  }
+  return posted;
+}
+
 const RPM_QUOTA_BODY = {
   error: {
     code: 429,
@@ -416,21 +437,7 @@ Deno.test("과부하가 이어져도 회복 전까지 같은 사건이라 디스
   equal(overloads.length, 2);
   equal(overloads[0].details.incidentId, overloads[1].details.incidentId);
 
-  const posted: string[] = [];
-  const dedupe = createInMemoryRuntimeAlertDedupe();
-  const transitionQueue = createInMemoryRuntimeAlertTransitionQueue();
-  for (const { event, details } of events) {
-    await sendGeminiRuntimeDiscordAlert(event, details, {
-      webhookUrl: "https://discord.com/api/webhooks/test/token",
-      dedupe,
-      transitionQueue,
-      fetch: async (_url, init) => {
-        posted.push(JSON.parse(String(init?.body)).embeds[0].title);
-        return new Response(null, { status: 204 });
-      },
-    });
-  }
-  equal(posted, [
+  equal(await postedTitles(events), [
     "[WARN] Gemini key 1 과부하 → key 2",
     "[RECOVERED] Gemini key 1 과부하 해소",
   ]);
@@ -461,22 +468,74 @@ Deno.test("앞 key가 429면 뒤 key로 넘기고 디스코드에 전환과 복�
   // 쿨다운 동안은 앞 key를 건너뛰고, 쿨다운이 끝나면 다시 앞 key를 먼저 쓴다.
   equal(keys, ["primary", "fallback", "fallback", "primary"]);
 
-  const posted: string[] = [];
-  const dedupe = createInMemoryRuntimeAlertDedupe();
-  const transitionQueue = createInMemoryRuntimeAlertTransitionQueue();
-  for (const { event, details } of events) {
-    await sendGeminiRuntimeDiscordAlert(event, details, {
-      webhookUrl: "https://discord.com/api/webhooks/test/token",
-      dedupe,
-      transitionQueue,
-      fetch: async (_url, init) => {
-        posted.push(JSON.parse(String(init?.body)).embeds[0].title);
-        return new Response(null, { status: 204 });
-      },
-    });
-  }
-  equal(posted, [
+  equal(await postedTitles(events), [
     "[WARN] Gemini Primary → Fallback 전환",
     "[RECOVERED] Gemini Fallback → Primary 복귀",
+  ]);
+});
+
+Deno.test("결제 key가 402면 10분 동안 건너뛰고 디스코드에 소진과 복구를 한 번씩 알린다", async () => {
+  let clock = 0;
+  let funded = false;
+  const keys: string[] = [];
+  const events: { event: string; details: Record<string, unknown> }[] = [];
+  const client = createSourceGeminiClient(config, {
+    state: createGeminiApiKeyStateStore(),
+    now: () => clock,
+    sleep: async () => {},
+    log: (event, details) => events.push({ event, details }),
+    fetch: async (_url, init) => {
+      keys.push(keyOf(init));
+      if (keyOf(init) === "primary") return response(RPM_QUOTA_BODY, 429);
+      return funded ? captionResponse() : response({}, 402);
+    },
+  });
+  const depleted = await rejection(client.extractCaption("카페"));
+  equal(
+    depleted instanceof AiProviderError && [depleted.kind, depleted.status],
+    ["QUOTA_EXCEEDED", 402],
+  );
+  // 잔액이 떨어진 key는 10분 동안 부르지 않는다.
+  clock = 5 * 60_000;
+  await rejection(client.extractCaption("카페"));
+  equal(keys, ["primary", "fallback", "primary"]);
+
+  clock = 10 * 60_000 + 1;
+  funded = true;
+  equal(await client.extractCaption("카페"), [hint]);
+  equal(keys, ["primary", "fallback", "primary", "primary", "fallback"]);
+  equal(await postedTitles(events), [
+    "[CRITICAL] Gemini Fallback 결제 잔액 소진",
+    "[WARN] Gemini Primary → Fallback 전환",
+    "[RECOVERED] Gemini Fallback 결제 잔액 복구",
+  ]);
+});
+
+Deno.test("선불 잔액 소진 문구가 담긴 429도 결제 잔액 소진으로 본다", async () => {
+  const events: { event: string; details: Record<string, unknown> }[] = [];
+  const client = createSourceGeminiClient(singleKey, {
+    state: createGeminiApiKeyStateStore(),
+    sleep: async () => {},
+    log: (event, details) => events.push({ event, details }),
+    fetch: async () =>
+      response({
+        error: {
+          code: 429,
+          message: "Your prepayment credits are depleted.",
+          status: "RESOURCE_EXHAUSTED",
+        },
+      }, 429),
+  });
+  const error = await rejection(client.extractCaption("카페"));
+  equal(error instanceof AiProviderError && error.kind, "QUOTA_EXCEEDED");
+  equal(events.map((item) => item.event), [
+    "ai_gemini_api_key_billing_depleted",
+  ]);
+  equal(
+    [events[0].details.credentialRole, events[0].details.status],
+    ["Primary", 429],
+  );
+  equal(await postedTitles(events), [
+    "[CRITICAL] Gemini Primary 결제 잔액 소진",
   ]);
 });

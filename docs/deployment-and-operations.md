@@ -154,7 +154,10 @@ Gemini 호출이 실패하면 다음 순서로 버틴다.
    프로젝트의 key여야 효과가 있다. 무료 key를 `GEMINI_API_KEY`에, 결제 key를
    `GEMINI_API_KEY_FALLBACKS`에 두면 무료 한도에 걸린 동안에만 결제 key가 요청을 받는다.
    쿨다운과 전환 규칙은 v10과 같은 `ai/gemini_credentials.ts`가 맡는다.
-4. key 쿨다운, 예비 key 전환, 전체 key 소진, 인증 오류, 복구는
+4. 결제 key의 선불 잔액이 떨어지면 Gemini는 402를 돌려주고, 같은 문구(`prepayment credits
+   are depleted`)를 담은 429를 준 사례도 있다. 이때는 그 key를 결제 잔액 소진으로 보고
+   10분 동안 부르지 않으며, 10분이 지나면 한 번 다시 써 본다.
+5. key 쿨다운, 예비 key 전환, 전체 key 소진, 인증 오류, 결제 잔액 소진, 복구는
    `DISCORD_GEMINI_ALERT_WEBHOOK_URL`로 v10과 같은 형식의 Discord 알림을 보낸다. 일시적
    오류로 다음 key를 쓰기 시작할 때와 그 key가 다시 성공할 때도 한 번씩 알린다. 회복되기
    전까지는 같은 사건으로 묶여 같은 인스턴스에서 다시 울리지 않는다.

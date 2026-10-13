@@ -13,7 +13,9 @@ export type GeminiRuntimeAlertKind =
   | "API_KEYS_UNAVAILABLE"
   | "AUTH_FAILED"
   | "KEY_OVERLOAD_FALLBACK"
-  | "KEY_OVERLOAD_RECOVERED";
+  | "KEY_OVERLOAD_RECOVERED"
+  | "KEY_BILLING_DEPLETED"
+  | "KEY_BILLING_RECOVERED";
 
 export interface RuntimeAlertDedupeStore {
   /** Atomically reserves a transition. False means it was already reserved. */
@@ -679,6 +681,59 @@ function overloadRecoveredAlert(details: JsonRecord): RuntimeAlert | null {
   };
 }
 
+// key의 선불 잔액이 떨어져 Gemini가 402를 줄 때 한 번 알린다. 다시 성공하기 전까지는 같은 사건이다.
+function billingDepletedAlert(details: JsonRecord): RuntimeAlert | null {
+  const slot = credentialSlot(details, ["credentialSlot"]);
+  const role = normalizedRole(details.credentialRole, slot);
+  if (slot === null || role === null) return null;
+  const status = finiteNumber(details.status);
+  const scope = modelScope(details);
+  const identity = incidentIdentity(details) ?? "active";
+  return {
+    severity: "CRITICAL",
+    kind: "KEY_BILLING_DEPLETED",
+    title: `[CRITICAL] Gemini ${role} 결제 잔액 소진`,
+    description:
+      `${role} key has no prepaid credits left. Top up credits on the AI Studio Billing page.`,
+    fields: [
+      { name: "Severity", value: "CRITICAL", inline: true },
+      { name: "Key", value: `${role} (key ${slot})`, inline: true },
+      ...(status === null
+        ? []
+        : [{ name: "HTTP status", value: String(status), inline: true }]),
+      ...commonFields(details),
+    ],
+    dedupeKey: `open:${scope}:billing:${slot}:${identity}`,
+    scope,
+  };
+}
+
+function billingRecoveredAlert(details: JsonRecord): RuntimeAlert | null {
+  const slot = credentialSlot(details, ["credentialSlot"]);
+  const role = normalizedRole(details.credentialRole, slot);
+  if (slot === null || role === null) return null;
+  const scope = modelScope(details);
+  const identity = incidentIdentity(details) ?? "active";
+  return {
+    severity: "RECOVERED",
+    kind: "KEY_BILLING_RECOVERED",
+    title: `[RECOVERED] Gemini ${role} 결제 잔액 복구`,
+    description:
+      `${role} key answered successfully again after its credits ran out.`,
+    fields: [
+      { name: "Severity", value: "RECOVERED", inline: true },
+      {
+        name: "Recovered target",
+        value: `${role} (key ${slot})`,
+        inline: true,
+      },
+      ...commonFields(details),
+    ],
+    dedupeKey: `recovered:${scope}:billing:${slot}:${identity}`,
+    scope,
+  };
+}
+
 function alertForEvent(
   event: string,
   rawDetails: Record<string, unknown>,
@@ -698,6 +753,12 @@ function alertForEvent(
   if (event === "ai_gemini_api_key_overloaded") return overloadAlert(details);
   if (event === "ai_gemini_api_key_overload_recovered") {
     return overloadRecoveredAlert(details);
+  }
+  if (event === "ai_gemini_api_key_billing_depleted") {
+    return billingDepletedAlert(details);
+  }
+  if (event === "ai_gemini_api_key_billing_recovered") {
+    return billingRecoveredAlert(details);
   }
   if (
     event === "ai_gemini_primary_recovered" ||
