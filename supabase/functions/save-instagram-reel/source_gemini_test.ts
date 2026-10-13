@@ -135,6 +135,8 @@ for (
     let polls = 0;
     let body: Record<string, unknown> | undefined;
     const client = createSourceGeminiClient(config, {
+      // Files API 경로(업로드, 처리 대기, 삭제)를 검사하므로 인라인을 끈다.
+      inlineMediaMaxBytes: 0,
       download: async () => {
         for (let index = 0; index < 2; index++) {
           const path = await Deno.makeTempFile({
@@ -275,6 +277,7 @@ Deno.test("파일 처리 대기 시간이 초과되면 Gemini 파일과 로컬 �
   let deleted = false;
   let removed = false;
   const client = createSourceGeminiClient(config, {
+    inlineMediaMaxBytes: 0,
     download: async () => [{ path, size: 1, mimeType: "video/mp4" }],
     remove: async () => {
       await Deno.remove(path);
