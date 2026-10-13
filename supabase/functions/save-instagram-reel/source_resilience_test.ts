@@ -449,8 +449,8 @@ Deno.test("과부하가 이어져도 회복 전까지 같은 사건이라 디스
   equal(overloads[0].details.incidentId, overloads[1].details.incidentId);
 
   equal(await postedTitles(events), [
-    "[WARN] Gemini key 1 과부하 → key 2",
-    "[RECOVERED] Gemini key 1 과부하 해소",
+    "[WARN] Gemini Primary 과부하 → Fallback",
+    "[RECOVERED] Gemini Primary 과부하 해소",
   ]);
 });
 
