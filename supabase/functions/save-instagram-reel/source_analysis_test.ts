@@ -296,3 +296,78 @@ Deno.test("카카오 공급자 오류는 검색 결과 없음이나 부분 성�
   }
   equal(caught === failure, true);
 });
+
+const anchor = { latitude: 37.54, longitude: 127.05 };
+
+Deno.test("캡션 주소가 있으면 그 반경 안에서만 찾고, 없으면 다른 지점을 붙이지 않는다", async () => {
+  const searches: string[] = [];
+  const result = await analyzeInstagramPlaces(input, {
+    extractCaption: async () => [
+      hint("카페", {
+        locationHints: [{
+          type: "ADDRESS",
+          value: "서울 성동구 성수이로 7",
+          basis: "CAPTION",
+        }],
+      }),
+    ],
+    extractMedia: async () => [],
+    geocode: async () => anchor,
+    search: async (query, near) => {
+      searches.push(`${query}${near ? " (근처)" : ""}`);
+      return near ? [] : [place("다른 지점")];
+    },
+  });
+  equal(searches, ["카페 (근처)"]);
+  equal(result.matches, []);
+  equal(result.failureReason, "KAKAO_PLACE_NOT_FOUND");
+});
+
+for (const basis of ["VIDEO", "IMAGE", "INFERRED"] as const) {
+  Deno.test(`${basis} 주소는 근처를 먼저 찾고, 없으면 지역과 이름으로 다시 찾는다`, async () => {
+    const searches: string[] = [];
+    const result = await analyzeInstagramPlaces(input, {
+      extractCaption: async () => [
+        hint("카페", {
+          locationHints: [{
+            type: "ADDRESS",
+            value: "서울 성동구 성수동1가 1",
+            basis,
+          }],
+        }),
+      ],
+      extractMedia: async () => [],
+      geocode: async () => anchor,
+      search: async (query, near) => {
+        searches.push(`${query}${near ? " (근처)" : ""}`);
+        return near ? [] : [place("100")];
+      },
+    });
+    // 주소에서 지역을 뽑는 규칙은 그대로라 "성수동1가"가 아니라 구를 붙인다.
+    equal(searches, ["카페 (근처)", "카페 성동구"]);
+    equal(result.matches.map((match) => match.place.kakaoPlaceId), ["100"]);
+  });
+}
+
+Deno.test("근처에서 찾으면 지역과 이름으로 다시 찾지 않는다", async () => {
+  const searches: string[] = [];
+  const result = await analyzeInstagramPlaces(input, {
+    extractCaption: async () => [
+      hint("카페", {
+        locationHints: [{
+          type: "ADDRESS",
+          value: "서울 성동구 성수동1가 1",
+          basis: "INFERRED",
+        }],
+      }),
+    ],
+    extractMedia: async () => [],
+    geocode: async () => anchor,
+    search: async (query, near) => {
+      searches.push(`${query}${near ? " (근처)" : ""}`);
+      return [place("100")];
+    },
+  });
+  equal(searches, ["카페 (근처)"]);
+  equal(result.matches.map((match) => match.place.kakaoPlaceId), ["100"]);
+});

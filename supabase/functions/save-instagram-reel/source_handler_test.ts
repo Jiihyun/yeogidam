@@ -104,7 +104,7 @@ for (const mode of [AUTO_SAVE, REVIEW_QUEUE]) {
           equal(body?.p_client_request_id, ids.request);
           equal(body?.p_source, "url_input");
           equal(body?.p_save_mode, mode);
-          equal(body?.p_pipeline_version, 11);
+          equal(body?.p_pipeline_version, 12);
           return Response.json({
             reel_id: ids.reel,
             worker_reel_id: scenario === "cache" ? null : ids.worker,
@@ -215,6 +215,10 @@ for (const mode of [AUTO_SAVE, REVIEW_QUEUE]) {
           });
         }
         if (url.hostname === "dapi.kakao.com") {
+          // 주소 좌표를 못 찾게 해서 지역과 이름 검색 흐름을 그대로 검사한다.
+          if (url.pathname.endsWith("/address.json")) {
+            return Response.json({ documents: [] });
+          }
           searchCalls++;
           if (
             scenario === "empty" ||
@@ -232,6 +236,7 @@ for (const mode of [AUTO_SAVE, REVIEW_QUEUE]) {
                 address_name: "서울 성동구 성수동1가 1",
                 x: "127",
                 y: "37.5",
+                category_name: "음식점 > 카페",
               },
               {
                 id: "200",
@@ -239,6 +244,7 @@ for (const mode of [AUTO_SAVE, REVIEW_QUEUE]) {
                 address_name: "서울 마포구 연남동 1",
                 x: "127",
                 y: "37.5",
+                category_name: "음식점 > 카페",
               },
             ],
           });
