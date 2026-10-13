@@ -2,6 +2,7 @@
 import type { PlaceGuess } from "./ai/types.ts";
 import type { KakaoPlace } from "./kakao.ts";
 import type { PlaceMatchFailure } from "./match_failure.ts";
+import type { Coordinate } from "./source_kakao.ts";
 
 export type LocationBasis = "CAPTION" | "INFERRED" | "VIDEO" | "IMAGE";
 
@@ -26,6 +27,9 @@ const ADDRESS_BASES: LocationBasis[] = [
   "INFERRED",
 ];
 const REGION_BASES: LocationBasis[] = ["VIDEO", "IMAGE", "INFERRED", "CAPTION"];
+// 캡션에 적힌 주소만 사실로 보고 그 근처만 믿는다. 영상, 이미지에서 읽은 주소와 추론 주소는 잘못 읽었을 수 있어서
+// (골든셋 C005에서 영상 속 동네를 다른 구의 같은 이름 동으로 읽었다) 근처를 먼저 찾되 없으면 지역과 이름으로 다시 찾는다.
+const SOFT_ADDRESS_BASES: LocationBasis[] = ["VIDEO", "IMAGE", "INFERRED"];
 
 function normalize(value: string): string {
   return value.normalize("NFKC").toLowerCase().replace(
@@ -67,8 +71,12 @@ function searchRegion(hint: SourcePlaceHint): string | null {
   return null;
 }
 
+function searchName(hint: SourcePlaceHint): string {
+  return (hint.nameSearchHint ?? hint.nameInCaption).trim();
+}
+
 export function buildSourceSearchQueries(hint: SourcePlaceHint): string[] {
-  const name = (hint.nameSearchHint ?? hint.nameInCaption).trim();
+  const name = searchName(hint);
   const region = searchRegion(hint);
   if (!region || normalize(name).includes(normalize(region))) return [name];
   return [...new Set([`${name} ${region}`, name])];
@@ -96,8 +104,74 @@ export interface SourceAnalysisDependencies {
     caption: string,
     instagramUrl: string,
   ): Promise<SourcePlaceHint[]>;
-  search(query: string): Promise<KakaoPlace[]>;
+  search(query: string, anchor?: Coordinate): Promise<KakaoPlace[]>;
+  // 없으면 주소 반경 검색을 건너뛰고 지역과 이름으로만 찾는다.
+  geocode?(address: string): Promise<Coordinate | null>;
   log?(event: string, details: Record<string, unknown>): void;
+}
+
+async function anchorFor(
+  hint: SourcePlaceHint,
+  bases: LocationBasis[],
+  dependencies: SourceAnalysisDependencies,
+): Promise<Coordinate | null> {
+  if (!dependencies.geocode) return null;
+  for (const basis of bases) {
+    for (const location of hint.locationHints) {
+      if (location.type !== "ADDRESS" || location.basis !== basis) continue;
+      const coordinate = await dependencies.geocode(location.value);
+      if (coordinate) return coordinate;
+    }
+  }
+  return null;
+}
+
+async function firstSearchResult(
+  query: string,
+  guessIndex: number,
+  dependencies: SourceAnalysisDependencies,
+  anchor?: Coordinate,
+): Promise<KakaoPlace | undefined> {
+  const places = await dependencies.search(query, anchor);
+  dependencies.log?.("source_kakao_search", {
+    guessIndex,
+    query,
+    ...(anchor ? { nearby: true } : {}),
+    candidateCount: places.length,
+  });
+  return places[0];
+}
+
+async function selectSourcePlace(
+  hint: SourcePlaceHint,
+  guessIndex: number,
+  dependencies: SourceAnalysisDependencies,
+): Promise<KakaoPlace | undefined> {
+  const captionAnchor = await anchorFor(hint, ["CAPTION"], dependencies);
+  if (captionAnchor) {
+    // 근처에 없는 가게를 지역이나 이름만으로 다시 찾으면 다른 지점이 붙으므로 여기서 끝낸다.
+    return await firstSearchResult(
+      searchName(hint),
+      guessIndex,
+      dependencies,
+      captionAnchor,
+    );
+  }
+  const softAnchor = await anchorFor(hint, SOFT_ADDRESS_BASES, dependencies);
+  if (softAnchor) {
+    const nearby = await firstSearchResult(
+      searchName(hint),
+      guessIndex,
+      dependencies,
+      softAnchor,
+    );
+    if (nearby) return nearby;
+  }
+  for (const query of buildSourceSearchQueries(hint)) {
+    const found = await firstSearchResult(query, guessIndex, dependencies);
+    if (found) return found;
+  }
+  return undefined;
 }
 
 export interface SourceAnalysisResult {
@@ -146,18 +220,7 @@ export async function analyzeInstagramPlaces(
   const seen = new Set<string>();
   for (const [guessIndex, hint] of hints.entries()) {
     const guess = storageGuess(hint);
-    let selected: KakaoPlace | undefined;
-    for (const query of buildSourceSearchQueries(hint)) {
-      const places = await dependencies.search(query);
-      dependencies.log?.("source_kakao_search", {
-        guessIndex,
-        query,
-        candidateCount: places.length,
-      });
-      if (!places.length) continue;
-      selected = places[0];
-      break;
-    }
+    const selected = await selectSourcePlace(hint, guessIndex, dependencies);
     if (!selected) {
       result.failures.push({
         guessIndex,

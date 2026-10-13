@@ -626,10 +626,15 @@ function recoveredAlert(
 }
 
 // 503 같은 일시적 오류로 다음 key를 쓰기 시작할 때 한 번 알린다. 같은 사건은 복구될 때까지 같은 번호다.
+// 제목은 다른 알림처럼 Primary, Fallback으로 쓰고, key가 셋 이상일 때를 위해 번호는 Route 항목에 남긴다.
 function overloadAlert(details: JsonRecord): RuntimeAlert | null {
   const fromSlot = credentialSlot(details, ["credentialSlot"]);
   const toSlot = credentialSlot(details, ["toCredentialSlot"]);
-  if (fromSlot === null || toSlot === null) return null;
+  const fromRole = normalizedRole(details.credentialRole, fromSlot);
+  const toRole = normalizedRole(details.toCredentialRole, toSlot);
+  if (fromSlot === null || toSlot === null || !fromRole || !toRole) {
+    return null;
+  }
   const credentialCount = finiteNumber(details.credentialCount);
   const lastKey = credentialCount !== null && toSlot === credentialCount;
   const status = finiteNumber(details.status);
@@ -638,12 +643,12 @@ function overloadAlert(details: JsonRecord): RuntimeAlert | null {
   return {
     severity: "WARNING",
     kind: "KEY_OVERLOAD_FALLBACK",
-    title: `[WARN] Gemini key ${fromSlot} 과부하 → key ${toSlot}`,
-    description: `Key ${fromSlot} returned ${
+    title: `[WARN] Gemini ${fromRole} 과부하 → ${toRole}`,
+    description: `${fromRole} returned ${
       status === null ? "a transient error" : `HTTP ${status}`
-    }. Requests use key ${toSlot}${
+    }. Requests use ${toRole}${
       lastKey ? " (the last key)" : ""
-    } and retry key ${fromSlot} after the cooldown.`,
+    } and retry ${fromRole} after the cooldown.`,
     fields: [
       { name: "Severity", value: "WARNING", inline: true },
       {
@@ -663,17 +668,22 @@ function overloadAlert(details: JsonRecord): RuntimeAlert | null {
 
 function overloadRecoveredAlert(details: JsonRecord): RuntimeAlert | null {
   const slot = credentialSlot(details, ["credentialSlot"]);
-  if (slot === null) return null;
+  const role = normalizedRole(details.credentialRole, slot);
+  if (slot === null || !role) return null;
   const scope = modelScope(details);
   const identity = incidentIdentity(details) ?? "active";
   return {
     severity: "RECOVERED",
     kind: "KEY_OVERLOAD_RECOVERED",
-    title: `[RECOVERED] Gemini key ${slot} 과부하 해소`,
-    description: `Key ${slot} answered successfully again and is used first.`,
+    title: `[RECOVERED] Gemini ${role} 과부하 해소`,
+    description: `${role} answered successfully again and is used first.`,
     fields: [
       { name: "Severity", value: "RECOVERED", inline: true },
-      { name: "Recovered target", value: `Key ${slot}`, inline: true },
+      {
+        name: "Recovered target",
+        value: `${role} (key ${slot})`,
+        inline: true,
+      },
       ...commonFields(details),
     ],
     dedupeKey: `recovered:${scope}:overload:${slot}:${identity}`,

@@ -126,8 +126,8 @@ GET /functions/v1/app-update-policy?platform=ios&appVersion=1.0
 
 ### 장소 분석 설정
 
-분석 버전 11은 `2026-Yeogidam`의 Gemini 분석 방식을 사용하고, Gemini가 실패할 때
-버티는 장치를 더했다. `GEMINI_API_KEY`와 `GEMINI_MODEL`을 모두 등록해야 한다.
+분석 버전 12는 `2026-Yeogidam`의 Gemini 분석 방식에 `feat/#322`의 보정(먹고 마시는 가게만
+뽑기, 주소 반경 검색)을 더했고, Gemini가 실패할 때 버티는 장치를 갖췄다. `GEMINI_API_KEY`와 `GEMINI_MODEL`을 모두 등록해야 한다.
 값이 없으면 기존 `PROVIDER_CONFIG_MISSING` 실패 코드로 처리한다. 모델 기본값은 없다.
 
 캡션 분석은 Interactions API와 URL Context, 미디어 분석은 `generateContent`를
@@ -170,7 +170,8 @@ Gemini 호출이 실패하면 다음 순서로 버틴다.
 
 실패 사유는 v10과 같이 인증 오류와 잘못된 요청을 `PROVIDER_CONFIG_MISSING`, 안전
 차단을 `GEMINI_PLACE_NOT_FOUND`, 나머지를 `UNKNOWN`으로 남긴다. 재시도와 key 전환은
-분석에 성공한 결과를 바꾸지 않으므로 파이프라인 버전은 11을 유지한다.
+분석에 성공한 결과를 바꾸지 않지만, 먹고 마시는 가게 한정과 주소 반경 검색은 매칭 결과를 바꾸므로
+파이프라인 버전을 12로 올렸다.
 
 미디어 원본은 `/tmp`에 스트리밍으로 저장하며 파일당 100MiB, 전체 200MiB,
 최대 20개로 제한한다. 합계가 20MiB 이하이면 올리지 않고 요청 본문에 싣는데, 길이가
