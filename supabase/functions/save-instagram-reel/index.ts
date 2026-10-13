@@ -8,7 +8,10 @@
 
 import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 import { createRequestId, errorResponse } from "../_shared/error_code.ts";
-import { AiConfigError } from "./ai/errors.ts";
+import { AiConfigError, AiProviderError } from "./ai/errors.ts";
+import { sanitizeAiRuntimeLogDetails } from "./ai/log_sanitizer.ts";
+import type { AiLog } from "./ai/provider.ts";
+import { sendGeminiRuntimeDiscordAlert } from "./ai/runtime_alerts.ts";
 import type { PlaceGuess } from "./ai/types.ts";
 import { fetchInstagramMeta } from "./instagram.ts";
 import { hasServiceRoleCredential } from "./auth.ts";
@@ -88,6 +91,71 @@ type FailureReason =
 
 const STALE_PROCESSING_MS = 15 * 60 * 1000;
 const PIPELINE_VERSION = 11;
+
+// v10과 같은 기준이다. 키나 요청이 잘못되면 설정 오류, 안전 차단은 장소 없음, 나머지는 UNKNOWN이다.
+function aiFailureReason(failure: AiProviderError): FailureReason {
+  if (failure.kind === "AUTH" || failure.kind === "BAD_REQUEST") {
+    return "PROVIDER_CONFIG_MISSING";
+  }
+  if (failure.kind === "CONTENT_BLOCKED" || failure.kind === "CANCELLED") {
+    // 기존 DB/iOS 계약의 비재시도 장소 분석 실패 코드를 호환용으로 쓴다.
+    return "GEMINI_PLACE_NOT_FOUND";
+  }
+  return "UNKNOWN";
+}
+
+// AI 키 쿨다운, 예비 키 전환, 복구 같은 이벤트를 남기고, 해당하는 이벤트는 디스코드로 알린다.
+function createAiRuntimeLog(reelId: string): AiLog {
+  return (event, details) => {
+    console.info(JSON.stringify({
+      event,
+      reelId,
+      ...sanitizeAiRuntimeLogDetails(details),
+    }));
+    const delivery = sendGeminiRuntimeDiscordAlert(event, details, {
+      webhookUrl: Deno.env.get("DISCORD_GEMINI_ALERT_WEBHOOK_URL"),
+      log: (alertEvent, alertDetails) => {
+        console.info(JSON.stringify({
+          event: alertEvent,
+          reelId,
+          ...alertDetails,
+        }));
+      },
+    }).catch((error) => {
+      console.error(JSON.stringify({
+        event: "ai_runtime_discord_alert_unexpected_failure",
+        reelId,
+        sourceEvent: event,
+        errorName: error instanceof Error ? error.name : "unknown",
+      }));
+    });
+    try {
+      EdgeRuntime.waitUntil(delivery);
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "ai_runtime_discord_alert_scheduling_failed",
+        reelId,
+        sourceEvent: event,
+        errorName: error instanceof Error ? error.name : "unknown",
+      }));
+    }
+  };
+}
+
+// 예비 키는 v10과 같이 쉼표로 나눈 목록이고, 주 키나 서로와 겹치면 설정 오류로 본다.
+// Gemini 한도는 API 키가 아니라 구글 프로젝트 단위라서, 다른 프로젝트의 키여야 429를 피할 수 있다.
+function geminiFallbackApiKeys(primaryApiKey: string): string[] {
+  const keys = (Deno.env.get("GEMINI_API_KEY_FALLBACKS") ?? "")
+    .split(",")
+    .map((key) => key.trim())
+    .filter(Boolean);
+  if (new Set([primaryApiKey, ...keys]).size !== keys.length + 1) {
+    throw new AiConfigError(
+      "GEMINI_API_KEY_FALLBACKS must contain unique keys",
+    );
+  }
+  return keys;
+}
 
 // 로컬 검증 전용 스텁 (STUB_PROVIDERS=1 일 때만 사용). AI/Kakao 키 없이
 // 파이프라인 전체(추출→매칭→저장→썸네일)를 결정적으로 검증하기 위한 것.
@@ -565,10 +633,13 @@ async function processReel(
         place: STUB_PLACE,
       }];
     } else {
+      const aiLog = createAiRuntimeLog(reelId);
+      const geminiApiKey = Deno.env.get("GEMINI_API_KEY")?.trim() ?? "";
       const ai = createSourceGeminiClient({
-        apiKey: Deno.env.get("GEMINI_API_KEY")?.trim() ?? "",
+        apiKey: geminiApiKey,
         model: Deno.env.get("GEMINI_MODEL")?.trim() ?? "",
-      });
+        fallbackApiKeys: geminiFallbackApiKeys(geminiApiKey),
+      }, { log: aiLog });
       const resolution = await analyzeInstagramPlaces({
         instagramUrl,
         caption,
@@ -642,12 +713,21 @@ async function processReel(
     if (error instanceof AiConfigError) {
       return await failWorker("PROVIDER_CONFIG_MISSING");
     }
+    const failure = error instanceof AiProviderError ? error : null;
     console.error(JSON.stringify({
       event: "reel_processing_failed",
       reelId,
       message: error instanceof Error ? error.message : String(error),
+      ...(failure
+        ? {
+          provider: failure.provider,
+          operation: failure.operation,
+          kind: failure.kind,
+          status: failure.status,
+        }
+        : {}),
     }));
-    return await failWorker("UNKNOWN");
+    return await failWorker(failure ? aiFailureReason(failure) : "UNKNOWN");
   }
 }
 

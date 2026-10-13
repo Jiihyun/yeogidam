@@ -71,12 +71,12 @@ sequenceDiagram
         I-->>F: caption + thumbnail
         alt 작성자가 with_sol_mate
             F->>I: 이미지·영상 원본 목록 조회 및 다운로드
-            F->>AI: 파일 업로드 + 전체 caption 통합 분석
+            F->>AI: 미디어(20MiB 이하 본문 첨부, 넘으면 업로드) + 전체 caption 통합 분석
         else 일반 작성자
             F->>AI: caption + 공개 프로필 URL, URL Context
             opt 추출 장소가 0개
                 F->>I: 이미지·영상 원본 목록 조회 및 다운로드
-                F->>AI: 파일 업로드 + caption 통합 분석
+                F->>AI: 미디어(20MiB 이하 본문 첨부, 넘으면 업로드) + caption 통합 분석
             end
         end
         AI-->>F: 장소별 원문명·보정명·계정·위치 출처·업종
@@ -158,16 +158,20 @@ shortcode의 이미지·영상만 사용하며 캐러셀의 모든 항목을 원
 실제로 접근하지 못한 프로필 내용은 생성하지 않도록 프롬프트에서 제한한다.
 
 캡션 분석은 `/v1/interactions`, 미디어 분석은
-`/v1beta/models/{model}:generateContent`를 사용한다. 미디어를 Files API로
-업로드한다. Deno 스트림은 Content-Length를 전송하지 않으므로 메모리에 최대
+`/v1beta/models/{model}:generateContent`를 사용한다. 미디어 원본 합계가 20MiB
+이하이면 base64로 요청 본문의 `inlineData`에 실어 업로드 단계를 건너뛰고, 넘으면
+Files API로 업로드한다. Deno 스트림은 Content-Length를 전송하지 않으므로 메모리에 최대
 8MiB만 올려 resumable offset과 서버의 조각 단위에 맞춰 순차 전송한다. 마지막
-조각에서 finalize하고 최대 2분 동안 ACTIVE 상태를 기다린 뒤 높은 미디어 해상도로
-분석한다. 성공·실패 모두 업로드 파일 삭제와 로컬 파일 정리를 시도한다.
+조각에서 finalize하고 최대 2분 동안 ACTIVE 상태를 기다린다. 두 경로 모두 높은 미디어
+해상도로 분석하며, 성공·실패 모두 업로드 파일 삭제와 로컬 파일 정리를 시도한다.
 캡션 요청 제한은 20초, 미디어 관련 HTTP 요청은 120초, 다운로드는 30초다.
 
-원본처럼 Gemini 단일 key/model을 사용한다. 기존 공급자 전환·키 fallback·2차
-후보 판단 모듈은 새 분석 경로에서 호출하지 않는다. `GEMINI_API_KEY`,
-`GEMINI_MODEL`은 필수이고 기본 모델을 임의로 지정하지 않는다.
+원본처럼 Gemini 모델 하나로 분석하되, 실패에 버티는 장치를 더했다. 일시적 오류가 나면
+뒤에 key가 있을 때는 바로 다음 key로 넘기고(오류를 낸 key는 60초 동안 뒤로 미룸),
+마지막 key에서만 같은 key로 두 번 더 보낸다. 429는 `GEMINI_API_KEY_FALLBACKS`의 다음
+key로 넘기고, 선불 잔액이 떨어진 key(402)는 10분 동안 건너뛴다. OpenAI 같은 다른 공급자로는 넘기지 않으며, 2차 후보 판단 모듈도 새 분석
+경로에서 호출하지 않는다. `GEMINI_API_KEY`, `GEMINI_MODEL`은 필수이고 기본 모델을
+임의로 지정하지 않는다. 자세한 규칙은 `deployment-and-operations.md`의 장소 분석 설정에 있다.
 
 ## 5. Kakao 검색과 선택
 

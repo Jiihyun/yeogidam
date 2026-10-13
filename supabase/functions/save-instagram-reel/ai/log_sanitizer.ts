@@ -3,6 +3,8 @@ type JsonRecord = Record<string, unknown>;
 const OPERATIONS = new Set([
   "PLACE_EXTRACTION",
   "KAKAO_CANDIDATE_JUDGMENT",
+  "SOURCE_CAPTION_ANALYSIS",
+  "SOURCE_MEDIA_ANALYSIS",
 ]);
 const PROVIDERS = new Set(["gemini", "openai"]);
 const CREDENTIAL_ROLES = new Set(["Primary", "Fallback"]);

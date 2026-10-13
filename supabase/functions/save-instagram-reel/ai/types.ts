@@ -4,7 +4,9 @@ export type AiProviderName = "gemini" | "openai";
 
 export type AiOperation =
   | "PLACE_EXTRACTION"
-  | "KAKAO_CANDIDATE_JUDGMENT";
+  | "KAKAO_CANDIDATE_JUDGMENT"
+  | "SOURCE_CAPTION_ANALYSIS"
+  | "SOURCE_MEDIA_ANALYSIS";
 
 export type AddressType = "ROAD" | "JIBUN" | "PARTIAL" | "NONE";
 

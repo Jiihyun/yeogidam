@@ -38,7 +38,8 @@ for (const mode of [AUTO_SAVE, REVIEW_QUEUE]) {
         SUPABASE_SERVICE_ROLE_KEY: "test-service",
         STUB_PROVIDERS: "0",
         PIPELINE_SYNC: "1",
-        GEMINI_API_KEY: "test-key",
+        // 429 시나리오의 키 쿨다운이 프로세스 공용 상태에 남으므로 시나리오마다 키를 나눈다.
+        GEMINI_API_KEY: `test-key-${mode}-${scenario}`,
         GEMINI_MODEL: "test-model",
         KAKAO_REST_API_KEY: "test-kakao",
       };

@@ -11,7 +11,11 @@ export type GeminiRuntimeAlertKind =
   | "PRIMARY_RECOVERED"
   | "SERVICE_RECOVERED"
   | "API_KEYS_UNAVAILABLE"
-  | "AUTH_FAILED";
+  | "AUTH_FAILED"
+  | "KEY_OVERLOAD_FALLBACK"
+  | "KEY_OVERLOAD_RECOVERED"
+  | "KEY_BILLING_DEPLETED"
+  | "KEY_BILLING_RECOVERED";
 
 export interface RuntimeAlertDedupeStore {
   /** Atomically reserves a transition. False means it was already reserved. */
@@ -621,6 +625,115 @@ function recoveredAlert(
   };
 }
 
+// 503 같은 일시적 오류로 다음 key를 쓰기 시작할 때 한 번 알린다. 같은 사건은 복구될 때까지 같은 번호다.
+function overloadAlert(details: JsonRecord): RuntimeAlert | null {
+  const fromSlot = credentialSlot(details, ["credentialSlot"]);
+  const toSlot = credentialSlot(details, ["toCredentialSlot"]);
+  if (fromSlot === null || toSlot === null) return null;
+  const credentialCount = finiteNumber(details.credentialCount);
+  const lastKey = credentialCount !== null && toSlot === credentialCount;
+  const status = finiteNumber(details.status);
+  const scope = modelScope(details);
+  const identity = incidentIdentity(details) ?? "active";
+  return {
+    severity: "WARNING",
+    kind: "KEY_OVERLOAD_FALLBACK",
+    title: `[WARN] Gemini key ${fromSlot} 과부하 → key ${toSlot}`,
+    description: `Key ${fromSlot} returned ${
+      status === null ? "a transient error" : `HTTP ${status}`
+    }. Requests use key ${toSlot}${
+      lastKey ? " (the last key)" : ""
+    } and retry key ${fromSlot} after the cooldown.`,
+    fields: [
+      { name: "Severity", value: "WARNING", inline: true },
+      {
+        name: "Route",
+        value: `Key ${fromSlot} → Key ${toSlot}${lastKey ? " (last)" : ""}`,
+        inline: true,
+      },
+      ...(status === null
+        ? []
+        : [{ name: "HTTP status", value: String(status), inline: true }]),
+      ...commonFields(details),
+    ],
+    dedupeKey: `open:${scope}:overload:${fromSlot}:${identity}`,
+    scope,
+  };
+}
+
+function overloadRecoveredAlert(details: JsonRecord): RuntimeAlert | null {
+  const slot = credentialSlot(details, ["credentialSlot"]);
+  if (slot === null) return null;
+  const scope = modelScope(details);
+  const identity = incidentIdentity(details) ?? "active";
+  return {
+    severity: "RECOVERED",
+    kind: "KEY_OVERLOAD_RECOVERED",
+    title: `[RECOVERED] Gemini key ${slot} 과부하 해소`,
+    description: `Key ${slot} answered successfully again and is used first.`,
+    fields: [
+      { name: "Severity", value: "RECOVERED", inline: true },
+      { name: "Recovered target", value: `Key ${slot}`, inline: true },
+      ...commonFields(details),
+    ],
+    dedupeKey: `recovered:${scope}:overload:${slot}:${identity}`,
+    scope,
+  };
+}
+
+// key의 선불 잔액이 떨어져 Gemini가 402를 줄 때 한 번 알린다. 다시 성공하기 전까지는 같은 사건이다.
+function billingDepletedAlert(details: JsonRecord): RuntimeAlert | null {
+  const slot = credentialSlot(details, ["credentialSlot"]);
+  const role = normalizedRole(details.credentialRole, slot);
+  if (slot === null || role === null) return null;
+  const status = finiteNumber(details.status);
+  const scope = modelScope(details);
+  const identity = incidentIdentity(details) ?? "active";
+  return {
+    severity: "CRITICAL",
+    kind: "KEY_BILLING_DEPLETED",
+    title: `[CRITICAL] Gemini ${role} 결제 잔액 소진`,
+    description:
+      `${role} key has no prepaid credits left. Top up credits on the AI Studio Billing page.`,
+    fields: [
+      { name: "Severity", value: "CRITICAL", inline: true },
+      { name: "Key", value: `${role} (key ${slot})`, inline: true },
+      ...(status === null
+        ? []
+        : [{ name: "HTTP status", value: String(status), inline: true }]),
+      ...commonFields(details),
+    ],
+    dedupeKey: `open:${scope}:billing:${slot}:${identity}`,
+    scope,
+  };
+}
+
+function billingRecoveredAlert(details: JsonRecord): RuntimeAlert | null {
+  const slot = credentialSlot(details, ["credentialSlot"]);
+  const role = normalizedRole(details.credentialRole, slot);
+  if (slot === null || role === null) return null;
+  const scope = modelScope(details);
+  const identity = incidentIdentity(details) ?? "active";
+  return {
+    severity: "RECOVERED",
+    kind: "KEY_BILLING_RECOVERED",
+    title: `[RECOVERED] Gemini ${role} 결제 잔액 복구`,
+    description:
+      `${role} key answered successfully again after its credits ran out.`,
+    fields: [
+      { name: "Severity", value: "RECOVERED", inline: true },
+      {
+        name: "Recovered target",
+        value: `${role} (key ${slot})`,
+        inline: true,
+      },
+      ...commonFields(details),
+    ],
+    dedupeKey: `recovered:${scope}:billing:${slot}:${identity}`,
+    scope,
+  };
+}
+
 function alertForEvent(
   event: string,
   rawDetails: Record<string, unknown>,
@@ -637,6 +750,16 @@ function alertForEvent(
     return unavailableAlert(details);
   }
   if (event === "ai_gemini_api_key_auth_failed") return authAlert(details);
+  if (event === "ai_gemini_api_key_overloaded") return overloadAlert(details);
+  if (event === "ai_gemini_api_key_overload_recovered") {
+    return overloadRecoveredAlert(details);
+  }
+  if (event === "ai_gemini_api_key_billing_depleted") {
+    return billingDepletedAlert(details);
+  }
+  if (event === "ai_gemini_api_key_billing_recovered") {
+    return billingRecoveredAlert(details);
+  }
   if (
     event === "ai_gemini_primary_recovered" ||
     event === "ai_gemini_service_recovered"
