@@ -93,7 +93,7 @@ type FailureReason =
   | "UNKNOWN";
 
 const STALE_PROCESSING_MS = 15 * 60 * 1000;
-const PIPELINE_VERSION = 12;
+const PIPELINE_VERSION = 13;
 
 // v10과 같은 기준이다. 키나 요청이 잘못되면 설정 오류, 안전 차단은 장소 없음, 나머지는 UNKNOWN이다.
 function aiFailureReason(failure: AiProviderError): FailureReason {

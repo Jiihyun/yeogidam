@@ -371,3 +371,72 @@ Deno.test("근처에서 찾으면 지역과 이름으로 다시 찾지 않는다
   equal(searches, ["카페 (근처)"]);
   equal(result.matches.map((match) => match.place.kakaoPlaceId), ["100"]);
 });
+
+Deno.test("캡션 단서를 카카오에서 하나도 못 찾으면 영상과 사진을 다시 보고, 실패 기록 번호를 이어 붙인다", async () => {
+  const calls: string[] = [];
+  const result = await analyzeInstagramPlaces(input, {
+    extractCaption: async () => [hint("없는 가게")],
+    extractMedia: async (caption, url) => {
+      calls.push(`media ${caption} ${url}`);
+      return [hint("영상 속 가게"), hint("영상 속 없는 가게")];
+    },
+    search: async (query) => query === "영상 속 가게" ? [place("200")] : [],
+  });
+  equal(calls, [`media ${input.caption} ${input.instagramUrl}`]);
+  equal(
+    result.matches.map((match) => [match.guessIndex, match.place.kakaoPlaceId]),
+    [[1, "200"]],
+  );
+  equal(result.failures.map((failure) => failure.guessIndex), [0, 2]);
+  equal(result.failureReason, null);
+});
+
+Deno.test("다시 보는 단계가 실패해도 카카오에서 못 찾은 결과로 끝낸다", async () => {
+  const result = await analyzeInstagramPlaces(input, {
+    extractCaption: async () => [hint("없는 가게")],
+    extractMedia: async () => {
+      throw new Error("원본을 받지 못했습니다");
+    },
+    search: async () => [],
+  });
+  equal(result.failureReason, "KAKAO_PLACE_NOT_FOUND");
+  equal(result.failures.map((failure) => failure.guessIndex), [0]);
+});
+
+Deno.test("이미 영상과 사진을 본 뒤라면 카카오에서 못 찾아도 다시 보지 않는다", async () => {
+  let mediaCalls = 0;
+  const result = await analyzeInstagramPlaces(input, {
+    extractCaption: async () => [],
+    extractMedia: async () => {
+      mediaCalls++;
+      return [hint("영상 속 없는 가게")];
+    },
+    search: async () => [],
+  });
+  equal(mediaCalls, 1);
+  equal(result.failureReason, "KAKAO_PLACE_NOT_FOUND");
+});
+
+Deno.test("반경 검색에서 보정명으로 못 찾으면 캡션에 적힌 이름으로 한 번 더 찾는다", async () => {
+  const searches: string[] = [];
+  const result = await analyzeInstagramPlaces(input, {
+    extractCaption: async () => [
+      hint("확불장군", {
+        nameSearchHint: "확불장군 참숯닭갈비",
+        locationHints: [{
+          type: "ADDRESS",
+          value: "광주 서구 쌍촌로 13-1",
+          basis: "CAPTION",
+        }],
+      }),
+    ],
+    extractMedia: async () => [],
+    geocode: async () => anchor,
+    search: async (query, near) => {
+      searches.push(`${query}${near ? " (근처)" : ""}`);
+      return near && query === "확불장군" ? [place("300")] : [];
+    },
+  });
+  equal(searches, ["확불장군 참숯닭갈비 (근처)", "확불장군 (근처)"]);
+  equal(result.matches.map((match) => match.place.kakaoPlaceId), ["300"]);
+});

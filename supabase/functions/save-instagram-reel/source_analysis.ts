@@ -142,6 +142,29 @@ async function firstSearchResult(
   return places[0];
 }
 
+// Gemini가 보정한 이름에 업종을 덧붙여 근처 검색이 비는 일이 있어서(골든셋 C016 "확불장군 참숯닭갈비")
+// 캡션에 적힌 이름도 한 번 더 찾는다.
+async function searchNearby(
+  hint: SourcePlaceHint,
+  guessIndex: number,
+  dependencies: SourceAnalysisDependencies,
+  anchor: Coordinate,
+): Promise<KakaoPlace | undefined> {
+  const names = [hint.nameSearchHint, hint.nameInCaption]
+    .map((name) => name?.trim() ?? "")
+    .filter(Boolean);
+  for (const name of new Set(names)) {
+    const found = await firstSearchResult(
+      name,
+      guessIndex,
+      dependencies,
+      anchor,
+    );
+    if (found) return found;
+  }
+  return undefined;
+}
+
 async function selectSourcePlace(
   hint: SourcePlaceHint,
   guessIndex: number,
@@ -150,17 +173,12 @@ async function selectSourcePlace(
   const captionAnchor = await anchorFor(hint, ["CAPTION"], dependencies);
   if (captionAnchor) {
     // 근처에 없는 가게를 지역이나 이름만으로 다시 찾으면 다른 지점이 붙으므로 여기서 끝낸다.
-    return await firstSearchResult(
-      searchName(hint),
-      guessIndex,
-      dependencies,
-      captionAnchor,
-    );
+    return await searchNearby(hint, guessIndex, dependencies, captionAnchor);
   }
   const softAnchor = await anchorFor(hint, SOFT_ADDRESS_BASES, dependencies);
   if (softAnchor) {
-    const nearby = await firstSearchResult(
-      searchName(hint),
+    const nearby = await searchNearby(
+      hint,
       guessIndex,
       dependencies,
       softAnchor,
@@ -201,8 +219,10 @@ export async function analyzeInstagramPlaces(
     return { ...result, failureReason: "IG_CAPTION_NOT_FOUND" };
   }
   let hints: SourcePlaceHint[];
+  let mediaRead = false;
   if (input.authorUsername === "with_sol_mate") {
     hints = await dependencies.extractMedia(input.caption, input.instagramUrl);
+    mediaRead = true;
   } else {
     hints = await dependencies.extractCaption(input.caption);
     if (hints.length === 0) {
@@ -210,6 +230,7 @@ export async function analyzeInstagramPlaces(
         input.caption,
         input.instagramUrl,
       );
+      mediaRead = true;
     }
   }
   dependencies.log?.("source_place_hints_extracted", { hints });
@@ -218,7 +239,42 @@ export async function analyzeInstagramPlaces(
   }
 
   const seen = new Set<string>();
-  for (const [guessIndex, hint] of hints.entries()) {
+  await matchHints(hints, 0, dependencies, result, seen);
+  // 캡션 단서를 카카오에서 하나도 못 찾으면 영상과 사진을 한 번 더 본다(2026-Yeogidam 1단계와 같은 조건).
+  // 보조 단계라서 실패해도 카카오에서 못 찾은 결과로 끝내고, 실패 기록 번호는 앞 단서 뒤로 이어 붙인다.
+  if (!result.matches.length && !mediaRead) {
+    let mediaHints: SourcePlaceHint[] = [];
+    try {
+      mediaHints = await dependencies.extractMedia(
+        input.caption,
+        input.instagramUrl,
+      );
+    } catch (error) {
+      dependencies.log?.("source_media_after_kakao_miss_failed", {
+        errorName: error instanceof Error ? error.name : "unknown",
+      });
+    }
+    if (mediaHints.length) {
+      dependencies.log?.("source_place_hints_extracted", {
+        hints: mediaHints,
+        afterKakaoMiss: true,
+      });
+      await matchHints(mediaHints, hints.length, dependencies, result, seen);
+    }
+  }
+  if (!result.matches.length) result.failureReason = "KAKAO_PLACE_NOT_FOUND";
+  return result;
+}
+
+async function matchHints(
+  hints: SourcePlaceHint[],
+  firstGuessIndex: number,
+  dependencies: SourceAnalysisDependencies,
+  result: SourceAnalysisResult,
+  seen: Set<string>,
+): Promise<void> {
+  for (const [offset, hint] of hints.entries()) {
+    const guessIndex = firstGuessIndex + offset;
     const guess = storageGuess(hint);
     const selected = await selectSourcePlace(hint, guessIndex, dependencies);
     if (!selected) {
@@ -235,6 +291,4 @@ export async function analyzeInstagramPlaces(
     seen.add(selected.kakaoPlaceId);
     result.matches.push({ guessIndex, guess, place: selected });
   }
-  if (!result.matches.length) result.failureReason = "KAKAO_PLACE_NOT_FOUND";
-  return result;
 }
