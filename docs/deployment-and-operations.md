@@ -156,7 +156,10 @@ Gemini 호출이 실패하면 다음 순서로 버틴다.
    Gemini 한도는 API key가 아니라 프로젝트 단위라서 예비 key는 다른
    프로젝트의 key여야 효과가 있다. 무료 key를 `GEMINI_API_KEY`에, 결제 key를
    `GEMINI_API_KEY_FALLBACKS`에 두면 무료 한도에 걸린 동안에만 결제 key가 요청을 받는다.
-   쿨다운과 전환 규칙은 v10과 같은 `ai/gemini_credentials.ts`가 맡는다.
+   캡션 분석(Interactions API)의 429는 세부 정보 없이 문장만 오므로 문장으로 한도 종류를
+   가린다. 같은 순간에 몰린 429는 한 사건으로 보아 쿨다운 단계를 올리지 않고, 종류가 같으면
+   먼저 건 쿨다운을 그대로 쓴다. 쿨다운과 전환 규칙은 v10과 같은 `ai/gemini_credentials.ts`가
+   맡는다.
 4. 결제 key의 선불 잔액이 떨어지면 Gemini는 402를 돌려주고, 같은 문구(`prepayment credits
    are depleted`)를 담은 429를 준 사례도 있다. 이때는 그 key를 결제 잔액 소진으로 보고
    10분 동안 부르지 않으며, 10분이 지나면 한 번 다시 써 본다.
